@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 
-[[ -e /hive/custom ]] && . /hive/custom/keryx-miner/h-manifest.conf
-[[ -e /hive/miners/custom ]] && . /hive/miners/custom/keryx-miner/h-manifest.conf
+# Self-locate the manifest from THIS script's own directory, so the package works under any folder
+# name (versioned or not) with no hardcoded /hive/miners/custom/keryx-miner path and no symlink.
+# No cd / no exit here: HiveOS may source this file.
+__MD="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")" && pwd)"
+. "$__MD/h-manifest.conf"
 
 # The zero-dup binary talks to the GPU via Vulkan (mining AND in-process inference).
 # Most current HiveOS images ship libvulkan1; install it if this one doesn't.

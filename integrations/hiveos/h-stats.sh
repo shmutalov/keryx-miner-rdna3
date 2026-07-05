@@ -1,27 +1,46 @@
 #!/usr/bin/env bash
 
-. /hive/miners/custom/keryx-miner/h-manifest.conf
+# Self-locate the manifest from THIS script's own directory (works under a versioned folder, no
+# symlink). No cd / no exit: HiveOS SOURCES this file and reads $khs / $stats from it afterwards,
+# so changing the caller's cwd or calling exit would break the HiveOS agent.
+__MD="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")" && pwd)"
+. "$__MD/h-manifest.conf"
 
-# Log format: "2026-05-09 12:00:00.000+02:00 [INFO ] Current hashrate is 5.23 Ghash/s"
-stats_raw=`cat $CUSTOM_LOG_BASENAME.log | grep "Current hashrate is" | tail -n 1`
+# Read the tail of the log ONCE and derive everything below from this in-memory copy, instead of
+# re-reading the whole log file once per GPU. This keeps the script cheap on big rigs (12, 20+ GPUs).
+# `tr -d '\000'` is a cheap guard in case the miner ever writes a stray NUL into the log.
+log=`tail -n 4000 "$CUSTOM_LOG_BASENAME.log" 2>/dev/null | tr -d '\000'`
+
+stats_raw=`grep "Current hashrate is" <<< "$log" | tail -n 1`
 
 maxDelay=120
 time_now=`date +%s`
 
-# Parse timestamp from fields $1 (date) and $2 (time), strip timezone offset for date parsing
-datetime_rep=`echo $stats_raw | awk '{split($2,t,/[+-][0-9]{2}:[0-9]{2}$/); print $1, t[1]}'`
-time_rep=`date -d "$datetime_rep" +%s 2>/dev/null || echo 0`
+# The miner logs with env_logger, whose default line starts "[2026-06-24T19:11:32Z INFO ...]"
+# (ISO-8601 UTC, leading '['). Older builds logged "2026-06-24 19:11:32.000+02:00 [INFO ]".
+# Pull the timestamp anywhere on the line (bracket/position independent) and let GNU date parse it
+# (it understands both the T...Z form and the "date time+offset" form natively).
+ts_field=`echo "$stats_raw" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?(Z|[+-][0-9]{2}:?[0-9]{2})?' | head -1`
+time_rep=`date -d "$ts_field" +%s 2>/dev/null || echo 0`
 diffTime=`echo $((time_now-time_rep)) | tr -d '-'`
 
 if [ "$diffTime" -lt "$maxDelay" ]; then
-        # Value is second-to-last field (before unit), unit is last field
-        total_hashrate=`echo $stats_raw | awk '{print $(NF-1)}' | cut -d "." -f 1,2 --output-delimiter='' | sed 's/$/0/'`
+        # Value is second-to-last field (before unit), unit is last field.
+        # The miner logs the rate with 2 decimals; dropping the dot then appending one 0 yields
+        # rate*1000 (e.g. 3.83 -> "383" -> "3830"). NB: do NOT use `cut --output-delimiter=''` to
+        # drop the dot — an empty output delimiter makes cut emit a NUL byte, which then trips
+        # bash's "command substitution: ignored null byte" warning. `tr -d '.'` is clean.
+        # HiveOS expects kilohashes (khs): Ghash/s = rate*1e6 khs = (rate*1000)*1e3, etc.
+        total_hashrate=`echo $stats_raw | awk 'NF>=2{print $(NF-1)}' | tr -d '.' | sed 's/$/0/'`
+        # Force base 10: a sub-1.0 rate yields a leading zero (e.g. 0.48 -> "0480") which bash would
+        # otherwise parse as octal and reject ("value too great for base").
+        total_hashrate=$((10#${total_hashrate:-0}))
         if [[ $stats_raw == *"Thash"* ]]; then
-                total_hashrate=$(($total_hashrate*1000000000))
-        elif [[ $stats_raw == *"Ghash"* ]]; then
                 total_hashrate=$(($total_hashrate*1000000))
-        elif [[ $stats_raw == *"Mhash"* ]]; then
+        elif [[ $stats_raw == *"Ghash"* ]]; then
                 total_hashrate=$(($total_hashrate*1000))
+        elif [[ $stats_raw == *"Mhash"* ]]; then
+                : # Mhash/s = rate*1e3 khs = rate*1000 already, no multiplier needed
         fi
 
         # GPU status
@@ -43,23 +62,36 @@ if [ "$diffTime" -lt "$maxDelay" ]; then
                 BRAND_MINER="amd"
         fi
 
+        # The miner keys its workers "Vulkan #N" by Vulkan device index, mining GPUs only.
+        # HiveOS's busid list can also contain devices the miner never mines on — e.g. an
+        # onboard iGPU. Using the raw loop index `i` as the miner device number then desyncs the
+        # moment such a device is skipped (every later card reads one slot too high, the last one
+        # falls off the end -> 0). Keep a SEPARATE counter that advances only for mining-brand
+        # cards, so it tracks the miner's own numbering (an amd iGPU occupies one index in BOTH
+        # lists, so the numberings stay aligned and its own slot truthfully reads 0).
+        # No iGPU -> miner_dev == i.
+        miner_dev=0
         for(( i=0; i < gpu_count; i++ )); do
                 [[ "${brands[i]}" != $BRAND_MINER ]] && continue
                 [[ "${busids[i]}" =~ ^([A-Fa-f0-9]+): ]]
                 busid_arr+=($((16#${BASH_REMATCH[1]})))
                 temp_arr+=(${temps[i]})
                 fan_arr+=(${fans[i]})
-                # Per-device line: "... [INFO ] Device #N: 5.23 Ghash/s"
-                gpu_raw=`cat $CUSTOM_LOG_BASENAME.log | grep "Device #$i:" | tail -n 1`
-                hashrate=`echo $gpu_raw | awk '{print $(NF-1)}' | cut -d "." -f 1,2 --output-delimiter='' | sed 's/$/0/'`
+                # Per-device line: "... Device Vulkan #N: 5.23 Ghash/s" — the worker id is
+                # "Vulkan #N", so the trailing colon pins the number (no "#1" vs "#10" ambiguity).
+                gpu_raw=`grep "Device Vulkan #$miner_dev:" <<< "$log" | tail -n 1`
+                hashrate=`echo $gpu_raw | awk 'NF>=2{print $(NF-1)}' | tr -d '.' | sed 's/$/0/'`
+                # Force base 10 (sub-1.0 rates yield a leading zero that bash would parse as octal).
+                hashrate=$((10#${hashrate:-0}))
                 if [[ $gpu_raw == *"Thash"* ]]; then
-                        hashrate=$(($hashrate*1000000000))
-                elif [[ $gpu_raw == *"Ghash"* ]]; then
                         hashrate=$(($hashrate*1000000))
-                elif [[ $gpu_raw == *"Mhash"* ]]; then
+                elif [[ $gpu_raw == *"Ghash"* ]]; then
                         hashrate=$(($hashrate*1000))
+                elif [[ $gpu_raw == *"Mhash"* ]]; then
+                        : # Mhash/s = rate*1e3 khs = rate*1000 already, no multiplier needed
                 fi
                 hash_arr+=($hashrate)
+                miner_dev=$((miner_dev+1))
         done
 
         hash_json=`printf '%s\n' "${hash_arr[@]}" | jq -cs '.'`
@@ -77,7 +109,7 @@ if [ "$diffTime" -lt "$maxDelay" ]; then
                 --argjson fan "$fan_json" \
                 --argjson temp "$temp_json" \
                 --arg uptime "$uptime" \
-                '{ hs: $hs, hs_units: "khs", algo: "heavyhash", ver: $ver, $uptime, $bus_numbers, $temp, $fan }')
+                '{ hs: $hs, hs_units: "khs", algo: "keryxhash", ver: $ver, $uptime, $bus_numbers, $temp, $fan }')
         khs=$total_hashrate
 else
         khs=0
