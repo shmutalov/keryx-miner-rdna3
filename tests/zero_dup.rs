@@ -7,7 +7,7 @@
 
 use keryx_miner::llm_engine::LlamaEngine;
 use keryx_miner::pom::WeightIndex;
-use keryx_vulkan::pom_walk::PomWalkGpu;
+use keryx_vulkan::pom_walk::{words4, PomWalkGpu};
 
 fn splitmix(x: &mut u64) -> u64 {
     *x = x.wrapping_add(0x9E3779B97F4A7C15);
@@ -66,17 +66,20 @@ fn shared_walk_matches_streamed_blob() {
     for (i, b) in pph.iter_mut().enumerate() {
         *b = (i as u8).wrapping_mul(37).wrapping_add(11);
     }
+    // Kernel-identity test, era-agnostic: raw (pre-H3) pph words on both paths. H3 salting
+    // happens host-side before the words reach mine() and cannot diverge the two walks.
     let ts: u64 = 1_772_000_000;
+    let p = words4(&pph);
     for msb in [0xFFu8, 0x80, 0x01, 0x00] {
         let mut target = [0u8; 32];
         target[31] = msb;
         if msb == 0xFF {
             target = [0xFF; 32];
         }
-        let a = shared.mine(&pph, ts, &target, start, batch);
-        let b = blob.mine(&pph, ts, &target, start, batch);
+        let a = shared.mine(&p, ts, &target, start, batch);
+        let b = blob.mine(&p, ts, &target, start, batch);
         assert_eq!(a, b, "winner mismatch at target msb {msb:#x}");
-        let c = shared.mine(&pph, ts, &target, start, batch);
+        let c = shared.mine(&p, ts, &target, start, batch);
         assert_eq!(a, c, "shared walk not deterministic at target msb {msb:#x}");
         eprintln!("target msb {msb:#04x}: shared == blob == {a:?}");
     }
@@ -85,8 +88,8 @@ fn shared_walk_matches_streamed_blob() {
     //    nonce walks all 256 steps. 8×65536 nonces each, warm.
     let none = [0u8; 32];
     let rounds: u64 = 8;
-    let blob_f = |s: u64| blob.mine(&pph, ts, &none, s, batch);
-    let shared_f = |s: u64| shared.mine(&pph, ts, &none, s, batch);
+    let blob_f = |s: u64| blob.mine(&p, ts, &none, s, batch);
+    let shared_f = |s: u64| shared.mine(&p, ts, &none, s, batch);
     let timed = |name: &str, f: &dyn Fn(u64) -> Option<u64>| {
         let t0 = std::time::Instant::now();
         for r in 0..rounds {

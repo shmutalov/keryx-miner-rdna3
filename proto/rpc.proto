@@ -43,6 +43,10 @@ message RpcBlockHeader {
   string blueWork = 10;
   string pruningPoint = 14;
   uint64 blueScore = 13;
+  // H3 (POM_LEVEL_ACTIVATION_DAA): final state of the winning possession walk, committed
+  // into the block hash by the node. Filled on submit_block exactly like the nonce.
+  // 0 (absent on the wire) below the activation. Field number mirrors the node's rpc.proto.
+  uint64 pomFinalState = 16;
 }
 
 message RpcBlockLevelParents {

@@ -138,7 +138,7 @@ fn vulkan_pom_walk_matches_host_reference() {
 
         for target in [impossible, median, max] {
             let host = host_lowest_winner(&words, n_chunks, &pph, ts, &target, start, batch);
-            let got = gpu.mine(&pph, ts, &target, start, batch);
+            let got = gpu.mine(&words4(&pph), ts, &target, start, batch);
             assert_eq!(
                 got, host,
                 "trial {trial}: GPU winner {got:?} != host {host:?} (target msbyte {})",
@@ -148,7 +148,7 @@ fn vulkan_pom_walk_matches_host_reference() {
     }
 
     // 'max' target must always return the very first nonce.
-    assert_eq!(gpu.mine(&[7u8; 32], 42, &[0xFFu8; 32], start, batch), Some(start));
+    assert_eq!(gpu.mine(&words4(&[7u8; 32]), 42, &[0xFFu8; 32], start, batch), Some(start));
 }
 
 /// The zero-dup streamed constructor MUST produce a blob byte-identical to the packed one: same
@@ -188,8 +188,8 @@ fn vulkan_pom_walk_streamed_matches_packed() {
         mid[31] = 0x40; // ~25% of nonces win → exercises real winner selection
         for target in [[0u8; 32], mid, [0xFFu8; 32]] {
             assert_eq!(
-                streamed.mine(&pph, ts, &target, start, batch),
-                packed.mine(&pph, ts, &target, start, batch),
+                streamed.mine(&words4(&pph), ts, &target, start, batch),
+                packed.mine(&words4(&pph), ts, &target, start, batch),
                 "trial {trial}: streamed and packed blobs disagree (target msbyte {})",
                 target[31]
             );
@@ -238,7 +238,7 @@ fn vulkan_pom_walk_multishard_matches_host_reference() {
         });
         for target in [[0u8; 32], pows[pows.len() / 2], [0xFFu8; 32]] {
             let host = host_lowest_winner(&words, n_chunks, &pph, ts, &target, start, batch);
-            let got = gpu.mine(&pph, ts, &target, start, batch);
+            let got = gpu.mine(&words4(&pph), ts, &target, start, batch);
             assert_eq!(got, host, "multishard trial {trial}: GPU {got:?} != host {host:?}");
         }
     }
@@ -269,11 +269,11 @@ fn vulkan_pom_walk_spans_dispatches() {
     let ts: u64 = rng.r#gen();
 
     // Impossible target → no winner anywhere, so every sub-dispatch runs and the loop returns None.
-    assert_eq!(gpu.mine(&pph, ts, &[0u8; 32], start, batch), None, "impossible target must yield None");
+    assert_eq!(gpu.mine(&words4(&pph), ts, &[0u8; 32], start, batch), None, "impossible target must yield None");
 
     // Loose target → many winners; GPU must return the same global-lowest nonce the host finds.
     let loose = [0x40u8; 32];
     let host = host_lowest_winner(&words, n_chunks, &pph, ts, &loose, start, batch);
-    assert_eq!(gpu.mine(&pph, ts, &loose, start, batch), host, "spanning batch: GPU != host");
+    assert_eq!(gpu.mine(&words4(&pph), ts, &loose, start, batch), host, "spanning batch: GPU != host");
     assert!(host.is_some(), "loose target should have a winner to make this meaningful");
 }

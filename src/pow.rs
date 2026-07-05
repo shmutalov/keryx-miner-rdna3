@@ -184,9 +184,11 @@ impl State {
         pph.copy_from_slice(&self.pow_hash_header[0..32]);
         let timestamp = u64::from_le_bytes(self.pow_hash_header[32..40].try_into().unwrap());
 
-        let seed = pom::pom_block_seed(&pph, timestamp, nonce);
+        // H3 salts the pph words feeding both PoM folds (forced update — POM_H3_PPH_SALT).
+        let h3 = self.daa_score >= pom::POM_LEVEL_ACTIVATION_DAA;
+        let seed = pom::pom_block_seed(&pph, timestamp, nonce, h3);
         let final_state = pom::walk_final(seed, index.n_chunks, pom::POM_WALK_STEPS, |o| index.read_chunk(o));
-        if !pom::le_leq(&pom::pom_pow_value(final_state, &pph), &self.target.to_le_bytes()) {
+        if !pom::le_leq(&pom::pom_pow_value(final_state, &pph, h3), &self.target.to_le_bytes()) {
             return None;
         }
 
@@ -200,13 +202,14 @@ impl State {
             pom::POM_OPENINGS,
             |o| index.read_chunk(o),
             |o| index.merkle_path(o),
+            h3,
         );
 
         // Cheap insurance: run the node's exact weightless verifier over the freshly built proof
         // before submit. A self-verify failure means a GPU↔CPU fold drift or a Merkle-path bug —
         // submitting it would just earn a node rejection, so drop the block and log loudly instead.
         let target_le = self.target.to_le_bytes();
-        if !pom::verify_proof(&pph, nonce, seed, &proof, index.n_chunks, pom::POM_WALK_STEPS, pom::POM_OPENINGS, &index.r_t, &target_le)
+        if !pom::verify_proof(&pph, nonce, seed, &proof, index.n_chunks, pom::POM_WALK_STEPS, pom::POM_OPENINGS, &index.r_t, &target_le, h3)
         {
             log::error!(
                 "PoM: self-verify FAILED for winning nonce {} — dropping block instead of submitting a \
@@ -223,6 +226,11 @@ impl State {
             BlockSeed::FullBlock(ref mut block) => {
                 let header = block.header.as_mut().expect("We checked that a header exists on creation");
                 header.nonce = nonce;
+                // H3: the header commits to the walk's final state — fill it exactly like the
+                // nonce. The node hashes it into the block hash and pins it to the proof.
+                if header.daa_score >= pom::POM_LEVEL_ACTIVATION_DAA {
+                    header.pom_final_state = final_state;
+                }
                 block.pom_proof = bytes; // plain bytes field (empty = none on the wire)
             }
             BlockSeed::PartialBlock { nonce: ref mut header_nonce, ref mut pom_proof, .. } => {
@@ -291,6 +299,12 @@ pub fn serialize_header<H: Hasher>(hasher: &mut H, header: &RpcBlockHeader, for_
 
     decode_to_slice(&header.pruning_point, &mut hash).unwrap();
     hasher.update(hash);
+
+    // H3: the block hash commits to the walk's final state. NEVER part of the pre-PoW hash
+    // (the walk seed derives from it). Mirrors the node's `hashing::header::hash`.
+    if !for_pre_pow && header.daa_score >= pom::POM_LEVEL_ACTIVATION_DAA {
+        hasher.update(header.pom_final_state.to_le_bytes());
+    }
 }
 
 #[allow(dead_code)] // False Positive: https://github.com/rust-lang/rust/issues/88900
@@ -445,6 +459,7 @@ mod tests {
             blue_work: "ce5639b8ed46571e20eeaa7a62a078f8c55aef6edd6a35ed37a3d6cf98736abd".into(),
             pruning_point: "fc44c4f57cf8f7a2ba410a70d0ad49060355b9deb97012345603d9d0d1dcb0de".into(),
             blue_score: 29372123613087746,
+            pom_final_state: 0,
         };
         let expected_res = [
             245, 95, 9, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 98, 165, 238, 232, 42, 189, 244, 74, 45, 11, 117,

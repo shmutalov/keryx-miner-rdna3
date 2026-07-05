@@ -339,8 +339,9 @@ impl MinerManager {
                         if !keryx_miner::pom_gpu::is_installed(pom_device) {
                             keryx_miner::pom_gpu::ensure_installed(daa, pom_device);
                         }
+                        let h3 = daa >= keryx_miner::pom::POM_LEVEL_ACTIVATION_DAA;
                         let found =
-                            keryx_miner::pom_gpu::mine(pom_device, &pph, time, &target_le, pom_nonce, POM_BATCH);
+                            keryx_miner::pom_gpu::mine(pom_device, &pph, time, &target_le, pom_nonce, POM_BATCH, h3);
                         pom_nonce = pom_nonce.wrapping_add(POM_BATCH);
                         hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
                         worker_hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
@@ -647,6 +648,7 @@ mod benches {
                     blue_work: "d8e28a03234786".to_string(),
                     pruning_point: "be4c415d378f9113fabd3c09fcc84ddb6a00f900c87cb6a1186993ddc3014e2d".to_string(),
                     blue_score: 1164419,
+                    pom_final_state: 0,
                 }),
                 transactions: vec![],
                 verbose_data: None,

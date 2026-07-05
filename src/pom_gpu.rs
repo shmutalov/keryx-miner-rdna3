@@ -37,10 +37,10 @@ enum Resident {
 }
 
 impl Resident {
-    fn mine(&self, pph: &[u8; 32], ts: u64, target: &[u8; 32], start: u64, batch: u32) -> Option<u64> {
+    fn mine(&self, pph_words: &[u64; 4], ts: u64, target: &[u8; 32], start: u64, batch: u32) -> Option<u64> {
         match self {
-            Resident::Blob(m) => m.mine(pph, ts, target, start, batch),
-                    Resident::Shared { walk, .. } => walk.mine(pph, ts, target, start, batch),
+            Resident::Blob(m) => m.mine(pph_words, ts, target, start, batch),
+                    Resident::Shared { walk, .. } => walk.mine(pph_words, ts, target, start, batch),
         }
     }
 
@@ -108,6 +108,8 @@ pub fn uninstall() {
 }
 
 /// Search nonces `[start, start + batch)` on `device`. None if not installed or no winner.
+/// `h3` salts the pph words host-side (POM_H3_PPH_SALT) — the walk kernel is era-agnostic,
+/// it folds whatever words it receives, so no shader change at the H3 gate.
 pub fn mine(
     device: u32,
     pre_pow_hash: &[u8; 32],
@@ -115,12 +117,14 @@ pub fn mine(
     target_le: &[u8; 32],
     start: u64,
     batch: u64,
+    h3: bool,
 ) -> Option<u64> {
     // Clone the (Arc-backed) entry out and dispatch lock-free: each device has exactly one
     // worker thread, and holding the map lock across a walk batch would serialize other GPUs.
     let m = miner_on(device)?;
     let batch = batch.min(u32::MAX as u64) as u32;
-    m.mine(pre_pow_hash, timestamp, target_le, start, batch)
+    let p = crate::pom::pph_words_for_era(pre_pow_hash, h3);
+    m.mine(&p, timestamp, target_le, start, batch)
 }
 
 /// Ensure the GPU PoM miner is installed on `device`; build the host possession index (first

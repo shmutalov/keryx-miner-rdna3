@@ -153,17 +153,21 @@ impl PomWalkGpu {
 
     /// Search nonces `[start, start + batch)`. Returns the lowest winning nonce, or None.
     ///
+    /// `pph_words` are the pre_pow_hash's 4 LE u64 words, already salted for the block's era by
+    /// the caller (H3 XORs `POM_H3_PPH_SALT` in — see `pom::pph_words_for_era`). The kernel is
+    /// era-agnostic: it folds whatever words it receives, so no shader change at the H3 gate.
+    ///
     /// The batch is ground in `MAX_DISPATCH_NONCES`-sized sub-dispatches, in increasing nonce order,
     /// so no single GPU dispatch runs long enough to trip the Windows TDR watchdog (DEVICE_LOST).
     /// Sub-batches are ascending, so the first one with any winner holds the global lowest nonce —
     /// returning there is identical to grinding the whole batch, and skips the rest.
-    pub fn mine(&self, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u32) -> Option<u64> {
+    pub fn mine(&self, pph_words: &[u64; 4], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u32) -> Option<u64> {
         let mut done: u32 = 0;
         while done < batch {
             let sub = (batch - done).min(MAX_DISPATCH_NONCES);
             self.vk.write_buffer(&self.winner, &NO_WINNER.to_le_bytes());
             let push = PomPush {
-                p: words4(pre_pow_hash),
+                p: *pph_words,
                 t: words4(target_le),
                 timestamp,
                 n_chunks: self.n_chunks,
@@ -320,14 +324,15 @@ impl PomWalkShared {
     }
 
     /// Search nonces `[start, start + batch)`. Identical sub-dispatch grinding (TDR-bounded)
-    /// and lowest-winner semantics as [`PomWalkGpu::mine`].
-    pub fn mine(&self, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u32) -> Option<u64> {
+    /// and lowest-winner semantics as [`PomWalkGpu::mine`], including the caller-salted
+    /// `pph_words` era contract.
+    pub fn mine(&self, pph_words: &[u64; 4], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u32) -> Option<u64> {
         let mut done: u32 = 0;
         while done < batch {
             let sub = (batch - done).min(MAX_DISPATCH_NONCES);
             self.vk.write_buffer(&self.winner, &NO_WINNER.to_le_bytes());
             let push = PomPrefixPush {
-                p: words4(pre_pow_hash),
+                p: *pph_words,
                 t: words4(target_le),
                 timestamp,
                 n_chunks: self.n_chunks,
