@@ -199,7 +199,7 @@ impl Client for StratumHandler {
                         // 5-tier index (see models.rs VERY_LIGHT_ACTIVATION_DAA), so advertise the
                         // first strictly-greater version to clear the gate. Bump this single string
                         // if the pool later raises the floor. (Real build: keryx-miner/CARGO_PKG_VERSION.)
-                        "keryx-miner-supr/0.6.3.7".to_string(),
+                        "keryx-miner-supr/0.6.7.0".to_string(),
                         KERYX_STRATUM_DAA_CAPABILITY.into(),
                     )),
                 )),
