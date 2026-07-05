@@ -256,11 +256,28 @@ fn system_prompt_for(name: &str) -> &'static str {
     match name {
         "gemma-3-4b" => SYSTEM_PROMPT_GEMMA,
         "dolphin-llama3-8b" => SYSTEM_PROMPT_DOLPHIN,
-        "llama-3.3-70b" | "llama-3.3-70b-official" => SYSTEM_PROMPT_LLAMA70B,
+        "llama-3.3-70b" | "llama-3.3-70b-q2" | "llama-3.3-70b-official" => SYSTEM_PROMPT_LLAMA70B,
         "deepseek-r1-32b" | "deepseek-r1-8b" => SYSTEM_PROMPT_DEEPSEEK,
         "tinyllama" => SYSTEM_PROMPT_TINYLLAMA,
         "qwen3-32b" => SYSTEM_PROMPT_QWEN3,
         _ => SYSTEM_PROMPT_DOLPHIN,
+    }
+}
+
+/// Stop-STRINGS scanned over the decoded output, per model. llama.cpp already stops on the
+/// GGUF's own EOG token ids, which covers every model whose template control tokens exist in
+/// its vocab — so this is empty for the regular lineup. The abliterated Llama-3.3-70B (both
+/// quants) is re-templated to ChatML over the stock LLaMA-3 vocab: `<|im_end|>`/`<|im_start|>`
+/// are NOT atomic tokens, the model writes them as plain multi-token text and never emits
+/// `<|eot_id|>` — only a stop-string cut ends the turn, otherwise it reopens `assistant` and
+/// repeats the same answer until max_tokens.
+fn stop_strings_for(name: &str) -> &'static [&'static str] {
+    match name {
+        "llama-3.3-70b" | "llama-3.3-70b-q2" => &["<|im_end|>", "<|im_start|>", "<|eot_id|>", "<|end_of_text|>"],
+        // Genuine official Llama-3.3 — LLaMA-3 header template, ids fire normally; strings are
+        // cheap insurance if the model opens a fresh header instead of stopping.
+        "llama-3.3-70b-official" => &["<|eot_id|>", "<|end_of_text|>", "<|start_header_id|>"],
+        _ => &[],
     }
 }
 
@@ -513,7 +530,7 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
 
     let system = system_prompt_for(spec.name);
     let user = user_message_for(spec.name, prompt);
-    match server.chat(system, &user, max_tokens) {
+    match server.chat(system, &user, max_tokens, stop_strings_for(spec.name)) {
         Ok(text) => {
             let cleaned = strip_think(&text).trim().to_string();
             if cleaned.is_empty() {

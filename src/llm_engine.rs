@@ -79,7 +79,14 @@ impl LlamaEngine {
 
     /// Chat completion through the GGUF's own chat template, greedy decoding (temperature-0
     /// equivalent — keeps OPoI answers stable), capped at `max_tokens` generated tokens.
-    pub fn chat(&self, system: &str, user: &str, max_tokens: usize) -> Result<String> {
+    ///
+    /// `stop_strings` are scanned over the decoded output and cut the turn (marker excluded)
+    /// when the model writes an end marker as plain text instead of emitting an EOG token.
+    /// Needed for GGUFs whose chat template was swapped over a vocab that lacks the template's
+    /// control tokens (abliterated Llama-3.3-70B: ChatML over stock LLaMA-3 — `<|im_end|>`
+    /// tokenizes as text, `<|eot_id|>` is never emitted, and without the cut the model reopens
+    /// `assistant` and repeats its answer until `max_tokens`). Empty for well-formed models.
+    pub fn chat(&self, system: &str, user: &str, max_tokens: usize, stop_strings: &[&str]) -> Result<String> {
         let _serialize = self.lock.lock().unwrap_or_else(|p| p.into_inner());
         let backend = backend()?;
 
@@ -139,6 +146,10 @@ impl LlamaEngine {
                 x => x,
             }?;
             out.extend_from_slice(&piece);
+            if let Some(cut) = find_stop(&out, piece.len(), stop_strings) {
+                out.truncate(cut);
+                break;
+            }
             batch.clear();
             batch.add(token, n_cur, &[0], true)?;
             n_cur += 1;
@@ -146,6 +157,27 @@ impl LlamaEngine {
         }
         Ok(String::from_utf8_lossy(&out).into_owned())
     }
+}
+
+/// Earliest start offset of any stop string in `out`, or None. A stop marker spans token
+/// boundaries, so the scan runs after every appended piece — but only over the tail window
+/// where a NEW match can end (`appended` fresh bytes plus `max_stop - 1` bytes of overlap);
+/// older bytes were already scanned on the previous token.
+fn find_stop(out: &[u8], appended: usize, stops: &[&str]) -> Option<usize> {
+    let max_stop = stops.iter().map(|s| s.len()).max()?;
+    let from = out.len().saturating_sub(appended + max_stop.saturating_sub(1));
+    let hay = &out[from..];
+    let mut cut: Option<usize> = None;
+    for pat in stops.iter().map(|s| s.as_bytes()) {
+        if pat.is_empty() || pat.len() > hay.len() {
+            continue;
+        }
+        if let Some(pos) = hay.windows(pat.len()).position(|w| w == pat) {
+            let abs = from + pos;
+            cut = Some(cut.map_or(abs, |c| c.min(abs)));
+        }
+    }
+    cut
 }
 
 /// Where a weight tensor's bytes live, as seen by the shared PoM walk.
@@ -296,14 +328,43 @@ mod tests {
         };
         let engine = LlamaEngine::launch(&gguf).expect("engine launch");
         let out = engine
-            .chat("You are a terse assistant.", "Reply with the single word: pong", 16)
+            .chat("You are a terse assistant.", "Reply with the single word: pong", 16, &[])
             .expect("chat");
         eprintln!("model replied: {out:?}");
         assert!(!out.trim().is_empty(), "empty completion");
         // Greedy decoding is deterministic: the same call must reproduce byte-identically.
         let again = engine
-            .chat("You are a terse assistant.", "Reply with the single word: pong", 16)
+            .chat("You are a terse assistant.", "Reply with the single word: pong", 16, &[])
             .expect("chat (repeat)");
         assert_eq!(out, again, "greedy decode not deterministic");
+    }
+
+    /// The stop scan must catch a marker regardless of how token pieces split it, cut at the
+    /// EARLIEST marker, and never fire on clean output.
+    #[test]
+    fn find_stop_cuts_split_and_earliest_markers() {
+        let stops = &["<|im_end|>", "<|im_start|>"];
+
+        // No marker → no cut, whatever the appended size.
+        assert_eq!(find_stop(b"a clean answer", 6, stops), None);
+        assert_eq!(find_stop(b"", 0, stops), None);
+        assert_eq!(find_stop(b"anything", 3, &[]), None);
+
+        // Marker split across two pieces: "...<|im_" seen first, "end|>" appended now. The
+        // scan window must reach back across the boundary and cut at the marker start.
+        let out = b"The answer is 42.<|im_end|>";
+        assert_eq!(find_stop(out, "end|>".len(), stops), Some(17));
+
+        // Marker fully inside the freshly appended piece.
+        assert_eq!(find_stop(out, out.len(), stops), Some(17));
+
+        // Two markers in the window → earliest wins (the shorter tail marker starts later).
+        let two = b"x<|im_end|>y<|im_start|>";
+        assert_eq!(find_stop(two, two.len(), stops), Some(1));
+
+        // Bytes before the window are NOT rescanned: a marker that ended on a previous piece
+        // is outside the window when only unrelated bytes were appended since.
+        let stale = b"<|im_end|>0123456789abcdef";
+        assert_eq!(find_stop(stale, 3, stops), None);
     }
 }
