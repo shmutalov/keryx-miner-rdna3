@@ -318,7 +318,7 @@ mod tests {
 
     /// End-to-end in-process inference on a real GGUF + GPU. Ignored by default (loads a
     /// multi-GB model); run with:
-    ///   KERYX_TEST_GGUF=<path to model.gguf> cargo test --release --features inproc-llm -- --ignored inproc_chat
+    ///   KERYX_TEST_GGUF=<path to model.gguf> cargo test --release -- --ignored inproc_chat
     #[test]
     #[ignore = "loads a multi-GB GGUF onto the GPU; set KERYX_TEST_GGUF to run"]
     fn inproc_chat_smoke() {

@@ -62,17 +62,18 @@ ureq = { version = "2", features = ["tls", "json"] }
 base64 = "0.22"
 anyhow = "1"
 # OPoI inference: llama.cpp via FFI with its Vulkan backend, IN-PROCESS — the PoM walk reads
-# the engine's own resident weight buffers (zero-dup). Pulled from our fork branch carrying the
-# windows-gnu vulkan build fixes (upstream PR utilityai/llama-cpp-rs#1060) plus the keryx ggml
-# exports (raw handles, tensor BDA, guarded queue submit) via the patched llama.cpp submodule.
+# the engine's own resident weight buffers (zero-dup). Pulled from our fork branch carrying ONLY
+# the keryx ggml exports (raw handles, tensor BDA, guarded queue submit) via the patched
+# llama.cpp submodule, rebased onto upstream 0.1.151 — the windows-gnu vulkan build fixes
+# (PR utilityai/llama-cpp-rs#1060) are upstream as of that release and no longer carried here.
 # default-features = false drops `common` (avoids upstream issue #1059's unlinked build-info
 # objects — we only need core llama: load, chat template, tokenize, greedy decode) and `openmp`
 # (no libgomp runtime dep; all layers run on the GPU anyway).
-# Pinned by rev (branch: keryx-zero-dup): Cargo.lock is gitignored in this repo, so a branch
-# reference would float — the rev makes release builds reproducible.
-llama-cpp-2 = { git = "https://github.com/shmutalov/llama-cpp-rs", rev = "b39b1ae62b2c78cadf9ef5e80aef63003cff32f4", default-features = false, features = ["vulkan"] }
+# Pinned by rev (branch: keryx-zero-dup-0.1.151): Cargo.lock is gitignored in this repo, so a
+# branch reference would float — the rev makes release builds reproducible.
+llama-cpp-2 = { git = "https://github.com/shmutalov/llama-cpp-rs", rev = "cfe442f88748fc840ddd738357d4f822ed75f96f", default-features = false, features = ["vulkan"] }
 # Direct sys-crate access for the keryx FFI exports — llama-cpp-2 does not re-export its sys crate.
-llama-cpp-sys-2 = { git = "https://github.com/shmutalov/llama-cpp-rs", rev = "b39b1ae62b2c78cadf9ef5e80aef63003cff32f4", default-features = false }
+llama-cpp-sys-2 = { git = "https://github.com/shmutalov/llama-cpp-rs", rev = "cfe442f88748fc840ddd738357d4f822ed75f96f", default-features = false }
 time = { version = "0.3", features = ["formatting", "macros"] }
 flate2 = "1.0"
 tar = "0.4"
