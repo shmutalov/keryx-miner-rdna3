@@ -11,8 +11,8 @@ REM --- Your Keryx payout address ---
 set "MINING_ADDRESS=keryx:qz4zajm2kecfy5c6qctepdnt4666yz0qhff5alnhyy6jjzfm94svxylck57rh"
 
 REM --- Pool and worker name (these are also the built-in defaults) ---
-REM set "POOL=stratum+tcp://krx.suprnova.cc:4404"
-set "POOL=stratum+tcp://krx.suprnova.cc:4401"
+set "POOL=stratum+tcp://krx.suprnova.cc:4404"
+REM set "POOL=stratum+tcp://krx.suprnova.cc:4401"
 REM set "POOL=stratum+tcp://krx.baikalmine.com:9020"
 REM set "POOL=stratum+tcp://eu.miningcrib.com:7212"
 REM set "POOL=stratum+tcp://pool.ddsolutions.ai:5555"
