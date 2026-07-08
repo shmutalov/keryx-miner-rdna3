@@ -4,13 +4,13 @@ use log::LevelFilter;
 use crate::Error;
 
 #[derive(Parser, Debug)]
-#[clap(name = "keryx-miner", version, about = "A Keryx high performance GPU miner with OPoI inference\n\nUncensored model tiers (default: Gemma-3-4B + Dolphin-8B — RTX 3060 12GB / 3070 / 3080):\n  --very-light Qwen3-1.7B only — RTX 3050 4GB or any GPU (PoM tier 0, post-H2)\n  --light      Gemma-3-4B only — RTX 3060 6GB or any GPU\n  (default)    Gemma-3-4B + Dolphin-3.0-Llama-3.1-8B — RTX 3060 12GB / 3070 / 3080\n  --high       + Qwen3-32B (Q4_K_M) — RTX 3090 / 4090 / 5090 (24GB+)\n  --very-high  Llama-3.3-70B — 48GB+ single-GPU (RTX 6000 Ada / A6000 / L40S)", term_width = 0)]
+#[clap(name = "keryx-miner", version, about = "A Keryx high performance GPU miner with OPoI inference\n\nUncensored model tiers — one model per tier (default: Dolphin-8B):\n  --very-light Qwen3-1.7B — 4GB+ VRAM, smallest tier\n  --light      Gemma-3-4B — 8GB+ VRAM\n  (default)    Dolphin-3.0-Llama-3.1-8B — 12GB+ VRAM\n  --high       Qwen3-32B (Q4_K_M) — 24GB+ VRAM\n  --very-high  Llama-3.3-70B (Q2_K_L 32GB / Q4 48GB) — 32GB+ VRAM", term_width = 0)]
 pub struct Opt {
     // ── OPoI / Inference ─────────────────────────────────────────────────────
 
     #[clap(
         long = "very-light",
-        help = "Model tier: Qwen3-1.7B only — any GPU (4GB+ VRAM). PoM tier 0 post-H2.",
+        help = "Model tier: Qwen3-1.7B — 4GB+ VRAM, smallest tier",
         help_heading = "OPoI / Inference",
         conflicts_with_all = &["light", "high", "very-high"]
     )]
@@ -18,7 +18,7 @@ pub struct Opt {
 
     #[clap(
         long = "light",
-        help = "Model tier: Gemma-3-4B only — any GPU (6GB+ VRAM)",
+        help = "Model tier: Gemma-3-4B — 8GB+ VRAM",
         help_heading = "OPoI / Inference",
         conflicts_with_all = &["very-light", "high", "very-high"]
     )]
@@ -26,7 +26,7 @@ pub struct Opt {
 
     #[clap(
         long = "high",
-        help = "Model tier: Gemma-3-4B + Dolphin-8B + Qwen3-32B (Q4_K_M) — RTX 3090 / 4090 / 5090 (24GB+)",
+        help = "Model tier: Qwen3-32B (Q4_K_M) — 24GB+ VRAM",
         help_heading = "OPoI / Inference",
         conflicts_with_all = &["very-light", "light", "very-high"]
     )]
@@ -34,7 +34,7 @@ pub struct Opt {
 
     #[clap(
         long = "very-high",
-        help = "Model tier: Llama-3.3-70B — 48GB+ single-GPU (RTX 6000 Ada / A6000 / L40S)",
+        help = "Model tier: Llama-3.3-70B — Q2_K_L 32GB / Q4 48GB",
         help_heading = "OPoI / Inference",
         conflicts_with_all = &["very-light", "light", "high"]
     )]
