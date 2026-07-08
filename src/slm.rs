@@ -259,7 +259,8 @@ fn system_prompt_for(name: &str) -> &'static str {
         "llama-3.3-70b" | "llama-3.3-70b-q2" | "llama-3.3-70b-official" => SYSTEM_PROMPT_LLAMA70B,
         "deepseek-r1-32b" | "deepseek-r1-8b" => SYSTEM_PROMPT_DEEPSEEK,
         "tinyllama" => SYSTEM_PROMPT_TINYLLAMA,
-        "qwen3-32b" => SYSTEM_PROMPT_QWEN3,
+        // Qwen3 32B and 1.7B share the same ChatML template + persona.
+        "qwen3-32b" | "qwen3-1.7b" => SYSTEM_PROMPT_QWEN3,
         _ => SYSTEM_PROMPT_DOLPHIN,
     }
 }
@@ -282,9 +283,12 @@ fn stop_strings_for(name: &str) -> &'static [&'static str] {
 }
 
 /// The user message for a model. Qwen3 takes `/no_think` to answer directly (no reasoning block).
+/// Both Qwen3 quants (32B, 1.7B) must get it — without it the 1.7B emits a full `<think>` block
+/// that `strip_think` only removes if `max_tokens` reached the closing tag, else the raw reasoning
+/// is published as the answer.
 fn user_message_for(name: &str, prompt: &str) -> String {
     match name {
-        "qwen3-32b" => format!("{} /no_think", prompt),
+        "qwen3-32b" | "qwen3-1.7b" => format!("{} /no_think", prompt),
         _ => prompt.to_string(),
     }
 }
