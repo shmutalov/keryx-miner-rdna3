@@ -36,7 +36,7 @@ set RUST_BACKTRACE=1
 
 REM ----------------------------------------------------------------------------
 cd /d "%~dp0"
-set "MINER=%~dp0target\release\keryx-miner.exe"
+set "MINER=%~dp0target\release\keryx-miner-rdna3.exe"
 
 if not exist "%MINER%" (
     echo ERROR: miner binary not found at:

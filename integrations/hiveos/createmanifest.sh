@@ -4,8 +4,10 @@ if [ "$#" -ne "2" ]
     exit
 fi
 cat > h-manifest.conf << EOF
-# The name of the miner
-CUSTOM_NAME=keryx-miner
+# The name of the miner (rdna3 fork: distinct from the official "keryx-miner" so it installs into
+# its OWN /hive/miners/custom/keryx-miner-rdna3 folder and never inherits the official miner's
+# leftover CUDA/OpenCL plugin .so files).
+CUSTOM_NAME=keryx-miner-rdna3
 
 # Optional version of your custom miner package
 CUSTOM_VERSION=$1
@@ -13,8 +15,8 @@ CUSTOM_BUILD=0
 CUSTOM_MINERBIN=$2
 
 # Resolve the miner's ACTUAL install dir from this manifest's own location. This lets the package
-# work under any folder name (e.g. the versioned "keryx-miner-v0.3.9-rdna3") WITHOUT a
-# /hive/miners/custom/keryx-miner symlink. BASH_SOURCE[0] is this file's path even when sourced.
+# work under any folder name (e.g. the versioned "keryx-miner-v0.3.10-rdna3") WITHOUT a
+# /hive/miners/custom/keryx-miner-rdna3 symlink. BASH_SOURCE[0] is this file's path even when sourced.
 CUSTOM_MINER_DIR="\$(cd "\$(dirname "\$(readlink -f "\${BASH_SOURCE[0]:-\$0}")")" && pwd)"
 
 # Full path to miner config file (inside the actual install dir, not a hardcoded /keryx-miner/)

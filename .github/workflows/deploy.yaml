@@ -64,11 +64,11 @@ jobs:
           LIBCLANG_PATH: C:\Program Files\LLVM\bin
           CMAKE_GENERATOR: Ninja
         run: |
-          cargo build --release --bin keryx-miner
+          cargo build --release --bin keryx-miner-rdna3
           if ($LASTEXITCODE -ne 0) { exit 1 }
           $asset = "keryx-miner-$env:TAG-win64-amd64"
           New-Item -ItemType Directory $asset | Out-Null
-          Copy-Item "$env:CARGO_TARGET_DIR/release/keryx-miner.exe" $asset/
+          Copy-Item "$env:CARGO_TARGET_DIR/release/keryx-miner-rdna3.exe" $asset/
           foreach ($f in @('start-miner.bat', 'README.md')) { if (Test-Path $f) { Copy-Item $f $asset/ } }
           7z a -tzip "$asset.zip" $asset
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -140,34 +140,46 @@ jobs:
           # jammy's libclang-dev is clang-14; point bindgen at it explicitly.
           LIBCLANG_PATH: /usr/lib/llvm-14/lib
           CMAKE_GENERATOR: Ninja
+          # Resolve the bundled libvulkan.so.1 (copied next to the binary below) from the binary's
+          # OWN directory at runtime, so the plain linux tarball starts without the user setting
+          # LD_LIBRARY_PATH. Kept literal ($ORIGIN reaches ld verbatim via the env map).
+          RUSTFLAGS: "-C link-arg=-Wl,-rpath,$ORIGIN"
         run: |
           set -euxo pipefail
-          cargo build --release --bin keryx-miner
+          cargo build --release --bin keryx-miner-rdna3
           asset="keryx-miner-${TAG}-linux-amd64"
           mkdir "$asset"
-          cp target/release/keryx-miner "$asset/"
+          cp target/release/keryx-miner-rdna3 "$asset/"
           cp README.md "$asset/" 2>/dev/null || true
-          strip "$asset/keryx-miner" || true
+          strip "$asset/keryx-miner-rdna3" || true
+          # Bundle the Vulkan LOADER (libvulkan.so.1) next to the binary so the miner starts on
+          # rigs that lack libvulkan1 (common on HiveOS). h-run.sh / users must run it with the
+          # package dir on LD_LIBRARY_PATH. The GPU still needs a system ICD driver (RADV/amdvlk).
+          cp -L /usr/lib/x86_64-linux-gnu/libvulkan.so.1 "$asset/"
           tar czvf "$asset.tgz" "$asset"
 
       # HiveOS custom-miner package: the *-hiveos.tgz a flightsheet's "Installation URL" points
-      # at; extracts to /hive/miners/custom/keryx-miner/. Ships the ZERO-DUP binary: a single
+      # at; extracts to its OWN /hive/miners/custom/keryx-miner-rdna3/ (distinct from the official
+      # miner, so no stale CUDA/OpenCL plugin .so is inherited). Ships the ZERO-DUP binary: a single
       # process (inference in-process, PoM walk over shared weights) — no llama-server child for
-      # h-run.sh to manage. Requires libvulkan1 + Vulkan-capable amdgpu on the rig (h-config.sh
-      # installs libvulkan1 if missing).
+      # h-run.sh to manage. Bundles the Vulkan loader; needs a Vulkan-capable amdgpu driver ICD
+      # (h-config.sh installs mesa-vulkan-drivers if none is present).
       - name: Package HiveOS flightsheet
         run: |
           set -euxo pipefail
-          pkg="keryx-miner"
-          ( cd integrations/hiveos && bash createmanifest.sh "${TAG#v}" keryx-miner )
+          pkg="keryx-miner-rdna3"
+          ( cd integrations/hiveos && bash createmanifest.sh "${TAG#v}" keryx-miner-rdna3 )
           mkdir -p "$pkg"
           cp integrations/hiveos/h-config.sh \
              integrations/hiveos/h-run.sh \
              integrations/hiveos/h-stats.sh \
              integrations/hiveos/h-manifest.conf "$pkg/"
-          cp target/release/keryx-miner "$pkg/keryx-miner"
-          strip "$pkg/keryx-miner" || true
-          chmod +x "$pkg"/*.sh "$pkg/keryx-miner"
+          cp target/release/keryx-miner-rdna3 "$pkg/keryx-miner-rdna3"
+          strip "$pkg/keryx-miner-rdna3" || true
+          # Bundle the Vulkan loader; h-run.sh puts the package dir first on LD_LIBRARY_PATH, so
+          # this is found even on HiveOS images without libvulkan1 (or with broken apt).
+          cp -L /usr/lib/x86_64-linux-gnu/libvulkan.so.1 "$pkg/"
+          chmod +x "$pkg"/*.sh "$pkg/keryx-miner-rdna3"
           tar czvf "keryx-miner-${TAG}-hiveos.tgz" "$pkg"
 
       - name: Upload artifacts (always)

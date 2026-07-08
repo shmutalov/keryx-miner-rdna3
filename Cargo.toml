@@ -20,6 +20,14 @@ include = [
     "README.md",
 ]
 
+# RDNA3 fork: rename the produced binary to `keryx-miner-rdna3` so its file/folder never collides
+# with an official `keryx-miner` install (a shared folder leaves foreign CUDA/OpenCL plugin .so
+# files the fork would try to load). The PACKAGE name stays `keryx-miner` so the internal
+# `keryx_miner` lib crate, `cargo test -p keryx-miner`, and the pool user-agent are all unchanged.
+[[bin]]
+name = "keryx-miner-rdna3"
+path = "src/main.rs"
+
 [dependencies]
 tonic = "0.8"
 tokio = { version = "1.17", features = ["macros", "rt-multi-thread", "signal"] }

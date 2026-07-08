@@ -31,7 +31,14 @@ mod pow;
 mod target;
 mod watch;
 
-const WHITELIST: [&str; 4] = ["libkeryxcuda", "libkeryxopencl", "keryxcuda", "keryxopencl"];
+// RDNA3 fork ships NO cdylib PoW plugins — PoW/PoM run in the in-process Vulkan worker
+// (see vulkan_worker.rs, registered in real_main). The whitelist is intentionally EMPTY so a
+// stray official-miner plugin left in the install dir is NEVER dlopen'd. This matters because
+// the fork's binary is `keryx-miner-rdna3` but users sometimes unpack it over an existing
+// official `keryx-miner` folder (e.g. /hive/miners/custom/keryx-miner), leaving a stale
+// `libkeryxopencl.so`/`libkeryxcuda.so` behind. Such a plugin is built against a different
+// clap/plugin ABI and aborts the process on a TypeId downcast mismatch the moment it loads.
+const WHITELIST: [&str; 0] = [];
 
 pub mod proto {
     #![allow(clippy::derive_partial_eq_without_eq)]
@@ -318,7 +325,7 @@ async fn run() -> Result<(), Error> {
     // SIGTERM, which previously had no handler and required SIGKILL.
     spawn_shutdown_handler();
     info!("=================================================================================");
-    info!("                 Keryx-Miner GPU {}", env!("CARGO_PKG_VERSION"));
+    info!("              Keryx-Miner-RDNA3 GPU {}", env!("CARGO_PKG_VERSION"));
     info!(" Mining for: {}", opt.mining_address.as_deref().unwrap_or("(recovery mode)"));
     info!("=================================================================================");
 

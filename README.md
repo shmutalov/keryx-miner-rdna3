@@ -48,8 +48,8 @@ cd keryx-miner-rdna3
 cargo build --release
 ```
 
-Binary: `target/release/keryx-miner` (`.exe` on Windows). No `nvcc`, no CUDA toolkit, no model
-SDKs are required.
+Binary: `target/release/keryx-miner-rdna3` (`.exe` on Windows). No `nvcc`, no CUDA toolkit, no
+model SDKs are required.
 
 ---
 
@@ -66,7 +66,7 @@ on first run (same as upstream).
 ## Usage
 
 ```bash
-./keryx-miner --mining-address keryx:YOUR_ADDRESS
+./keryx-miner-rdna3 --mining-address keryx:YOUR_ADDRESS
 ```
 
 ### Inference tiers (OPoI)
@@ -113,7 +113,7 @@ exporting anything. Prebuilt release binaries need none of this.
 `--keryxd-address` takes either a `grpc://` node (solo) or a `stratum+tcp://` pool URL. For pools:
 
 ```bash
-./keryx-miner --mining-address keryx:YOUR_ADDRESS \
+./keryx-miner-rdna3 --mining-address keryx:YOUR_ADDRESS \
   --keryxd-address stratum+tcp://krx.suprnova.cc:4401 \
   --worker rig1 \
   --password d=1
@@ -126,7 +126,7 @@ exporting anything. Prebuilt release binaries need none of this.
 ### All options
 
 ```bash
-./keryx-miner --help
+./keryx-miner-rdna3 --help
 ```
 
 ### Useful environment variables
