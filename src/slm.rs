@@ -72,6 +72,12 @@ static SERVER: Mutex<Option<([u8; 32], Arc<InferenceEngine>)>> = Mutex::new(None
 // ── File management ──────────────────────────────────────────────────────────
 
 fn model_dir(spec: &ModelSpec) -> std::path::PathBuf {
+    // KERYX_MODELS_DIR (set directly or via --models-dir) relocates the whole model store —
+    // on HiveOS h-run.sh points it at a shared dir OUTSIDE the package folder, so the
+    // multi-GB GGUFs survive custom-miner upgrades (which delete the package folder).
+    if let Some(root) = std::env::var_os("KERYX_MODELS_DIR") {
+        return std::path::PathBuf::from(root).join(spec.dir_name);
+    }
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
@@ -79,7 +85,8 @@ fn model_dir(spec: &ModelSpec) -> std::path::PathBuf {
     exe_dir.join("models").join(spec.dir_name)
 }
 
-/// Path to a model's GGUF file (`<exe_dir>/models/<dir_name>/model.gguf`). Used by PoM to
+/// Path to a model's GGUF file (`<models_root>/<dir_name>/model.gguf`, where the root is
+/// `KERYX_MODELS_DIR`/`--models-dir` if set, else `<exe_dir>/models`). Used by PoM to
 /// build the possession weight index, and to launch llama-server for inference.
 pub fn gguf_path_for(spec: &ModelSpec) -> std::path::PathBuf {
     model_dir(spec).join("model.gguf")

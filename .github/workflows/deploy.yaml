@@ -173,6 +173,7 @@ jobs:
           cp integrations/hiveos/h-config.sh \
              integrations/hiveos/h-run.sh \
              integrations/hiveos/h-stats.sh \
+             integrations/hiveos/pre-hive-upgrade.sh \
              integrations/hiveos/h-manifest.conf "$pkg/"
           cp target/release/keryx-miner-rdna3 "$pkg/keryx-miner-rdna3"
           strip "$pkg/keryx-miner-rdna3" || true

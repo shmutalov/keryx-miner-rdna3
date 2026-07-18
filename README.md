@@ -137,7 +137,21 @@ exporting anything. Prebuilt release binaries need none of this.
 | `KERYX_POW_ONLY` | `1` = mine kHeavyHash shares only; skip OPoI models + inference (no PoM) |
 | `KERYX_POM_KEEP_RESIDENT` | `1` = keep the PoM weight blob resident across inference when VRAM fits (skips reload) |
 | `KERYX_INFER_GPU` | raw Vulkan device index inference is pinned to on multi-GPU rigs (default: first discrete GPU) |
+| `KERYX_MODELS_DIR` | model storage root (default `<exe_dir>/models`); also settable per-run via `--models-dir` |
+| `KERYX_PURGE_LEGACY_MODELS` | (HiveOS) `1` = h-run.sh force-removes a leftover in-package model cache after merging it into the shared one |
 | `GLSLC` / `VULKAN_SDK` | (build only) locate `glslc` for shader compilation |
+
+On HiveOS the models are kept in the shared `/hive/miners/custom/models` cache (exported as
+`KERYX_MODELS_DIR` by `h-run.sh`), so package upgrades no longer re-download them. **Upgrading a
+rig from ≤ v0.3.12:** the old layout keeps models *inside* the package dir, which HiveOS deletes
+when the Install URL changes — run this once on the rig first to move them out:
+
+```bash
+wget -qO- https://raw.githubusercontent.com/shmutalov/keryx-miner-rdna3/rdna3/integrations/hiveos/pre-hive-upgrade.sh | bash
+```
+
+(Skipping it only costs a one-time re-download; v0.3.13+ migrates any surviving in-package cache
+automatically at every start.)
 
 ---
 

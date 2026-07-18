@@ -320,6 +320,12 @@ async fn run() -> Result<(), Error> {
     if opt.num_threads.is_none() {
         opt.num_threads = Some(0);
     }
+    // Model storage root is configurable: an explicit --models-dir wins over an inherited
+    // KERYX_MODELS_DIR (h-run.sh exports it on HiveOS so models live outside the package dir
+    // and survive upgrades). slm::model_dir reads the env var.
+    if let Some(dir) = opt.models_dir.as_ref() {
+        std::env::set_var("KERYX_MODELS_DIR", dir);
+    }
     env_logger::builder().filter_level(opt.log_level()).parse_default_env().init();
     // Shut down cleanly on SIGINT/SIGTERM (Ctrl-C on Windows) — supervisors stop the miner with
     // SIGTERM, which previously had no handler and required SIGKILL.
@@ -328,6 +334,9 @@ async fn run() -> Result<(), Error> {
     info!("              Keryx-Miner-RDNA3 GPU {}", env!("CARGO_PKG_VERSION"));
     info!(" Mining for: {}", opt.mining_address.as_deref().unwrap_or("(recovery mode)"));
     info!("=================================================================================");
+    if let Ok(dir) = std::env::var("KERYX_MODELS_DIR") {
+        info!("Models directory: {}", dir);
+    }
 
     // Recovery mode: rebuild escrow_state.json from the Keryx public API, then exit.
     // Must run before escrow key loading to avoid creating a new random key on disk.
