@@ -27,15 +27,25 @@ type MinerHandler = std::thread::JoinHandle<Result<(), Error>>;
 const FREEZE_GRACE: Duration = Duration::from_secs(60);
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-extern "C" fn signal_panic(_signal: nix::libc::c_int) {
+extern "C-unwind" fn signal_panic(_signal: nix::libc::c_int) {
+    // MUST be `extern "C-unwind"`: a plain `extern "C"` handler turns this panic into a
+    // process-wide abort ("panic in a function that cannot unwind") — the OPoI shutdown
+    // crash-loop. Unwinding lets a genuinely stuck worker's join() return instead. This
+    // is a last resort; the cooperative Close checks below normally let workers exit
+    // before this handler ever fires.
     panic!("Forced shutdown");
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn register_freeze_handler() {
-    let handler = nix::sys::signal::SigHandler::Handler(signal_panic);
+    // nix's typed SigHandler only accepts `extern "C" fn`, which would reintroduce the
+    // abort. Register through libc with a transmute instead: the C and C-unwind ABIs
+    // share an identical calling convention (this is ABI-sound), and unwind behavior
+    // follows the handler's own `extern "C-unwind"` definition.
     unsafe {
-        nix::sys::signal::signal(nix::sys::signal::Signal::SIGUSR1, handler).unwrap();
+        let handler: nix::libc::sighandler_t =
+            std::mem::transmute(signal_panic as extern "C-unwind" fn(nix::libc::c_int));
+        let _ = nix::libc::signal(nix::libc::SIGUSR1, handler);
     }
 }
 
@@ -337,6 +347,17 @@ impl MinerManager {
                         // An inference may have evicted the mining model (inference has priority).
                         // Rebuild the walk (reloads the model resident) before mining resumes.
                         if !keryx_miner::pom_gpu::is_installed(pom_device) {
+                            // A resident-model reload is a multi-second blocking GPU op with no
+                            // cooperative Close check inside it. If a shutdown/new job is already
+                            // pending, act on it now instead of starting a reload that would
+                            // outlive the shutdown grace window and get force-killed.
+                            if let Some(cmd) = block_channel.get_changed()? {
+                                match cmd {
+                                    Some(WorkerCommand::Close) => return Ok(()),
+                                    Some(WorkerCommand::Job(ns)) => { state = Some(ns); continue; }
+                                    None => { state = None; continue; }
+                                }
+                            }
                             keryx_miner::pom_gpu::ensure_installed(daa, pom_device);
                         }
                         let h3 = daa >= keryx_miner::pom::POM_LEVEL_ACTIVATION_DAA;
