@@ -141,10 +141,9 @@ pub fn ensure_installed(daa: u64, device: u32) -> bool {
 }
 
 /// PoM tier index of the mining model at a given block DAA. Recomputed per block (not frozen at
-/// index-build time) so the tier reindexing at the very-light hardfork (H2) is applied at the
-/// exact boundary — e.g. Gemma 0→1 — rather than from a stale build-time value. The proof's `tier`
-/// field MUST come from here, keyed on the block's own DAA, or a post-H2 block carries the stale
-/// 4-tier index and the node rejects it (`BadWeightPath`).
+/// index-build time) so the H4 gate applies at the exact boundary — None below the flip (this
+/// binary refuses to mine a pre-H4-era block), the `POM_TIERS_H4` index at/after it. The proof's
+/// `tier` field MUST come from here, keyed on the block's own DAA.
 pub fn current_tier(daa: u64) -> Option<u8> {
     let (model_id, _) = MINING_TIER.get()?;
     crate::models::pom_tier_index(model_id, daa)

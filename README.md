@@ -17,7 +17,7 @@ inference (OPoI — Optimistic Proof of Inference).
 |---|---|---|
 | **PoW** (kHeavyHash) | Vulkan compute shader | `keccak-f1600 → 64×64 matmul → wave_mix → keccak`. Bit-exact vs the host reference, verified on a 7900 XT. |
 | **PoM** (possession walk) | Vulkan compute shader | walk over the model weights resident in **device-local VRAM**, sharded across ≤1 GiB buffers reached by buffer-device-address (an 8B+ model's blob exceeds AMD's 4 GiB SSBO range and 2 GiB single-allocation limits). Bit-exact vs `pom::walk_final`, verified on a 7900 XT. |
-| **OPoI inference** (Dolphin-8B / Qwen3-32B / Gemma / Llama) | **llama.cpp Vulkan, in-process** | linked into the miner (all layers on GPU); the PoM walk shares the engine's resident weight buffers (zero-dup) — no child process, no HTTP. |
+| **OPoI inference** (H4 lineup: EXAONE / Mistral / GLM-4 / Qwen3.6 / Kimi-Linear) | **llama.cpp Vulkan, in-process** | linked into the miner (all layers on GPU); the PoM walk shares the engine's resident weight buffers (zero-dup) — no child process, no HTTP. |
 | **OPoI fraud-proof commitment** | CPU (integer) | `model_fixed::forward` — a deterministic, bit-exact 32-byte fold required by consensus. Not a GPU/LLM workload; unchanged. |
 
 The custom kernels live in the [`keryx-vulkan`](keryx-vulkan/) crate (uses [`ash`](https://crates.io/crates/ash);
@@ -69,18 +69,20 @@ on first run (same as upstream).
 ./keryx-miner-rdna3 --mining-address keryx:YOUR_ADDRESS
 ```
 
-### Inference tiers (OPoI)
+### Inference tiers (OPoI — H4 lineup, active at DAA 54,766,000)
 
 | Flag | Models | Min VRAM | Fits a 7900 XT (20 GB)? |
 |------|--------|----------|--------------------------|
-| `--light` | Gemma-3-4B | 4 GB | ✅ |
-| *(default)* | Dolphin-Llama3-8B | 8 GB | ✅ |
-| `--high` | Qwen3-32B (Q4_K_M) | 24 GB | tight / no |
-| `--very-high` | Llama-3.3-70B | 48 GB | no |
+| `--very-light` | EXAONE-4.0-1.2B | 4 GB | ✅ |
+| `--light` | Mistral-7B-v0.3 (Q6_K) | 8 GB | ✅ |
+| *(default)* | GLM-4-9B-0414 (Q6_K) | 12 GB | ✅ |
+| `--high` | Qwen3.6-27B (Q4_K_M) | 24 GB | no |
+| `--very-high` | Kimi-Linear-48B (Q4_K_M) | 32 GB | no |
 
-> Post-hardfork (OPoI v2 / PoM), **1 GPU = 1 tier**: each tier proves possession of and serves
-> exactly the single model above — the cumulative "serve everything below my tier" behaviour is
-> dropped, because a PoM GPU is bound to the one model whose weights are resident in VRAM.
+> Under PoM, **1 GPU = 1 tier**: each tier proves possession of and serves exactly the single
+> model above — a PoM GPU is bound to the one model whose weights are resident in VRAM. This
+> build is **H4-only**: below the H4 flip point it refuses to mine (the pre-H4 lineup was
+> dropped, matching upstream v0.3.7).
 
 The miner is **GPU-only by default** (no CPU mining threads); pass `--threads N` (`-t`) to add CPU
 PoW workers if you want them.

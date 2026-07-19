@@ -192,25 +192,36 @@ impl State {
             return None;
         }
 
-        let proof = pom::build_proof(
-            tier,
-            &pph,
-            nonce,
-            seed,
-            index.n_chunks,
-            pom::POM_WALK_STEPS,
-            pom::POM_OPENINGS,
-            |o| index.read_chunk(o),
-            |o| index.merkle_path(o),
-            h3,
-        );
+        // H4: recompute-from-chunks proof (all K chunks + paths, verifier re-walks). Pre-H4: the
+        // 32/256-opening proof. Node switches its verifier at the SAME score — lockstep.
+        let h4 = self.daa_score >= pom::COIN_AGE_VERIFICATION_ACTIVATION_DAA;
+        let proof = if h4 {
+            pom::build_proof_v2(tier, &pph, seed, index.n_chunks, pom::POM_WALK_STEPS, |o| index.read_chunk(o), |o| index.merkle_path(o), h3)
+        } else {
+            pom::build_proof(
+                tier,
+                &pph,
+                nonce,
+                seed,
+                index.n_chunks,
+                pom::POM_WALK_STEPS,
+                pom::POM_OPENINGS,
+                |o| index.read_chunk(o),
+                |o| index.merkle_path(o),
+                h3,
+            )
+        };
 
         // Cheap insurance: run the node's exact weightless verifier over the freshly built proof
         // before submit. A self-verify failure means a GPU↔CPU fold drift or a Merkle-path bug —
         // submitting it would just earn a node rejection, so drop the block and log loudly instead.
         let target_le = self.target.to_le_bytes();
-        if !pom::verify_proof(&pph, nonce, seed, &proof, index.n_chunks, pom::POM_WALK_STEPS, pom::POM_OPENINGS, &index.r_t, &target_le, h3)
-        {
+        let self_ok = if h4 {
+            pom::verify_proof_v2(&proof, &pph, seed, index.n_chunks, pom::POM_WALK_STEPS, &index.r_t, &target_le, h3)
+        } else {
+            pom::verify_proof(&pph, nonce, seed, &proof, index.n_chunks, pom::POM_WALK_STEPS, pom::POM_OPENINGS, &index.r_t, &target_le, h3)
+        };
+        if !self_ok {
             log::error!(
                 "PoM: self-verify FAILED for winning nonce {} — dropping block instead of submitting a \
                  proof the node would reject. Indicates a GPU/CPU walk-fold or Merkle-path mismatch.",
@@ -219,7 +230,9 @@ impl State {
             return None;
         }
 
-        let bytes = borsh::to_vec(&proof).ok()?;
+        // `to_wire_bytes` keeps a pre-H4 proof byte-identical to the 7-field layout the running
+        // node still decodes; a v2 proof encodes the full struct (only H4 nodes decode it).
+        let bytes = proof.to_wire_bytes();
 
         let mut block_seed = (*self.block).clone();
         match block_seed {

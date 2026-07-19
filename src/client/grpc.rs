@@ -437,7 +437,7 @@ impl KeryxdHandler {
             return None;
         }
         let v: serde_json::Value = serde_json::from_slice(&raw[PREFIX.len()..]).ok()?;
-        let model = v["m"].as_str().unwrap_or("gemma-3-4b").to_string();
+        let model = v["m"].as_str().unwrap_or("glm-4-9b-0414").to_string();
         let prompt = v["p"].as_str()?.to_string();
         let max_tokens = v["n"].as_u64().unwrap_or(128) as usize;
         Some((model, prompt, max_tokens))
@@ -571,9 +571,8 @@ impl KeryxdHandler {
                     if daa > self.last_known_daa {
                         self.last_known_daa = daa;
                     }
-                    // OPoI v2 hardfork: hot-swap the served model lineup the moment the
-                    // chain reaches OPOI_V2_ACTIVATION_DAA (idempotent, no restart).
-                    keryx_miner::slm::advance_lineup_if_due(daa);
+                    // H4-only binary: the served lineup is static (set once at startup) —
+                    // no era crossing left to hot-swap.
                 }
                 // Handle node-issued inference challenge: spawn an inference task if a new
                 // challenge arrived and no challenge is already in flight. Ignored under PoM — the

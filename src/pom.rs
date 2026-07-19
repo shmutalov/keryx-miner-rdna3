@@ -62,6 +62,14 @@ pub struct PomOpening {
     pub trace_path_after: Vec<[u8; 32]>,
 }
 
+/// H4 recompute-from-chunks walk step — mirror of the node's `PomStep`. The chunk index is
+/// NOT carried (the verifier derives `state % N` while re-walking).
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+pub struct PomStep {
+    pub chunk: [u8; 32],
+    pub weight_path: Vec<[u8; 32]>,
+}
+
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
 pub struct PomProof {
     pub tier: u8,
@@ -71,6 +79,44 @@ pub struct PomProof {
     pub initial_trace_path: Vec<[u8; 32]>,
     pub final_trace_path: Vec<[u8; 32]>,
     pub openings: Vec<PomOpening>,
+    /// H4 recompute-from-chunks walk record. `None` on every pre-H4 proof. MUST keep the exact
+    /// field order/types of the node's `PomProof::steps_v2` (borsh wire format).
+    pub steps_v2: Option<Vec<PomStep>>,
+}
+
+/// Exact pre-H4 layout of `PomProof` (no `steps_v2`) — mirror of the node's `PomProofPreH4`.
+/// A pre-H4 proof MUST serialize through this so the currently-running node (7-field decode)
+/// keeps accepting it byte-for-byte. See `PomProof::to_wire_bytes`.
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+pub struct PomProofPreH4 {
+    pub tier: u8,
+    pub trace_root: [u8; 32],
+    pub pow_value: [u8; 32],
+    pub final_state: u64,
+    pub initial_trace_path: Vec<[u8; 32]>,
+    pub final_trace_path: Vec<[u8; 32]>,
+    pub openings: Vec<PomOpening>,
+}
+
+impl PomProof {
+    /// Canonical wire (borsh) encoding, era-exact — mirror of the node's `to_wire_bytes`. A proof
+    /// without the v2 extension encodes byte-identically to the pre-H4 layout, so a not-yet-H4 node
+    /// (7-field decode) still accepts it. The submit path MUST use this, never `borsh::to_vec`.
+    pub fn to_wire_bytes(&self) -> Vec<u8> {
+        match &self.steps_v2 {
+            None => borsh::to_vec(&PomProofPreH4 {
+                tier: self.tier,
+                trace_root: self.trace_root,
+                pow_value: self.pow_value,
+                final_state: self.final_state,
+                initial_trace_path: self.initial_trace_path.clone(),
+                final_trace_path: self.final_trace_path.clone(),
+                openings: self.openings.clone(),
+            })
+            .expect("PomProof borsh serialize"),
+            Some(_) => borsh::to_vec(self).expect("PomProof borsh serialize"),
+        }
+    }
 }
 
 // --- byte-exact primitives (mirror node) ---
@@ -375,7 +421,84 @@ where
         initial_trace_path: merkle_proof(&trace_leaves, 0),
         final_trace_path: merkle_proof(&trace_leaves, k as usize),
         openings,
+        steps_v2: None,
     }
+}
+
+/// H4 PROVER (recompute-from-chunks). Re-walk the (already-won) nonce recording, for each of the
+/// K steps, the 32 B chunk read and its Merkle path under R_T. No trace tree, no Fiat-Shamir
+/// openings: the node re-walks all K transitions itself and derives `final_state`, so nothing is
+/// taken on the prover's word. Legacy trace-tree fields are canonically empty. Byte-exact mirror
+/// of the node's `verify_pom_proof_v2` expectations.
+#[allow(clippy::too_many_arguments)]
+pub fn build_proof_v2<F, WP>(
+    tier: u8,
+    pre_pow_hash: &[u8; 32],
+    seed: u64,
+    n_chunks: u64,
+    k: u32,
+    read_chunk: F,
+    weight_path: WP,
+    h3: bool,
+) -> PomProof
+where
+    F: Fn(u64) -> [u64; CHUNK_WORDS],
+    WP: Fn(u64) -> Vec<[u8; 32]>,
+{
+    let mut steps = Vec::with_capacity(k as usize);
+    let mut state = seed;
+    for _ in 0..k {
+        let off = state % n_chunks;
+        let chunk_words = read_chunk(off);
+        steps.push(PomStep { chunk: words_to_bytes(&chunk_words), weight_path: weight_path(off) });
+        state = transition(state, &chunk_words);
+    }
+    let final_state = state;
+    let pow_value = pom_pow_value(final_state, pre_pow_hash, h3);
+
+    PomProof {
+        tier,
+        trace_root: [0u8; 32],
+        pow_value,
+        final_state,
+        initial_trace_path: vec![],
+        final_trace_path: vec![],
+        openings: vec![],
+        steps_v2: Some(steps),
+    }
+}
+
+/// Self-check a built v2 proof before submit — same logic the node's `verify_pom_proof_v2` runs.
+/// Cheap insurance against emitting a block the node will reject.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_proof_v2(proof: &PomProof, pre_pow_hash: &[u8; 32], seed: u64, n_chunks: u64, k: u32, r_t: &[u8; 32], target: &[u8; 32], h3: bool) -> bool {
+    let steps = match &proof.steps_v2 {
+        Some(s) if s.len() == k as usize => s,
+        _ => return false,
+    };
+    if proof.trace_root != [0u8; 32]
+        || !proof.initial_trace_path.is_empty()
+        || !proof.final_trace_path.is_empty()
+        || !proof.openings.is_empty()
+    {
+        return false;
+    }
+    let mut state = seed;
+    for step in steps.iter() {
+        let off = state % n_chunks;
+        if !verify_merkle(blake(&step.chunk), off, &step.weight_path, r_t) {
+            return false;
+        }
+        state = transition(state, &chunk_to_words(&step.chunk));
+    }
+    if state != proof.final_state {
+        return false;
+    }
+    let pow_value = pom_pow_value(state, pre_pow_hash, h3);
+    if pow_value != proof.pow_value {
+        return false;
+    }
+    le_leq(&pow_value, target)
 }
 
 /// Self-check a built proof before submit (same logic the node runs). Cheap insurance
@@ -957,6 +1080,15 @@ pub const POM_ACTIVATION_DAA: u64 = 37_780_000;
 /// = new(43_450_000).
 pub const POM_LEVEL_ACTIVATION_DAA: u64 = 43_450_000;
 
+/// H4 (coin-age + PoM verifier v2) activation DAA score. At/after this score the miner builds the
+/// recompute-from-chunks proof (`build_proof_v2`: all K chunks the walk read, each Merkle-proven
+/// under R_T, no trace tree / no spot-check) instead of the 32/256-opening `build_proof`. The node
+/// switches its verifier at the SAME score (`coin_age_verification_activation`) — node↔miner
+/// lockstep, exactly like POM_LEVEL_ACTIVATION_DAA. Mainnet H4: 54_766_000 (2026-07-18 ~20:31
+/// UTC). MUST equal the node's MAINNET_PARAMS.coin_age_verification_activation (=
+/// H4_ACTIVATION_DAA).
+pub const COIN_AGE_VERIFICATION_ACTIVATION_DAA: u64 = 54_766_000;
+
 /// The resident tier weight index + tier id, installed once at startup when PoM is enabled.
 static POM_INDEX: OnceLock<(WeightIndex, u8)> = OnceLock::new();
 
@@ -1336,6 +1468,52 @@ mod tests {
     }
 
     #[test]
+    fn build_v2_then_self_verify() {
+        let k = 256u32;
+        let idx = synth_index(4096);
+        let pph = blake(b"v2-pph");
+        let seed = pom_block_seed(&pph, 111, 0xabc, true);
+
+        let proof = build_proof_v2(3, &pph, seed, idx.n_chunks, k, |o| idx.read_chunk(o), |o| idx.merkle_path(o), true);
+        assert_eq!(proof.tier, 3);
+        assert!(proof.steps_v2.as_ref().unwrap().len() == k as usize);
+        assert!(proof.openings.is_empty() && proof.trace_root == [0u8; 32]);
+        assert!(verify_proof_v2(&proof, &pph, seed, idx.n_chunks, k, &idx.r_t, &[0xff; 32], true));
+
+        // Wrong seed / wrong root / wrong target all fail the self-check.
+        assert!(!verify_proof_v2(&proof, &pph, seed ^ 1, idx.n_chunks, k, &idx.r_t, &[0xff; 32], true));
+        assert!(!verify_proof_v2(&proof, &pph, seed, idx.n_chunks, k, &blake(b"wrong"), &[0xff; 32], true));
+        assert!(!verify_proof_v2(&proof, &pph, seed, idx.n_chunks, k, &idx.r_t, &[0u8; 32], true));
+
+        // borsh wire round-trips through to_wire_bytes (full struct for a v2 proof).
+        let bytes = proof.to_wire_bytes();
+        let back: PomProof = borsh::from_slice(&bytes).unwrap();
+        assert!(verify_proof_v2(&back, &pph, seed, idx.n_chunks, k, &idx.r_t, &[0xff; 32], true));
+    }
+
+    /// A pre-H4 proof MUST wire-encode byte-identically to the 7-field `PomProofPreH4` layout —
+    /// the invariant that keeps the currently-running (pre-H4) node accepting new-miner blocks.
+    #[test]
+    fn pre_h4_proof_wire_bytes_are_legacy_exact() {
+        let (k, t) = (256u32, 32usize);
+        let idx = synth_index(4096);
+        let pph = blake(b"legacy-pph");
+        let seed = pom_block_seed(&pph, 1, 7, false);
+        let proof = build_proof(1, &pph, 7, seed, idx.n_chunks, k, t, |o| idx.read_chunk(o), |o| idx.merkle_path(o), false);
+        let legacy = borsh::to_vec(&PomProofPreH4 {
+            tier: proof.tier,
+            trace_root: proof.trace_root,
+            pow_value: proof.pow_value,
+            final_state: proof.final_state,
+            initial_trace_path: proof.initial_trace_path.clone(),
+            final_trace_path: proof.final_trace_path.clone(),
+            openings: proof.openings.clone(),
+        })
+        .unwrap();
+        assert_eq!(proof.to_wire_bytes(), legacy);
+    }
+
+    #[test]
     fn h3_salt_changes_seed_and_pow_and_roundtrips() {
         let (k, t) = (256u32, 32usize);
         let idx = synth_index(4096);
@@ -1391,26 +1569,25 @@ mod tests {
         assert_eq!(proof.tier, 1);
     }
 
-    // Validates the canonical layout against the consensus-pinned R_T. Needs the Gemma GGUF.
-    // Run: cargo test --lib pom -- --ignored --nocapture
+    // Validates the canonical layout against the consensus-pinned H4 R_T. Needs the (smallest)
+    // EXAONE GGUF on disk — point KERYX_TEST_GGUF at it.
+    // Run: KERYX_TEST_GGUF=<path> cargo test --lib pom -- --ignored --nocapture
     #[test]
-    #[ignore = "needs Gemma-3-4B GGUF on disk"]
-    fn weight_index_matches_pinned_gemma() {
-        let path = "/home/slash/KERYX-KRX/claude/keryx-miner/target/release/models/Gemma-3-4B/model.gguf";
-        let idx = WeightIndex::build_from_gguf(path).expect("build index");
-        assert_eq!(idx.n_chunks, 77_604_776, "chunk count must match pinned GEMMA_3_4B_POM_CHUNKS");
-        let pinned: [u8; 32] = [
-            0x84, 0x6c, 0xaa, 0x40, 0x0c, 0xf0, 0x14, 0x13, 0x21, 0x18, 0x49, 0x5d, 0x22, 0xe4, 0xbf, 0xa2, 0x42, 0x45,
-            0x4e, 0xac, 0x0d, 0x83, 0x5c, 0x3f, 0x8e, 0x63, 0x47, 0xd0, 0x13, 0x9d, 0x1b, 0x7e,
-        ];
-        assert_eq!(idx.r_t, pinned, "miner R_T must equal node-pinned GEMMA_3_4B_POM_ROOT");
+    #[ignore = "needs the EXAONE-4.0-1.2B GGUF on disk; set KERYX_TEST_GGUF"]
+    fn weight_index_matches_pinned_exaone() {
+        let Ok(path) = std::env::var("KERYX_TEST_GGUF") else {
+            eprintln!("skip: KERYX_TEST_GGUF not set");
+            return;
+        };
+        let idx = WeightIndex::build_from_gguf(&path).expect("build index");
+        let anchor = crate::models::pinned_pom_anchor(&crate::models::EXAONE_4_0_1_2B.model_id).expect("EXAONE anchor");
+        assert_eq!(idx.n_chunks, anchor.chunks, "chunk count must match the node-pinned H4 anchor");
+        assert_eq!(idx.r_t, anchor.root, "miner R_T must equal the node-pinned H4 anchor root");
 
-        // A real proof over the real model self-verifies against the pinned R_T.
-        let pph = blake(b"gemma-pph");
-        let nonce = 1234;
-        let seed = pom_block_seed(&pph, 99, nonce, false);
-        let proof =
-            build_proof(0, &pph, nonce, seed, idx.n_chunks, 256, 32, |o| idx.read_chunk(o), |o| idx.merkle_path(o), false);
-        assert!(verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, 256, 32, &idx.r_t, &[0xff; 32], false));
+        // A real H4 (v2) proof over the real model self-verifies against the pinned R_T.
+        let pph = blake(b"exaone-pph");
+        let seed = pom_block_seed(&pph, 99, 1234, true);
+        let proof = build_proof_v2(0, &pph, seed, idx.n_chunks, 256, |o| idx.read_chunk(o), |o| idx.merkle_path(o), true);
+        assert!(verify_proof_v2(&proof, &pph, seed, idx.n_chunks, 256, &idx.r_t, &[0xff; 32], true));
     }
 }

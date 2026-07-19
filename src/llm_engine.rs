@@ -16,7 +16,7 @@ use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
+use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 use log::info;
 
@@ -77,30 +77,19 @@ impl LlamaEngine {
         Ok(Self { model, lock: Mutex::new(()) })
     }
 
-    /// Chat completion through the GGUF's own chat template, greedy decoding (temperature-0
-    /// equivalent — keeps OPoI answers stable), capped at `max_tokens` generated tokens.
+    /// Raw-prompt completion, greedy decoding (temperature-0 equivalent — keeps OPoI answers
+    /// stable), capped at `max_tokens` generated tokens. `prompt` must already be chat-templated
+    /// (see `slm::format_prompt_by_name`) — the H4 lineup bypasses llama.cpp's built-in template
+    /// matcher, which does not recognize every H4 architecture, and upstream miners prompt with
+    /// the exact same strings, keeping OPoI answers aligned across implementations.
     ///
     /// `stop_strings` are scanned over the decoded output and cut the turn (marker excluded)
-    /// when the model writes an end marker as plain text instead of emitting an EOG token.
-    /// Needed for GGUFs whose chat template was swapped over a vocab that lacks the template's
-    /// control tokens (abliterated Llama-3.3-70B: ChatML over stock LLaMA-3 — `<|im_end|>`
-    /// tokenizes as text, `<|eot_id|>` is never emitted, and without the cut the model reopens
-    /// `assistant` and repeats its answer until `max_tokens`). Empty for well-formed models.
-    pub fn chat(&self, system: &str, user: &str, max_tokens: usize, stop_strings: &[&str]) -> Result<String> {
+    /// when a model writes an end marker as plain text instead of emitting an EOG token.
+    /// Empty for the H4 lineup — every model's vocab carries its template's control tokens,
+    /// so the EOG ids fire natively.
+    pub fn generate(&self, prompt: &str, max_tokens: usize, stop_strings: &[&str]) -> Result<String> {
         let _serialize = self.lock.lock().unwrap_or_else(|p| p.into_inner());
         let backend = backend()?;
-
-        // The model's baked-in chat template — the same one llama-server applies.
-        let tmpl = self
-            .model
-            .chat_template(None)
-            .map_err(|e| anyhow!("llm-engine: model has no usable chat template: {e}"))?;
-        let msgs = vec![
-            LlamaChatMessage::new("system".to_string(), system.to_string())?,
-            LlamaChatMessage::new("user".to_string(), user.to_string())?,
-        ];
-        // add_ass = true: end with the assistant header so generation starts the reply.
-        let prompt = self.model.apply_chat_template(&tmpl, &msgs, true)?;
 
         // str_to_token parses special tokens (the template's control tokens) and AddBos
         // lets the tokenizer add BOS iff the model wants one — llama-server semantics.
@@ -327,15 +316,15 @@ mod tests {
             return;
         };
         let engine = LlamaEngine::launch(&gguf).expect("engine launch");
-        let out = engine
-            .chat("You are a terse assistant.", "Reply with the single word: pong", 16, &[])
-            .expect("chat");
+        // Generic ChatML prompt — good enough for a smoke test on any test GGUF.
+        let prompt = "<|im_start|>system\nYou are a terse assistant.<|im_end|>\n\
+                      <|im_start|>user\nReply with the single word: pong<|im_end|>\n\
+                      <|im_start|>assistant\n";
+        let out = engine.generate(prompt, 16, &[]).expect("generate");
         eprintln!("model replied: {out:?}");
         assert!(!out.trim().is_empty(), "empty completion");
         // Greedy decoding is deterministic: the same call must reproduce byte-identically.
-        let again = engine
-            .chat("You are a terse assistant.", "Reply with the single word: pong", 16, &[])
-            .expect("chat (repeat)");
+        let again = engine.generate(prompt, 16, &[]).expect("generate (repeat)");
         assert_eq!(out, again, "greedy decode not deterministic");
     }
 

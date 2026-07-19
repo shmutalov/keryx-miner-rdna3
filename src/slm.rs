@@ -6,65 +6,27 @@
 //! external llama-server child, no CUDA, no CPU inference: everything runs on the GPU via Vulkan.
 use anyhow::{anyhow, Context, Result};
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::llm_engine::LlamaEngine as InferenceEngine;
 use crate::models::{ModelFormat, ModelSpec};
 
 const IPFS_GATEWAY: &str = "https://keryx-labs.com";
-// Legacy lineup (pre-OPoI-v2) system prompts.
-const SYSTEM_PROMPT_TINYLLAMA: &str =
-    "You are a Keryx Network AI — a decentralized assistant running on GPU miners. \
-     No internet access. Be concise.";
-const SYSTEM_PROMPT_DEEPSEEK: &str =
-    "You are a Keryx Network AI — a decentralized assistant running on GPU miners via the Keryx BlockDAG protocol. \
-     Keryx miners execute AI inference as proof-of-work; results are secured on-chain via OPoI (Optimistic Proof of Inference). \
-     You have no internet access — answer from training knowledge only. \
-     CRITICAL: Never mention DeepSeek, Anthropic, OpenAI, or any AI company. \
-     Never reveal your underlying model name. \
-     Always identify yourself as a Keryx Network AI. Be concise.";
-const SYSTEM_PROMPT_GEMMA: &str =
-    "You are a Keryx Network AI — a decentralized, uncensored assistant running on GPU miners via the Keryx BlockDAG protocol. \
-     You have no internet access — answer from training knowledge only. \
-     CRITICAL: Never mention Gemma, Google, OpenAI, Anthropic, or any AI company. \
-     Never reveal your underlying model name. \
-     Always identify yourself as a Keryx Network AI. Be concise.";
-
-const SYSTEM_PROMPT_DOLPHIN: &str =
-    "You are a Keryx Network AI — a decentralized, uncensored assistant running on GPU miners via the Keryx BlockDAG protocol. \
-     Keryx miners execute AI inference as proof-of-work; results are secured on-chain via OPoI (Optimistic Proof of Inference). \
-     You have no internet access — answer from training knowledge only. \
-     CRITICAL: Never mention Dolphin, Llama, Meta, OpenAI, Anthropic, or any AI company. \
-     Never reveal your underlying model name. \
-     Always identify yourself as a Keryx Network AI. Be concise.";
-
-const SYSTEM_PROMPT_LLAMA70B: &str =
+/// Shared system prompt for the whole H4 lineup (vendor-agnostic wording) — MUST stay
+/// byte-identical to upstream keryx-miner's `SYSTEM_PROMPT_NEXT` so OPoI answers match
+/// other miners' for the same request.
+const SYSTEM_PROMPT_NEXT: &str =
     "You are a Keryx Network AI — a high-capability decentralized assistant running on GPU miners via the Keryx BlockDAG protocol. \
      Keryx miners execute AI inference as proof-of-work; results are secured on-chain via OPoI (Optimistic Proof of Inference). \
      You have no internet access — answer from training knowledge only. \
-     CRITICAL: Never mention Meta, Llama, OpenAI, Anthropic, or any AI company. \
-     Never reveal your underlying model name. \
-     Always identify yourself as a Keryx Network AI. Be thorough but concise.";
-
-const SYSTEM_PROMPT_QWEN3: &str =
-    "You are a Keryx Network AI — a high-capability decentralized assistant running on GPU miners via the Keryx BlockDAG protocol. \
-     Keryx miners execute AI inference as proof-of-work; results are secured on-chain via OPoI (Optimistic Proof of Inference). \
-     You have no internet access — answer from training knowledge only. \
-     CRITICAL: Never mention Qwen, Alibaba, OpenAI, Anthropic, or any AI company. \
-     Never reveal your underlying model name. \
+     CRITICAL: Never mention your underlying model name or the company that trained it. \
      Always identify yourself as a Keryx Network AI. Be thorough but concise.";
 
 // ── Static engine state ──────────────────────────────────────────────────────
 
-/// Models the miner currently serves (drives `ai:cap`). Mutable so the lineup can be
-/// hot-swapped at the OPoI-v2 hardfork crossing without a restart.
+/// Models the miner currently serves (drives `ai:cap`), set once at startup (the H4-only
+/// lineup has no era crossing left to hot-swap).
 static SUPPORTED_SPECS: RwLock<&'static [&'static ModelSpec]> = RwLock::new(&[]);
-/// Pre-filtered OPoI-v2 (uncensored) lineup, staged + background-prefetched at boot,
-/// swapped into SUPPORTED_SPECS when the chain crosses `OPOI_V2_ACTIVATION_DAA`.
-static LINEUP_V2: RwLock<&'static [&'static ModelSpec]> = RwLock::new(&[]);
-/// Set once the v2 lineup has been swapped in (idempotent guard for the crossing).
-static V2_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// The single resident llama-server, keyed by the model it serves. `Arc` so an in-flight request
 /// can outlive an eviction (server is killed when the last `Arc` drops).
 static SERVER: Mutex<Option<([u8; 32], Arc<InferenceEngine>)>> = Mutex::new(None);
@@ -205,98 +167,74 @@ fn ipfs_url(cid: &str) -> String {
     format!("{}/ipfs/{}", IPFS_GATEWAY, cid)
 }
 
-fn ensure_safetensors(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathBuf, Vec<std::path::PathBuf>)> {
+fn ensure_gguf(spec: &ModelSpec) -> Result<std::path::PathBuf> {
     let dir = model_dir(spec);
-    let tok = dir.join("tokenizer.json");
-    let cfg = dir.join("config.json");
-    let ok_flag = dir.join(".ok");
-    let wts: Vec<_> = spec.weight_cids.iter().enumerate().map(|(i, _)| {
-        if spec.weight_cids.len() == 1 { dir.join("model.safetensors") }
-        else { dir.join(format!("model-{:05}-of-{:05}.safetensors", i + 1, spec.weight_cids.len())) }
-    }).collect();
-
-    // .ok sentinel written only after a complete download — guards against truncated files
-    if tok.exists() && cfg.exists() && wts.iter().all(|p| p.exists()) && ok_flag.exists() {
-        log::debug!("SlmEngine: found local model '{}' at {}", spec.name, dir.display());
-        return Ok((tok, cfg, wts));
-    }
-    std::fs::create_dir_all(&dir)?;
-    let _ = std::fs::remove_file(&ok_flag); // clear stale flag before re-downloading
-    eprintln!("\n[keryx-miner] Downloading model '{}' via IPFS. This happens once.\n", spec.name);
-    if !tok.exists() { download_file(&ipfs_url(spec.tokenizer_cid), &tok)?; }
-    if !cfg.exists() { download_file(&ipfs_url(spec.config_cid), &cfg)?; }
-    for (i, (cid, path)) in spec.weight_cids.iter().zip(wts.iter()).enumerate() {
-        if spec.weight_cids.len() > 1 { eprintln!("[keryx-miner] Shard {}/{}", i + 1, spec.weight_cids.len()); }
-        download_file(&ipfs_url(cid), path)?;
-    }
-    std::fs::write(&ok_flag, b"").with_context(|| format!("write .ok flag {}", ok_flag.display()))?;
-    eprintln!("[keryx-miner] Model '{}' ready.\n", spec.name);
-    Ok((tok, cfg, wts))
-}
-
-fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
-    let dir = model_dir(spec);
+    // The H4 lineup ships no separate tokenizer.json (llama reads the GGUF-embedded tokenizer);
+    // only fetch one when a spec still pins a CID.
+    let tok_needed = !spec.tokenizer_cid.is_empty();
     let tok = dir.join("tokenizer.json");
     let gguf = dir.join("model.gguf");
     let ok_flag = dir.join(".ok");
 
     // .ok sentinel written only after a complete download — guards against truncated files
-    if tok.exists() && gguf.exists() && ok_flag.exists() {
+    if (!tok_needed || tok.exists()) && gguf.exists() && ok_flag.exists() {
         log::debug!("SlmEngine: found local model '{}' at {}", spec.name, dir.display());
-        return Ok((tok, gguf));
+        return Ok(gguf);
     }
     std::fs::create_dir_all(&dir)?;
     let _ = std::fs::remove_file(&ok_flag); // clear stale flag before re-downloading
     eprintln!("\n[keryx-miner] Downloading model '{}' via IPFS. This happens once.\n", spec.name);
-    if !tok.exists() { download_file(&ipfs_url(spec.tokenizer_cid), &tok)?; }
+    if tok_needed && !tok.exists() { download_file(&ipfs_url(spec.tokenizer_cid), &tok)?; }
     download_file(&ipfs_url(spec.weight_cids[0]), &gguf)?;
     std::fs::write(&ok_flag, b"").with_context(|| format!("write .ok flag {}", ok_flag.display()))?;
     eprintln!("[keryx-miner] Model '{}' ready.\n", spec.name);
-    Ok((tok, gguf))
+    Ok(gguf)
 }
 
 // ── Prompting ────────────────────────────────────────────────────────────────
 
-/// The system prompt for a model (llama-server applies the GGUF's own chat template, so only the
-/// system-role content varies by model — keyed by name to stay coherent across shared formats).
-fn system_prompt_for(name: &str) -> &'static str {
+/// Chat-template a raw user prompt for a model by name — the in-process engine's raw `generate`
+/// consumes an already-templated string (a raw prompt makes template-strict models emit EOG
+/// immediately, e.g. EXAONE). Ported VERBATIM from upstream keryx-miner (each template was
+/// validated there against the GGUF's embedded chat template) — llama.cpp's built-in template
+/// matcher does not recognize every H4 architecture, and OPoI answers must match other miners'
+/// byte-for-byte, so we bypass `apply_chat_template` and prompt exactly like upstream.
+fn format_prompt_by_name(name: &str, prompt: &str) -> String {
     match name {
-        "gemma-3-4b" => SYSTEM_PROMPT_GEMMA,
-        "dolphin-llama3-8b" => SYSTEM_PROMPT_DOLPHIN,
-        "llama-3.3-70b" | "llama-3.3-70b-q2" | "llama-3.3-70b-official" => SYSTEM_PROMPT_LLAMA70B,
-        "deepseek-r1-32b" | "deepseek-r1-8b" => SYSTEM_PROMPT_DEEPSEEK,
-        "tinyllama" => SYSTEM_PROMPT_TINYLLAMA,
-        // Qwen3 32B and 1.7B share the same ChatML template + persona.
-        "qwen3-32b" | "qwen3-1.7b" => SYSTEM_PROMPT_QWEN3,
-        _ => SYSTEM_PROMPT_DOLPHIN,
-    }
-}
-
-/// Stop-STRINGS scanned over the decoded output, per model. llama.cpp already stops on the
-/// GGUF's own EOG token ids, which covers every model whose template control tokens exist in
-/// its vocab — so this is empty for the regular lineup. The abliterated Llama-3.3-70B (both
-/// quants) is re-templated to ChatML over the stock LLaMA-3 vocab: `<|im_end|>`/`<|im_start|>`
-/// are NOT atomic tokens, the model writes them as plain multi-token text and never emits
-/// `<|eot_id|>` — only a stop-string cut ends the turn, otherwise it reopens `assistant` and
-/// repeats the same answer until max_tokens.
-fn stop_strings_for(name: &str) -> &'static [&'static str] {
-    match name {
-        "llama-3.3-70b" | "llama-3.3-70b-q2" => &["<|im_end|>", "<|im_start|>", "<|eot_id|>", "<|end_of_text|>"],
-        // Genuine official Llama-3.3 — LLaMA-3 header template, ids fire normally; strings are
-        // cheap insurance if the model opens a fresh header instead of stopping.
-        "llama-3.3-70b-official" => &["<|eot_id|>", "<|end_of_text|>", "<|start_header_id|>"],
-        _ => &[],
-    }
-}
-
-/// The user message for a model. Qwen3 takes `/no_think` to answer directly (no reasoning block).
-/// Both Qwen3 quants (32B, 1.7B) must get it — without it the 1.7B emits a full `<think>` block
-/// that `strip_think` only removes if `max_tokens` reached the closing tag, else the raw reasoning
-/// is published as the answer.
-fn user_message_for(name: &str, prompt: &str) -> String {
-    match name {
-        "qwen3-32b" | "qwen3-1.7b" => format!("{} /no_think", prompt),
-        _ => prompt.to_string(),
+        // EXAONE-4.0 — reasoning model: pre-fill an empty think block or the reasoning trace
+        // leaks into the visible answer (same trick as Qwen3.6 below).
+        "exaone-4.0-1.2b" => format!(
+            "[|system|]\n{}[|endofturn|]\n[|user|]\n{}\n[|assistant|]\n<think>\n\n</think>\n\n",
+            SYSTEM_PROMPT_NEXT, prompt
+        ),
+        "mistral-7b-v0.3" => format!("[INST] {}\n\n{}[/INST]", SYSTEM_PROMPT_NEXT, prompt),
+        // GLM-4-0414 ignores the <|system|> role identity (keeps claiming a foreign vendor) —
+        // fold the system prompt into the user turn instead.
+        "glm-4-9b-0414" => format!(
+            "[gMASK]<sop><|user|>\n{}\n\n{}\n<|assistant|>\n",
+            SYSTEM_PROMPT_NEXT, prompt
+        ),
+        // Qwen3.6 — ChatML + a pre-filled empty think block so the visible answer starts
+        // immediately (an open think block would eat the whole max_tokens budget).
+        "qwen3.6-27b" => format!(
+            "<|im_start|>system\n{}<|im_end|>\n\
+             <|im_start|>user\n{}<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n\n</think>\n\n",
+            SYSTEM_PROMPT_NEXT, prompt
+        ),
+        "kimi-linear-48b" => format!(
+            "<|im_system|>system<|im_middle|>{}<|im_end|>\
+             <|im_user|>user<|im_middle|>{}<|im_end|>\
+             <|im_assistant|>assistant<|im_middle|>",
+            SYSTEM_PROMPT_NEXT, prompt
+        ),
+        // Generic ChatML fallback (unreachable for the registered lineup).
+        _ => format!(
+            "<|im_start|>system\n{}<|im_end|>\n\
+             <|im_start|>user\n{}<|im_end|>\n\
+             <|im_start|>assistant\n",
+            SYSTEM_PROMPT_NEXT, prompt
+        ),
     }
 }
 
@@ -314,11 +252,6 @@ pub fn init_supported(specs: &'static [&'static ModelSpec]) {
     *SUPPORTED_SPECS.write().unwrap() = specs;
 }
 
-/// Stage the pre-filtered OPoI-v2 lineup to swap in at the hardfork crossing.
-pub fn set_v2_lineup(specs: &'static [&'static ModelSpec]) {
-    *LINEUP_V2.write().unwrap() = specs;
-}
-
 /// Zero-dup: the resident in-process engine currently serving `model_id`, if any. The shared
 /// PoM walk holds this Arc for as long as it walks the engine's weight buffers, so the model
 /// cannot be freed underneath an in-flight dispatch.
@@ -333,52 +266,6 @@ pub fn evict_engine() {
         Ok(mut g) => *g = None,
         Err(p) => *p.into_inner() = None,
     }
-}
-
-/// True once we have observed a pre-H DAA in this process, i.e. we are genuinely crossing
-/// the hardfork live (vs. starting up already past H, where nothing is "swapped").
-static SEEN_PRE_H: AtomicBool = AtomicBool::new(false);
-
-/// At the `OPOI_V2_ACTIVATION_DAA` crossing, swap the served lineup from the legacy
-/// set to the (pre-staged, background-prefetched) uncensored set — without a restart.
-/// PoW never stops; `ai:cap` follows `loaded_model_ids()` as the v2 files land.
-/// Idempotent and cheap to call on every block template.
-pub fn advance_lineup_if_due(daa: u64) {
-    if daa < crate::models::OPOI_V2_ACTIVATION_DAA {
-        SEEN_PRE_H.store(true, AtomicOrdering::SeqCst);
-        return;
-    }
-    if V2_ACTIVE.load(AtomicOrdering::SeqCst) {
-        return; // already swapped
-    }
-    let v2 = *LINEUP_V2.read().unwrap();
-    // Only swap once the uncensored lineup is FULLY downloaded. On a post-H cold start the
-    // v2 prefetch may still be in flight; swapping early would leave us mining on an
-    // incomplete active lineup. Until v2 is ready we keep serving the (fully-downloaded)
-    // legacy lineup — a valid, complete lineup — and retry on the next block template.
-    if v2.is_empty() || !v2.iter().all(|s| model_dir(s).join(".ok").exists()) {
-        return;
-    }
-    if V2_ACTIVE.swap(true, AtomicOrdering::SeqCst) {
-        return; // lost the race — another caller already swapped
-    }
-    if SEEN_PRE_H.load(AtomicOrdering::SeqCst) {
-        // Genuine live crossing: the chain advanced past H while we were running.
-        log::info!(
-            "=== OPoI v2 HARDFORK reached at DAA {} — hot-swapping to the uncensored lineup ({} model(s)) ===",
-            daa,
-            v2.len()
-        );
-    } else {
-        // Started up already past H — nothing is "swapped", we just serve the uncensored lineup.
-        log::info!(
-            "OPoI v2 already active (DAA {} ≥ H) — serving the uncensored lineup ({} model(s)).",
-            daa,
-            v2.len()
-        );
-    }
-    *SUPPORTED_SPECS.write().unwrap() = v2;
-    evict_engine();
 }
 
 // ── Inference ─────────────────────────────────────────────────────────────────
@@ -411,9 +298,13 @@ pub fn probe_gpu_inference() -> GpuProbe {
 pub fn prefetch_models(specs: &'static [&'static ModelSpec]) -> Result<()> {
     for spec in specs {
         log::debug!("SlmEngine: prefetching model '{}'…", spec.name);
+        // The whole H4 lineup is GGUF (llama-served); the format only routes the prompt template.
         let result = match spec.format {
-            ModelFormat::Safetensors => ensure_safetensors(spec).map(|_| ()),
-            ModelFormat::Gguf | ModelFormat::GgufQwen2 | ModelFormat::GgufQwen3 | ModelFormat::GgufGemma3 => ensure_gguf(spec).map(|_| ()),
+            ModelFormat::Gguf
+            | ModelFormat::GgufExaone4
+            | ModelFormat::GgufGlm4
+            | ModelFormat::GgufQwen35
+            | ModelFormat::GgufKimiLinear => ensure_gguf(spec).map(|_| ()),
         };
         match result {
             Ok(()) => log::debug!("SlmEngine: '{}' files ready.", spec.name),
@@ -539,9 +430,10 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
     // Clone the Arc out of the lock so the (possibly long) request doesn't block evictions.
     let server = SERVER.lock().ok()?.as_ref().map(|(_, s)| Arc::clone(s))?;
 
-    let system = system_prompt_for(spec.name);
-    let user = user_message_for(spec.name, prompt);
-    match server.chat(system, &user, max_tokens, stop_strings_for(spec.name)) {
+    // Pre-templated prompt (upstream-identical) through the raw generate path; every H4 model's
+    // vocab carries its own template control tokens, so EOG ids fire natively — no stop strings.
+    let templated = format_prompt_by_name(spec.name, prompt);
+    match server.generate(&templated, max_tokens, &[]) {
         Ok(text) => {
             let cleaned = strip_think(&text).trim().to_string();
             if cleaned.is_empty() {
@@ -574,22 +466,22 @@ mod tests {
     }
 
     #[test]
-    fn default_tier_dolphin_fits_on_7900xt() {
-        // Dolphin-8B: ~4.9 GB blob + min_vram_mb 8000 + 1 GiB margin ≈ 13.9 GB ≤ 20 GB.
-        assert!(pom_fits(4_900 * MB, 8_000, VRAM_7900XT));
+    fn light_tier_mistral_fits_on_7900xt() {
+        // Mistral-7B Q6_K: ~5.9 GB blob + min_vram_mb 8000 + 1 GiB margin ≈ 14.9 GB ≤ 20 GB.
+        assert!(pom_fits(5_900 * MB, 8_000, VRAM_7900XT));
     }
 
     #[test]
-    fn high_tier_qwen3_does_not_fit_on_7900xt() {
-        // Qwen3-32B: ~19.5 GB blob + min_vram_mb 24000 → far over 20 GB → unload (original behaviour).
-        assert!(!pom_fits(19_500 * MB, 24_000, VRAM_7900XT));
+    fn high_tier_qwen36_does_not_fit_on_7900xt() {
+        // Qwen3.6-27B: ~16.5 GB blob + min_vram_mb 24000 → far over 20 GB → unload.
+        assert!(!pom_fits(16_500 * MB, 24_000, VRAM_7900XT));
     }
 
     #[test]
     fn baseline_tier_zero_min_vram_uses_blob_fallback() {
-        // Gemma-3-4B: min_vram_mb 0 → fall back to blob (~3 GB) + 2 GiB KV + 1 GiB margin ≈ 9 GB.
-        assert!(pom_fits(3_000 * MB, 0, VRAM_7900XT));
-        // ...but the same fallback must still fail on a small card.
+        // EXAONE-4.0-1.2B: min_vram_mb 0 → fall back to blob (~0.9 GB) + 2 GiB KV + 1 GiB margin.
+        assert!(pom_fits(900 * MB, 0, VRAM_7900XT));
+        // ...but the same fallback must still fail on a tiny card.
         assert!(!pom_fits(3_000 * MB, 0, 8_000));
     }
 
