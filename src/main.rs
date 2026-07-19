@@ -158,10 +158,19 @@ fn query_vram_mb() -> Option<u64> {
 /// OPoI capability gate (layer A): drop the models this machine cannot actually
 /// serve on GPU 0, so the `ai:cap` announcement never promises a model the miner
 /// would fail to load. Skipped when no Vulkan device can be queried (CPU-fallback
-/// setups keep working).
+/// setups keep working), or when `KERYX_SKIP_VRAM_GATE=1` forces every staged model
+/// through (testing: the download + possession-index build/R_T check work regardless
+/// of VRAM, but an over-VRAM model still fails at engine load and cannot mine).
 fn filter_specs_by_vram(
     specs: &'static [&'static keryx_miner::models::ModelSpec],
 ) -> &'static [&'static keryx_miner::models::ModelSpec] {
+    if std::env::var("KERYX_SKIP_VRAM_GATE").ok().as_deref() == Some("1") {
+        log::warn!(
+            "KERYX_SKIP_VRAM_GATE=1 — VRAM capability gate disabled; announcing + downloading all \
+             staged models. An over-VRAM model will OOM at engine load and cannot mine its tier."
+        );
+        return specs;
+    }
     let Some(gpu0_mb) = query_vram_mb() else {
         log::warn!("Cannot query GPU VRAM (no Vulkan device) — skipping the model capability gate.");
         return specs;
