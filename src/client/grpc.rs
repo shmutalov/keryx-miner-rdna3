@@ -580,7 +580,7 @@ impl KeryxdHandler {
                 // (defensive: holds even against a node that still issues them post-hardfork).
                 if !template.inference_challenge.is_empty()
                     && self.challenge_inference_rx.is_none()
-                    && self.last_known_daa < keryx_miner::pom::POM_ACTIVATION_DAA
+                    && self.last_known_daa < keryx_miner::pom::pom_activation_daa()
                 {
                     let challenge = template.inference_challenge.clone();
                     let mut parts = challenge.splitn(2, ':');

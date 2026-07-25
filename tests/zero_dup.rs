@@ -70,26 +70,44 @@ fn shared_walk_matches_streamed_blob() {
     // happens host-side before the words reach mine() and cannot diverge the two walks.
     let ts: u64 = 1_772_000_000;
     let p = words4(&pph);
-    for msb in [0xFFu8, 0x80, 0x01, 0x00] {
-        let mut target = [0u8; 32];
-        target[31] = msb;
-        if msb == 0xFF {
-            target = [0xFF; 32];
+    // Both walk eras: the H5 non-foldable transition is a separate branch in each shader, so the
+    // prefix (zero-dup) and shard (blob) kernels must agree in BOTH — a drift in the v2 branch alone
+    // would sail past a v1-only test and reject every block mined post-H5.
+    for walk_v2 in [false, true] {
+        for msb in [0xFFu8, 0x80, 0x01, 0x00] {
+            let mut target = [0u8; 32];
+            target[31] = msb;
+            if msb == 0xFF {
+                target = [0xFF; 32];
+            }
+            let a = shared.mine(&p, &p, ts, &target, start, batch, walk_v2);
+            let b = blob.mine(&p, &p, ts, &target, start, batch, walk_v2);
+            assert_eq!(a, b, "walk_v2={walk_v2}: winner mismatch at target msb {msb:#x}");
+            let c = shared.mine(&p, &p, ts, &target, start, batch, walk_v2);
+            assert_eq!(a, c, "walk_v2={walk_v2}: shared walk not deterministic at target msb {msb:#x}");
+            eprintln!("walk_v2={walk_v2} target msb {msb:#04x}: shared == blob == {a:?}");
         }
-        let a = shared.mine(&p, ts, &target, start, batch);
-        let b = blob.mine(&p, ts, &target, start, batch);
-        assert_eq!(a, b, "winner mismatch at target msb {msb:#x}");
-        let c = shared.mine(&p, ts, &target, start, batch);
-        assert_eq!(a, c, "shared walk not deterministic at target msb {msb:#x}");
-        eprintln!("target msb {msb:#04x}: shared == blob == {a:?}");
     }
 
+    // The eras must genuinely differ on both kernels (else the flag is being ignored somewhere).
+    let mut mid = [0xFFu8; 32];
+    mid[31] = 0x02;
+    assert_ne!(
+        blob.mine(&p, &p, ts, &mid, start, batch, false),
+        blob.mine(&p, &p, ts, &mid, start, batch, true),
+        "blob kernel: walk_v2 must change the walk"
+    );
+    assert_ne!(
+        shared.mine(&p, &p, ts, &mid, start, batch, false),
+        shared.mine(&p, &p, ts, &mid, start, batch, true),
+        "prefix kernel: walk_v2 must change the walk"
+    );
+
     // 7. Hashrate: prefix-table binary search vs shard shift/mask, no-winner target so every
-    //    nonce walks all 256 steps. 8×65536 nonces each, warm.
+    //    nonce walks all 256 steps. 8×65536 nonces each, warm. Reported per era: H5's v2 walk does
+    //    4 mix64 per chunk instead of 1 and is the measured ~4x hashrate drop on RDNA3.
     let none = [0u8; 32];
     let rounds: u64 = 8;
-    let blob_f = |s: u64| blob.mine(&p, ts, &none, s, batch);
-    let shared_f = |s: u64| shared.mine(&p, ts, &none, s, batch);
     let timed = |name: &str, f: &dyn Fn(u64) -> Option<u64>| {
         let t0 = std::time::Instant::now();
         for r in 0..rounds {
@@ -98,6 +116,9 @@ fn shared_walk_matches_streamed_blob() {
         let dt = t0.elapsed().as_secs_f64();
         eprintln!("{name}: {:.2} MH/s ({} nonces in {dt:.3}s)", (rounds * batch as u64) as f64 / dt / 1.0e6, rounds * batch as u64);
     };
-    timed("blob  ", &blob_f);
-    timed("shared", &shared_f);
+    for walk_v2 in [false, true] {
+        let era = if walk_v2 { "v2" } else { "v1" };
+        timed(&format!("blob   {era}"), &|s: u64| blob.mine(&p, &p, ts, &none, s, batch, walk_v2));
+        timed(&format!("shared {era}"), &|s: u64| shared.mine(&p, &p, ts, &none, s, batch, walk_v2));
+    }
 }

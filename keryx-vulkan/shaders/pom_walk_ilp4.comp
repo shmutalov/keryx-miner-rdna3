@@ -30,6 +30,7 @@ layout(push_constant) uniform Push {
     uint k;
     uint batch;
     uint shard_shift;
+    uint walk_v2;          // H5: 1 = mix64-chained transition, 0 = frozen v1 XOR fold
 } pc;
 
 uint64_t mix64(uint64_t x) {
@@ -47,6 +48,14 @@ uint64_t step_state(uint64_t state, uint64_t off) {
     uint64_t local = off & pc.shard_mask;
     Shard chunk = Shard(SHARDS.addr[shard] + local * 32UL);
     uint64_t h = state;
+    if (pc.walk_v2 != 0u) {
+        // H5 non-foldable transition — 4 mix64 on the dependency chain per chunk instead of 1.
+        h = mix64(h ^ chunk.words[0]);
+        h = mix64(h ^ chunk.words[1]);
+        h = mix64(h ^ chunk.words[2]);
+        h = mix64(h ^ chunk.words[3]);
+        return h;
+    }
     h ^= chunk.words[0];
     h ^= chunk.words[1];
     h ^= chunk.words[2];

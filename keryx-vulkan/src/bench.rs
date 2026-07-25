@@ -15,8 +15,23 @@
 //!
 //! Run:  `cargo run -p keryx-vulkan --example bench_pom_walk --features bench --release`
 //! Env:  POM_BENCH_BLOB_MB (default 1024)  POM_BENCH_NONCES (default 16777216)  POM_BENCH_ITERS (default 5)
+//!       POM_BENCH_WALK_V2 (default 1 — the live H5 era; set 0 to measure the frozen pre-H5 fold)
 //!
 //! ─────────────────────────────────────────────────────────────────────────────────────────────
+//! H5 FINDING (2026-07-25, RX 7900 XT, 1 GiB blob) — the H5 `transition_v2` is FREE on RDNA3:
+//!
+//!   era                          baseline median MH/s
+//!   v1 (pre-H5 XOR fold)                19.16
+//!   v2 (H5 mix64-chained)               19.45
+//!
+//! v2 does 4 `mix64` per chunk instead of 1 and costs nothing measurable — consistent with the
+//! findings below that the walk is memory-latency-bound, not ALU-bound: the extra mixing hides
+//! entirely under the 256 dependent VRAM reads. Also measured: 8 GiB blob → 18.16 MH/s (v2), and
+//! the zero-dup prefix kernel → 18.26 MH/s (v2) at a 4.6 GiB / 300-tensor layout (see
+//! `tests/prefix_vs_blob.rs`). So NO kernel-level H5 hashrate regression exists on this GPU.
+//! If a rig reports a large post-H5 hashrate drop, look OUTSIDE the walk (OPoI inference pauses,
+//! model load/index build stalls, tier reassignment, clocks) — not at these kernels.
+//!
 //! FINDINGS (RX 7900 XT, 20 GiB, driver 32.0.31019.2002, 1 GiB blob) — READ THIS BEFORE OPTIMIZING:
 //!
 //!   variant    median MH/s   vs baseline
@@ -62,7 +77,13 @@ const IMPOSSIBLE: [u8; 32] = [0u8; 32]; // pow_value <= 0 essentially never → 
 
 // ── Push-constant blocks (must match the shaders' `Push` layouts) ──────────────────────────────
 
-/// Baseline / wave32 push — identical to production `PomPush` (112 bytes).
+/// Baseline / wave32 push (116 bytes).
+///
+/// NOTE: this is deliberately NOT the production `PomPush` any more. Production carries the H5.1
+/// seed word set (`s0..s3`) and reads the target out of the binding-0 buffer to stay inside the
+/// 128 B guaranteed `maxPushConstantsSize`; the bench variants keep the target inline (they only
+/// ever mine the impossible target) and skip the seed split entirely, because they measure the WALK
+/// and the seed fold runs once per nonce. They do carry `walk_v2` — that is the hot loop.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct PomPush {
@@ -75,9 +96,41 @@ struct PomPush {
     k: u32,
     batch: u32,
     shard_shift: u32,
+    walk_v2: u32,
 }
 
-/// Magic push — `PomPush` + magic/shift/is_pow2 (124 bytes, padded to 128 = AMD maxPushConstantsSize).
+/// PRODUCTION push layout — must stay byte-identical to `pom_walk::PomPush` / the `Push` block in
+/// `pom_walk.comp`, because the `baseline` variant benches the real production kernel. Production
+/// carries the H5.1 seed word set and reads the target from the binding-0 I/O buffer instead of
+/// inline (see [`IoBlock`]); the bench-only variants keep the older inline-target layout.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ProdPush {
+    p: [u64; 4],
+    s: [u64; 4],
+    timestamp: u64,
+    n_chunks: u64,
+    start_nonce: u64,
+    shard_mask: u64,
+    k: u32,
+    batch: u32,
+    shard_shift: u32,
+    walk_v2: u32,
+}
+
+/// Binding-0 I/O block: winner slot + target, matching production's `Io` block. The bench-only
+/// variants declare just `{ uint offset; }` over the same buffer (a legal prefix view) and take
+/// their target from push constants, so writing the full block is safe for every variant.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct IoBlock {
+    offset: u32,
+    _pad: u32,
+    t: [u64; 4],
+}
+
+/// Magic push — `PomPush` + magic/shift/is_pow2 (128 bytes = exactly the guaranteed
+/// `maxPushConstantsSize`; nothing more fits here).
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct MagicPush {
@@ -93,6 +146,7 @@ struct MagicPush {
     shard_shift: u32,
     magic_shift: u32,
     is_pow2: u32,
+    walk_v2: u32,
 }
 
 fn as_bytes<T: Copy>(p: &T) -> &[u8] {
@@ -187,17 +241,26 @@ fn pom_block_seed(p: &[u64; 4], timestamp: u64, nonce: u64) -> u64 {
     s
 }
 
-fn walk_final(seed: u64, n_chunks: u64, words: &[u64]) -> u64 {
+fn walk_final(seed: u64, n_chunks: u64, words: &[u64], walk_v2: bool) -> u64 {
     let mut state = seed;
     let mut off = state % n_chunks;
     for _ in 0..POM_WALK_STEPS {
         let base = (off * 4) as usize;
         let mut h = state;
-        h ^= words[base];
-        h ^= words[base + 1];
-        h ^= words[base + 2];
-        h ^= words[base + 3];
-        state = mix64(h);
+        if walk_v2 {
+            // H5 `transition_v2` — mix64 chained through every word.
+            h = mix64(h ^ words[base]);
+            h = mix64(h ^ words[base + 1]);
+            h = mix64(h ^ words[base + 2]);
+            h = mix64(h ^ words[base + 3]);
+            state = h;
+        } else {
+            h ^= words[base];
+            h ^= words[base + 1];
+            h ^= words[base + 2];
+            h ^= words[base + 3];
+            state = mix64(h);
+        }
         off = state % n_chunks;
     }
     state
@@ -228,9 +291,10 @@ fn le_leq(a: &[u8; 32], b: &[u8; 32]) -> bool {
     true
 }
 
-fn host_lowest_winner(words: &[u64], n_chunks: u64, p: &[u64; 4], ts: u64, target: &[u8; 32], start: u64, batch: u32) -> Option<u64> {
+#[allow(clippy::too_many_arguments)]
+fn host_lowest_winner(words: &[u64], n_chunks: u64, p: &[u64; 4], ts: u64, target: &[u8; 32], start: u64, batch: u32, walk_v2: bool) -> Option<u64> {
     (0..batch as u64).map(|i| start + i).find(|&nonce| {
-        let fs = walk_final(pom_block_seed(p, ts, nonce), n_chunks, words);
+        let fs = walk_final(pom_block_seed(p, ts, nonce), n_chunks, words, walk_v2);
         le_leq(&pom_pow_value(fs, p), target)
     })
 }
@@ -260,18 +324,20 @@ impl<'a> Blob<'a> {
         }
         let addr_table = vk.create_buffer((addrs.len() * 8) as u64)?;
         vk.write_buffer(&addr_table, words_as_bytes(&addrs));
-        let winner = vk.create_buffer(4)?;
+        let winner = vk.create_buffer(std::mem::size_of::<IoBlock>() as u64)?;
         Ok(Self { vk, shards, addr_table, winner, shard_chunks })
     }
 
     /// Grind nonces `[start, start+batch)` with `kernel`; returns the lowest winning nonce (or None).
     /// `mk_push` builds the per-sub-dispatch push bytes given (sub_batch, sub_start_nonce). Sub-
     /// dispatches are ascending so the first with a winner holds the global lowest — same as prod.
-    fn grind(&self, kernel: &Kernel, nonces_per_group: u32, mk_push: &dyn Fn(u32, u64) -> Vec<u8>, start: u64, batch: u32) -> Option<u64> {
+    #[allow(clippy::too_many_arguments)]
+    fn grind(&self, kernel: &Kernel, nonces_per_group: u32, mk_push: &dyn Fn(u32, u64) -> Vec<u8>, start: u64, batch: u32, target: [u64; 4]) -> Option<u64> {
         let mut done = 0u32;
         while done < batch {
             let sub = (batch - done).min(MAX_DISPATCH_NONCES);
-            self.vk.write_buffer(&self.winner, &NO_WINNER.to_le_bytes());
+            // Winner reset + target in one write: production reads the target from here.
+            self.vk.write_buffer(&self.winner, as_bytes(&IoBlock { offset: NO_WINNER, _pad: 0, t: target }));
             let push = mk_push(sub, start + done as u64);
             let groups = sub.div_ceil(nonces_per_group);
             self.vk.dispatch(kernel, &[&self.winner, &self.addr_table], &push, groups);
@@ -304,6 +370,7 @@ struct Variant {
     local_size: u32,
     nonces_per_invocation: u32, // ILP factor (G); 1 for the scalar variants
     magic: Option<(u64, u32, bool)>, // Some => magic push layout
+    prod: bool,                      // true => the real production kernel (ProdPush layout)
 }
 
 impl Variant {
@@ -315,12 +382,25 @@ impl Variant {
 
 impl Variant {
     /// Curried push builder for a given header/target — captures everything except (sub, start_nonce).
-    fn push_fn<'b>(&'b self, p: [u64; 4], t: [u64; 4], ts: u64, n_chunks: u64, shard_mask: u64, shard_shift: u32) -> Box<dyn Fn(u32, u64) -> Vec<u8> + 'b> {
+    #[allow(clippy::too_many_arguments)]
+    fn push_fn<'b>(&'b self, p: [u64; 4], t: [u64; 4], ts: u64, n_chunks: u64, shard_mask: u64, shard_shift: u32, walk_v2: bool) -> Box<dyn Fn(u32, u64) -> Vec<u8> + 'b> {
+        let walk_v2 = walk_v2 as u32;
+        if self.prod {
+            // Production kernel: seed words == pow words here (the bench never crosses H5.1, and the
+            // seed fold is one-per-nonce so it cannot move the walk timing), target rides the buffer.
+            return Box::new(move |sub, start_nonce| {
+                as_bytes(&ProdPush {
+                    p, s: p, timestamp: ts, n_chunks, start_nonce, shard_mask,
+                    k: POM_WALK_STEPS, batch: sub, shard_shift, walk_v2,
+                })
+                .to_vec()
+            });
+        }
         match self.magic {
             None => Box::new(move |sub, start_nonce| {
                 as_bytes(&PomPush {
                     p, t, timestamp: ts, n_chunks, start_nonce, shard_mask,
-                    k: POM_WALK_STEPS, batch: sub, shard_shift,
+                    k: POM_WALK_STEPS, batch: sub, shard_shift, walk_v2,
                 })
                 .to_vec()
             }),
@@ -328,7 +408,7 @@ impl Variant {
                 as_bytes(&MagicPush {
                     p, t, timestamp: ts, n_chunks, start_nonce, shard_mask, magic,
                     k: POM_WALK_STEPS, batch: sub, shard_shift, magic_shift,
-                    is_pow2: is_pow2 as u32,
+                    is_pow2: is_pow2 as u32, walk_v2,
                 })
                 .to_vec()
             }),
@@ -336,11 +416,18 @@ impl Variant {
     }
 }
 
-fn make_variant(vk: &Vk, name: &'static str, spv: &[u8], local_size: u32, npi: u32, magic: Option<(u64, u32, bool)>) -> Result<Variant, String> {
+#[allow(clippy::too_many_arguments)]
+fn make_variant(vk: &Vk, name: &'static str, spv: &[u8], local_size: u32, npi: u32, magic: Option<(u64, u32, bool)>, prod: bool) -> Result<Variant, String> {
     let spirv = ash::util::read_spv(&mut Cursor::new(spv)).map_err(|e| e.to_string())?;
-    let push_size = if magic.is_some() { std::mem::size_of::<MagicPush>() } else { std::mem::size_of::<PomPush>() } as u32;
+    let push_size = if prod {
+        std::mem::size_of::<ProdPush>()
+    } else if magic.is_some() {
+        std::mem::size_of::<MagicPush>()
+    } else {
+        std::mem::size_of::<PomPush>()
+    } as u32;
     let kernel = vk.make_kernel(&spirv, 2, push_size)?;
-    Ok(Variant { name, kernel, local_size, nonces_per_invocation: npi, magic })
+    Ok(Variant { name, kernel, local_size, nonces_per_invocation: npi, magic, prod })
 }
 
 /// Deterministic well-distributed blob content so the data-dependent walk spreads across the whole
@@ -359,6 +446,10 @@ pub fn run() {
     let blob_mb: u64 = std::env::var("POM_BENCH_BLOB_MB").ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
     let nonces: u32 = std::env::var("POM_BENCH_NONCES").ok().and_then(|s| s.parse().ok()).unwrap_or(1 << 24);
     let iters: usize = std::env::var("POM_BENCH_ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
+    // H5 era by default: v2 is what mainnet runs now, so it is what needs optimizing. The v1 fold
+    // is still selectable to reproduce the pre-H5 numbers in the table above.
+    let walk_v2: bool = std::env::var("POM_BENCH_WALK_V2").ok().map(|s| s != "0").unwrap_or(true);
+    eprintln!("walk era: {}", if walk_v2 { "v2 (H5, mix64-chained — 4 mix64/chunk)" } else { "v1 (pre-H5 XOR fold)" });
 
     let vk = match Vk::new() {
         Ok(v) => v,
@@ -441,15 +532,15 @@ pub fn run() {
                 continue;
             }
         };
-        let push = variant.push_fn(p, t, ts, n_chunks, shard_mask, shard_shift);
+        let push = variant.push_fn(p, t, ts, n_chunks, shard_mask, shard_shift, walk_v2);
         // warm-up (untimed): page in, warm the pipeline/caches consistently.
-        blob.grind(&variant.kernel, variant.nonces_per_group(), &*push, 0, nonces.min(1 << 20));
+        blob.grind(&variant.kernel, variant.nonces_per_group(), &*push, 0, nonces.min(1 << 20), t);
 
         let mut rates = Vec::with_capacity(iters);
         for it in 0..iters {
             let start = 0x8000_0000_0000_0000u64 + (it as u64) * nonces as u64;
             let t0 = Instant::now();
-            blob.grind(&variant.kernel, variant.nonces_per_group(), &*push, start, nonces);
+            blob.grind(&variant.kernel, variant.nonces_per_group(), &*push, start, nonces, t);
             let dt = t0.elapsed().as_secs_f64();
             rates.push(nonces as f64 / dt / 1e6);
         }
@@ -471,15 +562,16 @@ pub fn run() {
 /// Build the named variant with the correct magic for `n_chunks`.
 fn build_named(vk: &Vk, name: &str, n_chunks: u64) -> Result<Variant, String> {
     match name {
-        "baseline" => make_variant(vk, "baseline", BASELINE_SPV, 64, 1, None),
-        "wave32" => make_variant(vk, "wave32", WAVE32_SPV, 32, 1, None),
-        "magic" => make_variant(vk, "magic", MAGIC_SPV, 64, 1, Some(magic_gen(n_chunks))),
-        "ilp4" => make_variant(vk, "ilp4", ILP4_SPV, 64, ILP4_G, None),
+        "baseline" => make_variant(vk, "baseline", BASELINE_SPV, 64, 1, None, true),
+        "wave32" => make_variant(vk, "wave32", WAVE32_SPV, 32, 1, None, false),
+        "magic" => make_variant(vk, "magic", MAGIC_SPV, 64, 1, Some(magic_gen(n_chunks)), false),
+        "ilp4" => make_variant(vk, "ilp4", ILP4_SPV, 64, ILP4_G, None, false),
         other => Err(format!("unknown variant {other}")),
     }
 }
 
-/// Check a variant's lowest-winner selection against the host across several targets.
+/// Check a variant's lowest-winner selection against the host across several targets, in BOTH walk
+/// eras — a variant that only agrees under the frozen v1 fold is useless for tuning the live H5 walk.
 fn verify_variant(_vk: &Vk, blob: &Blob, variant: &Variant, words: &[u64], n_chunks: u64) -> bool {
     let p = words4(&[0x5au8; 32]);
     let ts = 0xDEAD_BEEF_0000_0001u64;
@@ -488,27 +580,32 @@ fn verify_variant(_vk: &Vk, blob: &Blob, variant: &Variant, words: &[u64], n_chu
     // shard params MUST match the power-of-two shard_chunks the blob was built with.
     let shard_mask = blob.shard_chunks - 1;
     let shard_shift = blob.shard_chunks.trailing_zeros();
-    // pick a median target so there is a real mid-batch winner to disagree on
-    let mut pows: Vec<[u8; 32]> = (0..batch as u64)
-        .map(|i| pom_pow_value(walk_final(pom_block_seed(&p, ts, start + i), n_chunks, words), &p))
-        .collect();
-    pows.sort_by(|a, b| {
-        for i in (0..32).rev() {
-            if a[i] != b[i] {
-                return a[i].cmp(&b[i]);
+    for walk_v2 in [false, true] {
+        // pick a median target so there is a real mid-batch winner to disagree on
+        let mut pows: Vec<[u8; 32]> = (0..batch as u64)
+            .map(|i| pom_pow_value(walk_final(pom_block_seed(&p, ts, start + i), n_chunks, words, walk_v2), &p))
+            .collect();
+        pows.sort_by(|a, b| {
+            for i in (0..32).rev() {
+                if a[i] != b[i] {
+                    return a[i].cmp(&b[i]);
+                }
             }
-        }
-        std::cmp::Ordering::Equal
-    });
-    let targets = [[0u8; 32], pows[pows.len() / 2], [0xFFu8; 32]];
-    for target in targets {
-        let pt = words4(&target);
-        let push = variant.push_fn(p, pt, ts, n_chunks, shard_mask, shard_shift);
-        let got = blob.grind(&variant.kernel, variant.nonces_per_group(), &*push, start, batch);
-        let host = host_lowest_winner(words, n_chunks, &p, ts, &target, start, batch);
-        if got != host {
-            eprintln!("  {} (n={n_chunks}): MISMATCH got={got:?} host={host:?} (target msb {})", variant.name, target[31]);
-            return false;
+            std::cmp::Ordering::Equal
+        });
+        let targets = [[0u8; 32], pows[pows.len() / 2], [0xFFu8; 32]];
+        for target in targets {
+            let pt = words4(&target);
+            let push = variant.push_fn(p, pt, ts, n_chunks, shard_mask, shard_shift, walk_v2);
+            let got = blob.grind(&variant.kernel, variant.nonces_per_group(), &*push, start, batch, pt);
+            let host = host_lowest_winner(words, n_chunks, &p, ts, &target, start, batch, walk_v2);
+            if got != host {
+                eprintln!(
+                    "  {} (n={n_chunks}, walk_v2={walk_v2}): MISMATCH got={got:?} host={host:?} (target msb {})",
+                    variant.name, target[31]
+                );
+                return false;
+            }
         }
     }
     true

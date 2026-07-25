@@ -604,7 +604,7 @@ impl StratumHandler {
                                     // host still builds the right kHeavyHash matrix before the fork.
                                     daa_score: LAST_DAA_SCORE
                                         .load(Ordering::Relaxed)
-                                        .max(crate::pow::heavy_hash::POW_SALT_V4_ACTIVATION_DAA),
+                                        .max(crate::pow::heavy_hash::pow_salt_v4_activation_daa()),
                                     nonce: 0,
                                     target: self.target_pool,
                                     nonce_mask: self.nonce_mask,

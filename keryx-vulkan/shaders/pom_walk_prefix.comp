@@ -20,20 +20,28 @@ layout(std430, buffer_reference, buffer_reference_align = 8) readonly buffer Chu
     uint64_t words[];
 };
 
-layout(std430, binding = 0) buffer Winner { uint offset; } OUT;
+// Dispatch I/O block — see the matching comment in pom_walk.comp: the 256-bit LE target lives here
+// rather than in the push constants so the block stays within the 128 B guaranteed
+// `maxPushConstantsSize` after H5/H5.1 added s0..s3 + walk_v2.
+layout(std430, binding = 0) buffer Io {
+    uint offset;
+    uint _pad;
+    uint64_t t[4];
+} OUT;
 layout(std430, binding = 1) readonly buffer Prefix { uint64_t start[]; } PREFIX; // n_tensors + 1
 layout(std430, binding = 2) readonly buffer Addrs  { uint64_t addr[];  } ADDRS;  // n_tensors
 
 layout(push_constant) uniform Push {
-    uint64_t p0, p1, p2, p3;   // pre_pow_hash, as 4 LE u64 words
-    uint64_t t0, t1, t2, t3;   // target (256-bit LE), as 4 u64 words
+    uint64_t p0, p1, p2, p3;   // POW-fold pph words (H3-salted at/after the H3 gate)
+    uint64_t s0, s1, s2, s3;   // SEED-fold pph words (H5.1-salted at/after the H5.1 gate)
     uint64_t timestamp;        // header timestamp
     uint64_t n_chunks;         // total canonical chunks
     uint64_t start_nonce;      // first nonce of this batch
     uint k;                    // POM_WALK_STEPS (256)
     uint batch;                // number of nonces in this dispatch
     uint n_tensors;            // number of table entries
-} pc;
+    uint walk_v2;              // H5: 1 = mix64-chained transition, 0 = frozen v1 XOR fold
+} pc;                          // 104 B total (11 u64 + 4 u32)
 
 uint64_t mix64(uint64_t x) {
     x ^= x >> 30;
@@ -63,12 +71,13 @@ void main() {
     }
     uint64_t nonce = pc.start_nonce + uint64_t(idx);
 
+    // Seed fold reads the SEED word set (H5.1-swapped); the pow fold below keeps p0..p3.
     uint64_t state = mix64(nonce ^ 0x4B65727978531UL);
     state = mix64(state ^ pc.timestamp);
-    state = mix64(state ^ pc.p0);
-    state = mix64(state ^ pc.p1);
-    state = mix64(state ^ pc.p2);
-    state = mix64(state ^ pc.p3);
+    state = mix64(state ^ pc.s0);
+    state = mix64(state ^ pc.s1);
+    state = mix64(state ^ pc.s2);
+    state = mix64(state ^ pc.s3);
 
     uint64_t off = state % pc.n_chunks;
     for (uint i = 0u; i < pc.k; ++i) {
@@ -76,11 +85,21 @@ void main() {
         uint64_t local = off - PREFIX.start[t];
         Chunk chunk = Chunk(ADDRS.addr[t] + local * 32UL); // 32 bytes per canonical chunk
         uint64_t h = state;
-        h ^= chunk.words[0];
-        h ^= chunk.words[1];
-        h ^= chunk.words[2];
-        h ^= chunk.words[3];
-        state = mix64(h);
+        if (pc.walk_v2 != 0u) {
+            // H5 non-foldable walk — all 32 bytes load-bearing. Dispatch-uniform, no divergence.
+            h = mix64(h ^ chunk.words[0]);
+            h = mix64(h ^ chunk.words[1]);
+            h = mix64(h ^ chunk.words[2]);
+            h = mix64(h ^ chunk.words[3]);
+            state = h;
+        } else {
+            // Pre-H5 fold (frozen — validates all blocks below h5_activation_daa()).
+            h ^= chunk.words[0];
+            h ^= chunk.words[1];
+            h ^= chunk.words[2];
+            h ^= chunk.words[3];
+            state = mix64(h);
+        }
         off = state % pc.n_chunks;
     }
 
@@ -90,10 +109,10 @@ void main() {
     uint64_t o3 = mix64(o2 ^ pc.p3 ^ 0xD6E8FEB86659FD93UL);
 
     bool le;
-    if (o3 != pc.t3) { le = o3 < pc.t3; }
-    else if (o2 != pc.t2) { le = o2 < pc.t2; }
-    else if (o1 != pc.t1) { le = o1 < pc.t1; }
-    else if (o0 != pc.t0) { le = o0 < pc.t0; }
+    if (o3 != OUT.t[3]) { le = o3 < OUT.t[3]; }
+    else if (o2 != OUT.t[2]) { le = o2 < OUT.t[2]; }
+    else if (o1 != OUT.t[1]) { le = o1 < OUT.t[1]; }
+    else if (o0 != OUT.t[0]) { le = o0 < OUT.t[0]; }
     else { le = true; }
 
     if (le) {

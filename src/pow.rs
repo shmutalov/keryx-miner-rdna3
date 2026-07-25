@@ -185,18 +185,23 @@ impl State {
         let timestamp = u64::from_le_bytes(self.pow_hash_header[32..40].try_into().unwrap());
 
         // H3 salts the pph words feeding both PoM folds (forced update — POM_H3_PPH_SALT).
-        let h3 = self.daa_score >= pom::POM_LEVEL_ACTIVATION_DAA;
-        let seed = pom::pom_block_seed(&pph, timestamp, nonce, h3);
-        let final_state = pom::walk_final(seed, index.n_chunks, pom::POM_WALK_STEPS, |o| index.read_chunk(o));
+        let h3 = self.daa_score >= pom::pom_level_activation_daa();
+        // H5: non-foldable mix64-chained walk at/after the gate. MUST match the GPU search era
+        // (`pom_gpu::mine(.., walk_v2)`) or the CPU rebuild derives a different final_state.
+        let walk_v2 = self.daa_score >= pom::h5_activation_daa();
+        // H5.1: the seed fold reads the v2-salted pph words (pow fold stays H3-salted).
+        let h5_1 = self.daa_score >= pom::h5_1_activation_daa();
+        let seed = pom::pom_block_seed(&pph, timestamp, nonce, h3, h5_1);
+        let final_state = pom::walk_final(seed, index.n_chunks, pom::POM_WALK_STEPS, |o| index.read_chunk(o), walk_v2);
         if !pom::le_leq(&pom::pom_pow_value(final_state, &pph, h3), &self.target.to_le_bytes()) {
             return None;
         }
 
         // H4: recompute-from-chunks proof (all K chunks + paths, verifier re-walks). Pre-H4: the
         // 32/256-opening proof. Node switches its verifier at the SAME score — lockstep.
-        let h4 = self.daa_score >= pom::COIN_AGE_VERIFICATION_ACTIVATION_DAA;
+        let h4 = self.daa_score >= pom::coin_age_verification_activation_daa();
         let proof = if h4 {
-            pom::build_proof_v2(tier, &pph, seed, index.n_chunks, pom::POM_WALK_STEPS, |o| index.read_chunk(o), |o| index.merkle_path(o), h3)
+            pom::build_proof_v2(tier, &pph, seed, index.n_chunks, pom::POM_WALK_STEPS, |o| index.read_chunk(o), |o| index.merkle_path(o), h3, walk_v2)
         } else {
             pom::build_proof(
                 tier,
@@ -217,7 +222,7 @@ impl State {
         // submitting it would just earn a node rejection, so drop the block and log loudly instead.
         let target_le = self.target.to_le_bytes();
         let self_ok = if h4 {
-            pom::verify_proof_v2(&proof, &pph, seed, index.n_chunks, pom::POM_WALK_STEPS, &index.r_t, &target_le, h3)
+            pom::verify_proof_v2(&proof, &pph, seed, index.n_chunks, pom::POM_WALK_STEPS, &index.r_t, &target_le, h3, walk_v2)
         } else {
             pom::verify_proof(&pph, nonce, seed, &proof, index.n_chunks, pom::POM_WALK_STEPS, pom::POM_OPENINGS, &index.r_t, &target_le, h3)
         };
@@ -241,7 +246,7 @@ impl State {
                 header.nonce = nonce;
                 // H3: the header commits to the walk's final state — fill it exactly like the
                 // nonce. The node hashes it into the block hash and pins it to the proof.
-                if header.daa_score >= pom::POM_LEVEL_ACTIVATION_DAA {
+                if header.daa_score >= pom::pom_level_activation_daa() {
                     header.pom_final_state = final_state;
                 }
                 block.pom_proof = bytes; // plain bytes field (empty = none on the wire)
@@ -315,7 +320,7 @@ pub fn serialize_header<H: Hasher>(hasher: &mut H, header: &RpcBlockHeader, for_
 
     // H3: the block hash commits to the walk's final state. NEVER part of the pre-PoW hash
     // (the walk seed derives from it). Mirrors the node's `hashing::header::hash`.
-    if !for_pre_pow && header.daa_score >= pom::POM_LEVEL_ACTIVATION_DAA {
+    if !for_pre_pow && header.daa_score >= pom::pom_level_activation_daa() {
         hasher.update(header.pom_final_state.to_le_bytes());
     }
 }

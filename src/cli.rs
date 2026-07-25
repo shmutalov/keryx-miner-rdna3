@@ -4,13 +4,13 @@ use log::LevelFilter;
 use crate::Error;
 
 #[derive(Parser, Debug)]
-#[clap(name = "keryx-miner", version, about = "A Keryx high performance GPU miner with OPoI inference\n\nUncensored H4 model tiers — one model per tier (default: GLM-4-9B-0414):\n  --very-light EXAONE-4.0-1.2B — 4GB+ VRAM, smallest tier\n  --light      Mistral-7B-v0.3 (Q6_K) — 8GB+ VRAM\n  (default)    GLM-4-9B-0414 (Q6_K) — 12GB+ VRAM\n  --high       Qwen3.6-27B (Q4_K_M) — 24GB+ VRAM\n  --very-high  Kimi-Linear-48B (Q4_K_M) — 32GB+ VRAM", term_width = 0)]
+#[clap(name = "keryx-miner", version, about = "A Keryx high performance GPU miner with OPoI inference\n\nUncensored H5 model tiers — one model per tier (default: GLM-4-9B-0414):\n  --very-light Qwen3-8B-abliterated (Q4_K_S) — 6GB+ VRAM, smallest tier\n  --light      Mistral-7B-v0.3 (Q6_K) — 8GB+ VRAM\n  (default)    GLM-4-9B-0414 (Q6_K) — 12GB+ VRAM\n  --high       Qwen3.6-27B (Q4_K_M) — 24GB+ VRAM\n  --very-high  Kimi-Linear-48B (Q4_K_M) — 32GB+ VRAM", term_width = 0)]
 pub struct Opt {
     // ── OPoI / Inference ─────────────────────────────────────────────────────
 
     #[clap(
         long = "very-light",
-        help = "Model tier: EXAONE-4.0-1.2B — 4GB+ VRAM, smallest tier",
+        help = "Model tier: Qwen3-8B-abliterated (Q4_K_S) — 6GB+ VRAM, smallest tier",
         help_heading = "OPoI / Inference",
         conflicts_with_all = &["light", "high", "very-high"]
     )]
@@ -113,7 +113,10 @@ pub struct Opt {
     #[clap(short, long, help = "Keryxd port [default: Mainnet = 22110, Testnet = 22211]")]
     port: Option<u16>,
 
-    #[clap(long, help = "Use testnet instead of mainnet [default: false]")]
+    #[clap(
+        long,
+        help = "Use testnet instead of mainnet: default port 22211 and testnet DAA activation gates (PoM/H3 from genesis, H4/H5/H5.1 at 3000) [default: false]"
+    )]
     testnet: bool,
 
     #[clap(short = 't', long = "threads", help = "Amount of CPU miner threads to launch [default: 0]")]
@@ -169,6 +172,9 @@ fn parse_devfund_percent(s: &str) -> Result<u16, &'static str> {
 
 impl Opt {
     pub fn process(&mut self) -> Result<(), Error> {
+        // Switch every DAA activation gate (PoM + PoW salts) to its testnet value before any
+        // mining state is built — see `pom::set_testnet`.
+        keryx_miner::pom::set_testnet(self.testnet);
         if self.recover_escrow {
             return Ok(());
         }

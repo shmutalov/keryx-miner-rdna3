@@ -316,7 +316,7 @@ impl MinerManager {
                     // PoM possession mining (design A): when active, the walk runs on the GPU
                     // over the resident weights instead of kHeavyHash. On a winning nonce we build
                     // the proof (host) and submit; the legacy plugin path below is skipped.
-                    if matches!(state.as_ref(), Some(s) if s.daa_score >= keryx_miner::pom::POM_ACTIVATION_DAA) {
+                    if matches!(state.as_ref(), Some(s) if s.daa_score >= keryx_miner::pom::pom_activation_daa()) {
                         // Inference owns ITS GPU while a challenge runs (it has priority). Pause the
                         // walk instead of dispatching: two Vulkan contexts sharing one compute queue
                         // would slow inference past its OPoI deadline, and contention can stretch a
@@ -360,9 +360,14 @@ impl MinerManager {
                             }
                             keryx_miner::pom_gpu::ensure_installed(daa, pom_device);
                         }
-                        let h3 = daa >= keryx_miner::pom::POM_LEVEL_ACTIVATION_DAA;
-                        let found =
-                            keryx_miner::pom_gpu::mine(pom_device, &pph, time, &target_le, pom_nonce, POM_BATCH, h3);
+                        let h3 = daa >= keryx_miner::pom::pom_level_activation_daa();
+                        // H5 / H5.1 eras — MUST be derived from this block's own DAA and MUST match
+                        // what `State::generate_block_if_pom` uses when it rebuilds the walk.
+                        let walk_v2 = daa >= keryx_miner::pom::h5_activation_daa();
+                        let h5_1 = daa >= keryx_miner::pom::h5_1_activation_daa();
+                        let found = keryx_miner::pom_gpu::mine(
+                            pom_device, &pph, time, &target_le, pom_nonce, POM_BATCH, h3, walk_v2, h5_1,
+                        );
                         pom_nonce = pom_nonce.wrapping_add(POM_BATCH);
                         hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
                         worker_hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
@@ -410,7 +415,7 @@ impl MinerManager {
                     gpu_work.copy_output_to(&mut nonces)?;
                     // When PoM is active the GPU still runs kHeavyHash (3a is CPU-only); its
                     // solutions are NOT valid PoM blocks, so don't submit them. GPU PoM = 3b.
-                    if nonces[0] != 0 && state_ref.daa_score < keryx_miner::pom::POM_ACTIVATION_DAA {
+                    if nonces[0] != 0 && state_ref.daa_score < keryx_miner::pom::pom_activation_daa() {
                         if let Some(block_seed) = state_ref.generate_block_if_pow(nonces[0]) {
                             match send_channel.blocking_send(block_seed.clone()) {
                                 Ok(()) => block_seed.report_block(),
@@ -527,7 +532,7 @@ impl MinerManager {
                     // PoM possession path (CPU) once active; else legacy kHeavyHash. The proof tier is
                     // recomputed from this block's DAA (per-block, not the frozen build-time tier) so
                     // the H2 reindex is applied at the boundary — else the node rejects (BadWeightPath).
-                    let found = if state_ref.daa_score >= keryx_miner::pom::POM_ACTIVATION_DAA {
+                    let found = if state_ref.daa_score >= keryx_miner::pom::pom_activation_daa() {
                         keryx_miner::pom::active_index().and_then(|(idx, _)| {
                             let tier = keryx_miner::pom_gpu::current_tier(state_ref.daa_score)?;
                             state_ref.generate_block_if_pom(nonce.0, idx, tier)

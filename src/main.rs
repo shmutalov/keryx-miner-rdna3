@@ -117,7 +117,7 @@ fn filter_plugins(dirname: &str) -> Vec<String> {
 /// this is just an upfront, tier-labelled heads-up.
 ///
 /// VRAM requirements (GGUF weights only, not counting GPU workspace):
-///   EXAONE-4.0-1.2B →  ~0.9 GB
+///   Qwen3-8B-ablit. →  ~4.6 GB  (Q4_K_S — H5 tier 0, requires ≥6 GB card)
 ///   Mistral-7B-v0.3 →  ~5.9 GB  (Q6_K — requires ≥8 GB card)
 ///   GLM-4-9B-0414   →  ~8.3 GB  (Q6_K — requires ≥12 GB card)
 ///   Qwen3.6-27B     → ~16.5 GB  (requires ≥24 GB card)
@@ -136,7 +136,7 @@ fn check_gpu_vram_for_tier(needs_high: bool, needs_very_high: bool) {
     if vram_mb < min_vram_mb {
         log::warn!(
             "⚠  {} needs ≥{} GB VRAM but only {} GB on this GPU — GPU inference for this tier \
-             will OOM. Use a smaller tier (--light Mistral-7B / --very-light EXAONE-4.0-1.2B) or \
+             will OOM. Use a smaller tier (--light Mistral-7B / --very-light Qwen3-8B) or \
              serve it via a host/CPU path.",
             model_label,
             min_vram_mb / 1024,
@@ -179,13 +179,18 @@ fn filter_specs_by_vram(
         .iter()
         .copied()
         .filter(|spec| {
-            if spec.min_vram_mb <= gpu0_mb {
+            // Gate on the ASSIGNMENT floor, not `min_vram_mb`: the H5 tier-0 Qwen3-8B loads in
+            // ~5,409 MiB, so a 6 GB card reporting slightly under its 6000 MB min_vram must still
+            // keep tier 0 rather than be dropped into "cannot mine at all".
+            let floor = keryx_miner::models::pom_assignment_floor_mb(spec);
+            if floor <= gpu0_mb {
                 true
             } else {
                 log::warn!(
-                    "✗  '{}' needs ≥{} MB VRAM but only {} MB on GPU 0 — model NOT announced (ai:cap) and not downloaded.",
+                    "✗  '{}' needs ≥{} MB VRAM (assignment floor {} MB) but only {} MB on GPU 0 — model NOT announced (ai:cap) and not downloaded.",
                     spec.name,
                     spec.min_vram_mb,
+                    floor,
                     gpu0_mb,
                 );
                 false
@@ -436,7 +441,7 @@ async fn run() -> Result<(), Error> {
     // Phase-3 OPoI / PoM: load inference models before mining starts. Under PoM each tier
     // mines AND serves exactly ONE model (1 GPU = 1 tier); multi-tier coverage is a network
     // property, not a per-GPU one. H4 lineup:
-    //   --very-light → EXAONE-4.0-1.2B  (PoM tier 0)
+    //   --very-light → Qwen3-8B-ablit.  (PoM tier 0, H5)
     //   --light      → Mistral-7B-v0.3  (tier 1)
     //   (no flag)    → GLM-4-9B-0414    (tier 2) [default]
     //   --high       → Qwen3.6-27B      (tier 3)
@@ -455,7 +460,7 @@ async fn run() -> Result<(), Error> {
         info!("--light mode: light tier — mines Mistral-7B-v0.3 under PoM.");
         keryx_miner::models::Tier::Light
     } else if opt.very_light {
-        info!("--very-light mode: entry tier — mines EXAONE-4.0-1.2B under PoM.");
+        info!("--very-light mode: entry tier — mines Qwen3-8B-abliterated under PoM.");
         keryx_miner::models::Tier::VeryLight
     } else {
         info!("default mode: mines GLM-4-9B-0414 under PoM.");
@@ -468,7 +473,7 @@ async fn run() -> Result<(), Error> {
     // PoM: pick the highest tier this miner serves that has a pinned R_T (the model it will
     // mine under possession). Captured before `specs_v2` is consumed; the index is built after
     // prefetch (below). `&'static ModelSpec` is Copy so this survives the moves.
-    let pom_spec = if keryx_miner::pom::POM_ACTIVATION_DAA != u64::MAX {
+    let pom_spec = if keryx_miner::pom::pom_activation_daa() != u64::MAX {
         specs_v2
             .iter()
             .copied()
@@ -511,7 +516,7 @@ async fn run() -> Result<(), Error> {
         // the H4 gate makes it None below the flip, so a startup-frozen value would be wrong.
         keryx_miner::pom_gpu::set_mining_tier(spec.model_id, gpath);
         info!("PoM: configured to mine {} under possession; index + GPU walk load lazily when PoM activates (DAA {}).",
-            spec.dir_name, keryx_miner::pom::POM_ACTIVATION_DAA);
+            spec.dir_name, keryx_miner::pom::pom_activation_daa());
     }
 
     // Verify the Vulkan inference backend before mining. OPoI challenges are mandatory, so a miner

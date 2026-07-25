@@ -37,10 +37,20 @@ enum Resident {
 }
 
 impl Resident {
-    fn mine(&self, pph_words: &[u64; 4], ts: u64, target: &[u8; 32], start: u64, batch: u32) -> Option<u64> {
+    #[allow(clippy::too_many_arguments)]
+    fn mine(
+        &self,
+        pow_words: &[u64; 4],
+        seed_words: &[u64; 4],
+        ts: u64,
+        target: &[u8; 32],
+        start: u64,
+        batch: u32,
+        walk_v2: bool,
+    ) -> Option<u64> {
         match self {
-            Resident::Blob(m) => m.mine(pph_words, ts, target, start, batch),
-                    Resident::Shared { walk, .. } => walk.mine(pph_words, ts, target, start, batch),
+            Resident::Blob(m) => m.mine(pow_words, seed_words, ts, target, start, batch, walk_v2),
+            Resident::Shared { walk, .. } => walk.mine(pow_words, seed_words, ts, target, start, batch, walk_v2),
         }
     }
 
@@ -108,8 +118,16 @@ pub fn uninstall() {
 }
 
 /// Search nonces `[start, start + batch)` on `device`. None if not installed or no winner.
-/// `h3` salts the pph words host-side (POM_H3_PPH_SALT) — the walk kernel is era-agnostic,
-/// it folds whatever words it receives, so no shader change at the H3 gate.
+///
+/// `h3` salts the pph words host-side (POM_H3_PPH_SALT); `h5_1` swaps the SEED word set to the
+/// H5.1 salt (POM_H5_1_PPH_SALT) while the POW words stay H3-salted. The walk kernel is
+/// era-agnostic for the folds — it folds whatever word sets it receives — and branches only on
+/// `walk_v2`, which selects the H5 non-foldable mix64-chained transition.
+///
+/// `walk_v2` MUST be derived from the same block DAA the CPU proof path uses
+/// (`State::generate_block_if_pom`) or the rebuild derives a different `final_state` and the
+/// self-verify drops the block.
+#[allow(clippy::too_many_arguments)]
 pub fn mine(
     device: u32,
     pre_pow_hash: &[u8; 32],
@@ -118,13 +136,16 @@ pub fn mine(
     start: u64,
     batch: u64,
     h3: bool,
+    walk_v2: bool,
+    h5_1: bool,
 ) -> Option<u64> {
     // Clone the (Arc-backed) entry out and dispatch lock-free: each device has exactly one
     // worker thread, and holding the map lock across a walk batch would serialize other GPUs.
     let m = miner_on(device)?;
     let batch = batch.min(u32::MAX as u64) as u32;
     let p = crate::pom::pph_words_for_era(pre_pow_hash, h3);
-    m.mine(&p, timestamp, target_le, start, batch)
+    let s = crate::pom::seed_pph_words_for_era(pre_pow_hash, h3, h5_1);
+    m.mine(&p, &s, timestamp, target_le, start, batch, walk_v2)
 }
 
 /// Ensure the GPU PoM miner is installed on `device`; build the host possession index (first

@@ -12,15 +12,20 @@ const POM_WALK_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pom_walk.s
 pub const POM_WALK_STEPS: u32 = 256;
 
 /// Push-constant block — layout MUST match the `Push` block in `pom_walk.comp` (std430: twelve u64
-/// at 0..96, then three u32 at 96, 100, 104; total 112 bytes incl. tail pad). The weight blob is
+/// at 0..96, then four u32 at 96, 100, 104, 108; total 112 bytes, no tail pad). The weight blob is
 /// split into power-of-two-sized shards (each a separate device-address buffer, ≤ the 2 GiB
 /// `maxMemoryAllocationSize`); the shader maps a chunk to its shard via `shard_shift`/`shard_mask`
 /// and reads the shard's GPU address from a small bound address table.
+///
+/// `p` feeds the POW fold, `s` the walk-SEED fold — H5.1 salts only the latter. The 256-bit target
+/// is NOT here: it rides in the binding-0 I/O buffer so this block stays inside the 128 B
+/// guaranteed `maxPushConstantsSize` (RADV reports exactly 128) now that H5/H5.1 need `s` +
+/// `walk_v2`. See [`IoHead`].
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct PomPush {
     p: [u64; 4],
-    t: [u64; 4],
+    s: [u64; 4],
     timestamp: u64,
     n_chunks: u64,
     start_nonce: u64,
@@ -28,9 +33,32 @@ struct PomPush {
     k: u32,
     batch: u32,
     shard_shift: u32, // log2(chunks_per_shard)
+    walk_v2: u32,     // H5: 1 = mix64-chained transition, 0 = frozen v1 XOR fold
+}
+
+/// Binding-0 dispatch I/O block, matching the `Io` block in both walk shaders: the atomicMin winner
+/// slot followed by the 256-bit LE target. Written in ONE pre-dispatch mapped write, so the target
+/// inherits the same visibility guarantee the winner reset always had; only the first 4 bytes are
+/// read back.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct IoHead {
+    offset: u32,
+    _pad: u32,
+    t: [u64; 4],
 }
 
 const NO_WINNER: u32 = 0xFFFF_FFFF;
+
+/// Bytes of the binding-0 I/O block for a dispatch: winner reset + this block's target.
+fn io_bytes(target_le: &[u8; 32]) -> [u8; std::mem::size_of::<IoHead>()] {
+    let head = IoHead { offset: NO_WINNER, _pad: 0, t: words4(target_le) };
+    let mut out = [0u8; std::mem::size_of::<IoHead>()];
+    out.copy_from_slice(unsafe {
+        std::slice::from_raw_parts(&head as *const IoHead as *const u8, std::mem::size_of::<IoHead>())
+    });
+    out
+}
 
 /// Chunks per shard: 2^25 × 32 B = 1 GiB, comfortably under the AMD 2 GiB `maxMemoryAllocationSize`
 /// single-allocation cap, with headroom for driver overhead. Power of two so the shader maps a
@@ -132,7 +160,7 @@ impl PomWalkGpu {
         // Address table (tiny — one u64 per shard) bound as a normal storage buffer at binding 1.
         let addr_table = vk.create_buffer((addrs.len() * 8) as u64)?;
         vk.write_buffer(&addr_table, words_as_bytes(&addrs));
-        let winner = vk.create_buffer(4)?;
+        let winner = vk.create_buffer(std::mem::size_of::<IoHead>() as u64)?;
 
         Ok(Self { vk, kernel, shards, addr_table, winner, n_chunks, shard_chunks })
     }
@@ -153,22 +181,34 @@ impl PomWalkGpu {
 
     /// Search nonces `[start, start + batch)`. Returns the lowest winning nonce, or None.
     ///
-    /// `pph_words` are the pre_pow_hash's 4 LE u64 words, already salted for the block's era by
-    /// the caller (H3 XORs `POM_H3_PPH_SALT` in — see `pom::pph_words_for_era`). The kernel is
-    /// era-agnostic: it folds whatever words it receives, so no shader change at the H3 gate.
+    /// `pow_words` / `seed_words` are the pre_pow_hash's 4 LE u64 words for the POW fold and the
+    /// WALK-SEED fold respectively, already salted for the block's era by the caller (H3 XORs
+    /// `POM_H3_PPH_SALT` into both; H5.1 swaps the seed set to `POM_H5_1_PPH_SALT` — see
+    /// `pom::pph_words_for_era` / `pom::seed_pph_words_for_era`). Pre-H5.1 the two sets are
+    /// identical. `walk_v2` selects the H5 non-foldable transition. The kernel stays era-agnostic:
+    /// it folds whatever word sets it receives and branches only on the `walk_v2` flag.
     ///
     /// The batch is ground in `MAX_DISPATCH_NONCES`-sized sub-dispatches, in increasing nonce order,
     /// so no single GPU dispatch runs long enough to trip the Windows TDR watchdog (DEVICE_LOST).
     /// Sub-batches are ascending, so the first one with any winner holds the global lowest nonce —
     /// returning there is identical to grinding the whole batch, and skips the rest.
-    pub fn mine(&self, pph_words: &[u64; 4], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u32) -> Option<u64> {
+    pub fn mine(
+        &self,
+        pow_words: &[u64; 4],
+        seed_words: &[u64; 4],
+        timestamp: u64,
+        target_le: &[u8; 32],
+        start: u64,
+        batch: u32,
+        walk_v2: bool,
+    ) -> Option<u64> {
         let mut done: u32 = 0;
         while done < batch {
             let sub = (batch - done).min(MAX_DISPATCH_NONCES);
-            self.vk.write_buffer(&self.winner, &NO_WINNER.to_le_bytes());
+            self.vk.write_buffer(&self.winner, &io_bytes(target_le));
             let push = PomPush {
-                p: *pph_words,
-                t: words4(target_le),
+                p: *pow_words,
+                s: *seed_words,
                 timestamp,
                 n_chunks: self.n_chunks,
                 start_nonce: start + done as u64,
@@ -176,6 +216,7 @@ impl PomWalkGpu {
                 k: POM_WALK_STEPS,
                 batch: sub,
                 shard_shift: self.shard_chunks.trailing_zeros(),
+                walk_v2: walk_v2 as u32,
             };
             let groups = sub.div_ceil(64); // local_size_x = 64
             self.vk.dispatch(&self.kernel, &[&self.winner, &self.addr_table], push_bytes(&push), groups);
@@ -206,20 +247,20 @@ impl Drop for PomWalkGpu {
 const POM_WALK_PREFIX_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pom_walk_prefix.spv"));
 const POM_FETCH_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pom_fetch.spv"));
 
-/// Push-constant block for `pom_walk_prefix.comp` (std430: eleven u64 at 0..88, three u32 at
-/// 88..100; padded to 104).
+/// Push-constant block for `pom_walk_prefix.comp` (std430: eleven u64 at 0..88, four u32 at
+/// 88..104; total 104). Same `p`/`s` split and out-of-band target as [`PomPush`].
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct PomPrefixPush {
     p: [u64; 4],
-    t: [u64; 4],
+    s: [u64; 4],
     timestamp: u64,
     n_chunks: u64,
     start_nonce: u64,
     k: u32,
     batch: u32,
     n_tensors: u32,
-    _pad: u32,
+    walk_v2: u32,
 }
 
 /// Push-constant block for `pom_fetch.comp`.
@@ -287,7 +328,7 @@ impl PomWalkShared {
         vk.write_buffer(&prefix_buf, words_as_bytes(&prefix));
         let addrs_buf = vk.create_buffer((addrs.len() * 8) as u64)?;
         vk.write_buffer(&addrs_buf, words_as_bytes(&addrs));
-        let winner = vk.create_buffer(4)?;
+        let winner = vk.create_buffer(std::mem::size_of::<IoHead>() as u64)?;
         let out32 = vk.create_buffer(32)?;
 
         Ok(Self {
@@ -325,22 +366,31 @@ impl PomWalkShared {
 
     /// Search nonces `[start, start + batch)`. Identical sub-dispatch grinding (TDR-bounded)
     /// and lowest-winner semantics as [`PomWalkGpu::mine`], including the caller-salted
-    /// `pph_words` era contract.
-    pub fn mine(&self, pph_words: &[u64; 4], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u32) -> Option<u64> {
+    /// `pow_words`/`seed_words` era contract and the `walk_v2` era flag.
+    pub fn mine(
+        &self,
+        pow_words: &[u64; 4],
+        seed_words: &[u64; 4],
+        timestamp: u64,
+        target_le: &[u8; 32],
+        start: u64,
+        batch: u32,
+        walk_v2: bool,
+    ) -> Option<u64> {
         let mut done: u32 = 0;
         while done < batch {
             let sub = (batch - done).min(MAX_DISPATCH_NONCES);
-            self.vk.write_buffer(&self.winner, &NO_WINNER.to_le_bytes());
+            self.vk.write_buffer(&self.winner, &io_bytes(target_le));
             let push = PomPrefixPush {
-                p: *pph_words,
-                t: words4(target_le),
+                p: *pow_words,
+                s: *seed_words,
                 timestamp,
                 n_chunks: self.n_chunks,
                 start_nonce: start + done as u64,
                 k: POM_WALK_STEPS,
                 batch: sub,
                 n_tensors: self.n_tensors,
-                _pad: 0,
+                walk_v2: walk_v2 as u32,
             };
             let groups = sub.div_ceil(64); // local_size_x = 64
             self.vk.dispatch(&self.walk, &[&self.winner, &self.prefix, &self.addrs], prefix_push_bytes(&push), groups);

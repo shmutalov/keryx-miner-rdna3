@@ -14,26 +14,41 @@ const KERYX_MATRIX_SALT_V4: [u8; 32] = *b"KERYX:KeryxHash-v4:2026-06-07:xx";
 /// in network params. Miners compiled before this update will keep using v1 and their
 /// blocks will be rejected after activation — that is the forced-update mechanism.
 ///
-/// Mainnet: 17_275_000 (2026-05-30 ~15:00 UTC emergency activation)
-/// Testnet: 0 (active from genesis — no mid-chain salt transition on testnet)
-// Mainnet value — matches the node's MAINNET_PARAMS.pow_salt_v2_activation = new(17_275_000).
-pub const POW_SALT_V2_ACTIVATION_DAA: u64 = 17_275_000;
+/// Mainnet: 17_275_000 (2026-05-30 ~15:00 UTC emergency activation) — matches the node's
+/// MAINNET_PARAMS.pow_salt_v2_activation = new(17_275_000).
+/// Testnet: 0 (active from genesis — no mid-chain salt transition on testnet).
+#[inline(always)]
+pub fn pow_salt_v2_activation_daa() -> u64 {
+    if keryx_miner::pom::is_testnet() {
+        0
+    } else {
+        17_275_000
+    }
+}
 
 /// DAA score at which the miner switches to SALT v4 (chain relaunch on stock difficulty) —
 /// must match `pow_salt_v4_activation` in network params. The matrix is generated host-side
 /// here (the CUDA kernel receives the precomputed matrix), so no kernel/PTX change is needed.
 ///
-/// Mainnet: 21_932_751 (same DAA as the old v3 gate; forks cleanly off the broken chain)
-/// Mainnet value — matches the node's MAINNET_PARAMS.pow_salt_v4_activation = new(21_932_751).
-pub const POW_SALT_V4_ACTIVATION_DAA: u64 = 21_932_751;
+/// Mainnet: 21_932_751 (same DAA as the old v3 gate; forks cleanly off the broken chain) —
+/// matches the node's MAINNET_PARAMS.pow_salt_v4_activation = new(21_932_751).
+/// Testnet: 0 (active from genesis) — node TESTNET_PARAMS.pow_salt_v4_activation = new(0).
+#[inline(always)]
+pub fn pow_salt_v4_activation_daa() -> u64 {
+    if keryx_miner::pom::is_testnet() {
+        0
+    } else {
+        21_932_751
+    }
+}
 
 /// Returns the active matrix-salt version (1, 2 or 4) for a block at `daa_score`.
 /// Must mirror `active_salt_version` in `consensus/pow/src/lib.rs` (compared with `>=`).
 #[inline(always)]
 pub fn active_salt_version(daa_score: u64) -> u8 {
-    if daa_score >= POW_SALT_V4_ACTIVATION_DAA {
+    if daa_score >= pow_salt_v4_activation_daa() {
         4
-    } else if daa_score >= POW_SALT_V2_ACTIVATION_DAA {
+    } else if daa_score >= pow_salt_v2_activation_daa() {
         2
     } else {
         1
