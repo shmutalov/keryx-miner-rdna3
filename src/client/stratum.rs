@@ -192,14 +192,15 @@ impl Client for StratumHandler {
                 payload: StratumLinePayload::StratumCommand(StratumCommand::Subscribe(
                     MiningSubscribe::MiningSubscribeOptions((
                         // suprnova's bridge version-gates PoM shares by the reported keryx-miner-supr
-                        // version (post-H2 it rejected <= v0.6.3.6; post-H4 it demands >= v0.7.0:
-                        // "UPGRADE to keryx-miner-supr >= v0.7.0"). This build IS H4-aware:
-                        // `pom_tier_index`/`current_tier` emit the H4 five-tier index and the submit
-                        // path builds the v2 recompute-from-chunks proof (see
-                        // pom::COIN_AGE_VERIFICATION_ACTIVATION_DAA) — so advertise the first version
-                        // that clears the H4 floor. Bump this single string if the pool raises the
-                        // floor again. (Real build: keryx-miner/CARGO_PKG_VERSION.)
-                        "keryx-miner-supr/0.7.0.0".to_string(),
+                        // version (post-H2 it rejected <= v0.6.3.6; post-H4 it demanded >= v0.7.0;
+                        // post-H5 it demands >= v0.9.0: "miners below v0.9.0 are rejected and mine
+                        // dead work"). This build IS H5-aware: the walk uses the non-foldable
+                        // `transition_v2` at/after `pom::h5_activation_daa()`, the seed fold takes
+                        // the H5.1 salt at `pom::h5_1_activation_daa()`, and `pom_tier_index` emits
+                        // the H5 tier table (tier 0 = Qwen3-8B-abliterated) — so advertise the first
+                        // version that clears the H5 floor. Bump this single string if the pool
+                        // raises the floor again. (Real build: keryx-miner/CARGO_PKG_VERSION.)
+                        "keryx-miner-supr/0.9.0.0".to_string(),
                         KERYX_STRATUM_DAA_CAPABILITY.into(),
                     )),
                 )),
