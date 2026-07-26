@@ -176,7 +176,7 @@ automatically at every start.)
   card can actually serve (a 7900 XT comfortably runs `--light` and the default tier).
 - ⚠️ **Pool version gate:** some pools (suprnova) reject post-fork PoM shares from miners that don't
   advertise a recent enough `keryx-miner-supr` version in `mining.subscribe` (the floor has moved
-  with each hardfork — `0.6.3+`, then `0.7.0+`, and `0.9.0+` since H5); this fork advertises a
+  with each hardfork — `0.6.3+`, then `0.7.0+`, `0.9.0+` at H5 and `0.9.2+` since H5.2); this fork advertises a
   compatible identity so its (valid) proofs are accepted. Single string in `client/stratum.rs`.
 - ⚠️ **Known benign:** an occasional panic in `MinerManager`'s shutdown/reconnect path (a worker
   thread exits before the drop-time join) — harmless under a supervised restart loop; a clean-up

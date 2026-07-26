@@ -193,15 +193,16 @@ impl Client for StratumHandler {
                     MiningSubscribe::MiningSubscribeOptions((
                         // suprnova's bridge version-gates PoM shares by the reported keryx-miner-supr
                         // version (post-H2 it rejected <= v0.6.3.6; post-H4 it demanded >= v0.7.0;
-                        // post-H5 it demands >= v0.9.0: "miners below v0.9.0 are rejected and mine
-                        // dead work"). This build IS H5-aware: the walk uses the non-foldable
+                        // post-H5 it first demanded >= v0.9.0, then >= v0.9.2 once H5.2 landed:
+                        // "miners below v0.9.2 are rejected and mine dead work"). This build IS
+                        // H5.2-aware: the walk uses the non-foldable
                         // `transition_v2` at/after `pom::h5_activation_daa()`, the seed fold takes
                         // the H5.1 salt at `pom::h5_1_activation_daa()` then the H5.2 salt at
                         // `pom::h5_2_activation_daa()`, and `pom_tier_index` emits
                         // the H5 tier table (tier 0 = Qwen3-8B-abliterated) — so advertise the first
-                        // version that clears the H5 floor. Bump this single string if the pool
+                        // version that clears the current floor. Bump this single string if the pool
                         // raises the floor again. (Real build: keryx-miner/CARGO_PKG_VERSION.)
-                        "keryx-miner-supr/0.9.0.0".to_string(),
+                        "keryx-miner-supr/0.9.2.0".to_string(),
                         KERYX_STRATUM_DAA_CAPABILITY.into(),
                     )),
                 )),
