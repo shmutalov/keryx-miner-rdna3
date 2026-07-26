@@ -191,7 +191,9 @@ impl State {
         let walk_v2 = self.daa_score >= pom::h5_activation_daa();
         // H5.1: the seed fold reads the v2-salted pph words (pow fold stays H3-salted).
         let h5_1 = self.daa_score >= pom::h5_1_activation_daa();
-        let seed = pom::pom_block_seed(&pph, timestamp, nonce, h3, h5_1);
+        // H5.2: the seed fold rotates to the H5.2 salt (still seed-only).
+        let h5_2 = self.daa_score >= pom::h5_2_activation_daa();
+        let seed = pom::pom_block_seed(&pph, timestamp, nonce, h3, h5_1, h5_2);
         let final_state = pom::walk_final(seed, index.n_chunks, pom::POM_WALK_STEPS, |o| index.read_chunk(o), walk_v2);
         if !pom::le_leq(&pom::pom_pow_value(final_state, &pph, h3), &self.target.to_le_bytes()) {
             return None;

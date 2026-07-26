@@ -260,10 +260,24 @@ pub fn pph_words_for_era(pre_pow_hash: &[u8; 32], h3: bool) -> [u64; 4] {
 /// MUST equal the node's `POM_H5_1_PPH_SALT`.
 pub const POM_H5_1_PPH_SALT: [u64; 4] = [0x0F86D1400D3F8664, 0xC296B67C7A7A6A5B, 0x5F89AD33D961FEAA, 0xAC6C9AFDFA053580];
 
-/// pph words feeding the SEED fold for the era selected by (`h3`, `h5_1`).
+/// H5.2 domain salt applied to the pph words feeding the WALK SEED fold only, at/after
+/// `h5_2_activation_daa()`. Chain anchoring 2026-07-25: rotating the seed salt makes every
+/// pre-gate fork point of the relaunched chain permanently uncompetitive. Seed fold only —
+/// the pow fold keeps the H3 salt (header-only pow and block levels are era-stable).
+/// Derivation: sha256("keryx-h5.2-pom-pph-salt") read as 4 little-endian u64 words.
+/// MUST equal the node's `POM_H5_2_PPH_SALT`.
+pub const POM_H5_2_PPH_SALT: [u64; 4] = [0x584ADE0A598D896D, 0x8783631D81BC2695, 0x2917FCF883A0B862, 0x533CCCFAC88FD614];
+
+/// pph words feeding the SEED fold for the era selected by (`h3`, `h5_1`, `h5_2`).
 #[inline]
-pub fn seed_pph_words_for_era(pre_pow_hash: &[u8; 32], h3: bool, h5_1: bool) -> [u64; 4] {
-    if h5_1 {
+pub fn seed_pph_words_for_era(pre_pow_hash: &[u8; 32], h3: bool, h5_1: bool, h5_2: bool) -> [u64; 4] {
+    if h5_2 {
+        let mut w = pph_words(pre_pow_hash);
+        for (wi, si) in w.iter_mut().zip(POM_H5_2_PPH_SALT.iter()) {
+            *wi ^= si;
+        }
+        w
+    } else if h5_1 {
         let mut w = pph_words(pre_pow_hash);
         for (wi, si) in w.iter_mut().zip(POM_H5_1_PPH_SALT.iter()) {
             *wi ^= si;
@@ -287,9 +301,9 @@ fn pom_block_seed_from_words(p: &[u64; 4], timestamp: u64, nonce: u64) -> u64 {
 
 /// Canonical block seed = initial walk state. mix64-fold of (nonce, time, pre_pow_hash).
 /// BYTE-IDENTICAL to the Vulkan walk kernel's seed fold and the node's
-/// `pom_block_seed`(`_h3`/`_h5_1`).
-pub fn pom_block_seed(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64, h3: bool, h5_1: bool) -> u64 {
-    pom_block_seed_from_words(&seed_pph_words_for_era(pre_pow_hash, h3, h5_1), timestamp, nonce)
+/// `pom_block_seed`(`_h3`/`_h5_1`/`_h5_2`).
+pub fn pom_block_seed(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64, h3: bool, h5_1: bool, h5_2: bool) -> u64 {
+    pom_block_seed_from_words(&seed_pph_words_for_era(pre_pow_hash, h3, h5_1, h5_2), timestamp, nonce)
 }
 
 /// Canonical pow value (256-bit LE) = mix64-fold of (final_state, pre_pow_hash).
@@ -411,9 +425,10 @@ pub fn mine_pom(
     h3: bool,
 ) -> Option<(u64, PomProof)> {
     for nonce in nonce_start..nonce_start.saturating_add(max_nonces) {
-        // Legacy pre-H4 path: the H5/H5.1 eras can never reach it (both gates are far above the H4
-        // gate, and this binary refuses to mine below H4), so h5_1 = false and the walk stays v1.
-        let seed = pom_block_seed(pre_pow_hash, timestamp, nonce, h3, false);
+        // Legacy pre-H4 path: the H5/H5.1/H5.2 eras can never reach it (every gate is far above the
+        // H4 gate, and this binary refuses to mine below H4), so both flags are false and the walk
+        // stays v1.
+        let seed = pom_block_seed(pre_pow_hash, timestamp, nonce, h3, false, false);
         let final_state = walk_final(seed, index.n_chunks, k, |o| index.read_chunk(o), false);
         if le_leq(&pom_pow_value(final_state, pre_pow_hash, h3), target) {
             let proof = build_proof(tier, pre_pow_hash, nonce, seed, index.n_chunks, k, t, |o| index.read_chunk(o), |o| index.merkle_path(o), h3);
@@ -1222,6 +1237,17 @@ pub fn h5_1_activation_daa() -> u64 {
     gate(59_027_921, 3_000)
 }
 
+/// H5.2 (chain anchoring 2026-07-25) activation DAA score. At/after this score the walk seed
+/// derives from the H5.2-salted pph words (`POM_H5_2_PPH_SALT`) instead of the H5.1 ones — seed
+/// fold only, the pow fold keeps the H3 salt. Rotating the salt strands every pre-gate fork point
+/// of the relaunched chain. MUST equal the node's `MAINNET_PARAMS.h5_2_activation` /
+/// `H5_2_ACTIVATION_DAA` = 59_170_000.
+/// Testnet: 4_000 — node TESTNET_PARAMS.h5_2_activation = new(4_000).
+#[inline(always)]
+pub fn h5_2_activation_daa() -> u64 {
+    gate(59_170_000, 4_000)
+}
+
 /// The resident tier weight index + tier id, installed once at startup when PoM is enabled.
 static POM_INDEX: OnceLock<(WeightIndex, u8)> = OnceLock::new();
 
@@ -1500,7 +1526,7 @@ mod tests {
         let pph = [7u8; 32];
         let target = [0xffu8; 32];
         let (nonce, proof) = mine_pom(&idx, 2, &pph, 123, &target, k, t, 0, 1, false).expect("max target → win");
-        let seed = pom_block_seed(&pph, 123, nonce, false, false);
+        let seed = pom_block_seed(&pph, 123, nonce, false, false, false);
         assert!(verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, k, t, &idx.r_t, &target, false));
 
         let _ = std::fs::remove_file(&gguf_path);
@@ -1524,7 +1550,7 @@ mod tests {
         let pph = [3u8; 32];
         let target = [0xffu8; 32]; // max → the first nonce wins, so 1 nonce suffices
         let (nonce, proof) = mine_pom(&idx, 0, &pph, 99, &target, k, t, 0, 1, false).expect("max target → win");
-        let seed = pom_block_seed(&pph, 99, nonce, false, false);
+        let seed = pom_block_seed(&pph, 99, nonce, false, false, false);
         assert!(
             verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, k, t, &idx.r_t, &target, false),
             "GGUF-pread chunks must verify against the model's R_T (byte-identity broken otherwise)"
@@ -1588,7 +1614,7 @@ mod tests {
         let idx = synth_index(4096);
         let pph = blake(b"pph");
         let nonce = 0xabc;
-        let seed = pom_block_seed(&pph, 111, nonce, false, false);
+        let seed = pom_block_seed(&pph, 111, nonce, false, false, false);
 
         let proof =
             build_proof(2, &pph, nonce, seed, idx.n_chunks, k, t, |o| idx.read_chunk(o), |o| idx.merkle_path(o), false);
@@ -1605,7 +1631,7 @@ mod tests {
         let k = 256u32;
         let idx = synth_index(4096);
         let pph = blake(b"v2-pph");
-        let seed = pom_block_seed(&pph, 111, 0xabc, true, false);
+        let seed = pom_block_seed(&pph, 111, 0xabc, true, false, false);
 
         let proof = build_proof_v2(3, &pph, seed, idx.n_chunks, k, |o| idx.read_chunk(o), |o| idx.merkle_path(o), true, false);
         assert_eq!(proof.tier, 3);
@@ -1632,7 +1658,7 @@ mod tests {
         let k = 256u32;
         let idx = synth_index(4096);
         let pph = blake(b"h5-era");
-        let seed = pom_block_seed(&pph, 1, 42, true, false);
+        let seed = pom_block_seed(&pph, 1, 42, true, false, false);
 
         let p_v1 = build_proof_v2(0, &pph, seed, idx.n_chunks, k, |o| idx.read_chunk(o), |o| idx.merkle_path(o), true, false);
         let p_v2 = build_proof_v2(0, &pph, seed, idx.n_chunks, k, |o| idx.read_chunk(o), |o| idx.merkle_path(o), true, true);
@@ -1674,15 +1700,40 @@ mod tests {
         let nonce = 0x5150;
 
         // Seed diverges across the H5.1 gate — that is the forced update.
-        let seed_h3 = pom_block_seed(&pph, 7, nonce, true, false);
-        let seed_h5_1 = pom_block_seed(&pph, 7, nonce, true, true);
+        let seed_h3 = pom_block_seed(&pph, 7, nonce, true, false, false);
+        let seed_h5_1 = pom_block_seed(&pph, 7, nonce, true, true, false);
         assert_ne!(seed_h3, seed_h5_1, "H5.1 salt must change the walk seed");
 
         // The pow fold is untouched: pph_words_for_era has no h5_1 dimension at all, and the
         // H5.1 seed words differ from the pow words they replace.
         assert_eq!(pom_pow_value(7, &pph, true), pom_pow_value(7, &pph, true));
-        assert_ne!(seed_pph_words_for_era(&pph, true, true), pph_words_for_era(&pph, true));
-        assert_eq!(seed_pph_words_for_era(&pph, true, false), pph_words_for_era(&pph, true));
+        assert_ne!(seed_pph_words_for_era(&pph, true, true, false), pph_words_for_era(&pph, true));
+        assert_eq!(seed_pph_words_for_era(&pph, true, false, false), pph_words_for_era(&pph, true));
+    }
+
+    /// H5.2 rotates the SEED salt again: it must override H5.1 where both are active, still leave
+    /// the pow fold on the H3 words, and land on the node's pinned salt (lockstep constant).
+    #[test]
+    fn h5_2_rotates_seed_salt_over_h5_1() {
+        let pph = blake(b"h5.2-pph");
+        let nonce = 0x5250;
+
+        let seed_h5_1 = pom_block_seed(&pph, 7, nonce, true, true, false);
+        let seed_h5_2 = pom_block_seed(&pph, 7, nonce, true, true, true);
+        assert_ne!(seed_h5_1, seed_h5_2, "H5.2 salt must change the walk seed at the gate");
+
+        // H5.2 wins over H5.1 and over H3 — the seed words are the raw pph XOR the H5.2 salt.
+        let raw = pph_words(&pph);
+        let want: [u64; 4] = std::array::from_fn(|i| raw[i] ^ POM_H5_2_PPH_SALT[i]);
+        assert_eq!(seed_pph_words_for_era(&pph, true, true, true), want);
+        assert_eq!(seed_pph_words_for_era(&pph, true, false, true), want);
+
+        // Seed fold only: the pow words stay H3-salted and differ from the H5.2 seed words.
+        assert_ne!(seed_pph_words_for_era(&pph, true, true, true), pph_words_for_era(&pph, true));
+
+        // Gate ordering — H5 ≤ H5.1 < H5.2 in both nets (testnet crosses H5/H5.1 in one run).
+        assert!(h5_activation_daa() <= h5_1_activation_daa());
+        assert!(h5_1_activation_daa() < h5_2_activation_daa());
     }
 
     /// A pre-H4 proof MUST wire-encode byte-identically to the 7-field `PomProofPreH4` layout —
@@ -1692,7 +1743,7 @@ mod tests {
         let (k, t) = (256u32, 32usize);
         let idx = synth_index(4096);
         let pph = blake(b"legacy-pph");
-        let seed = pom_block_seed(&pph, 1, 7, false, false);
+        let seed = pom_block_seed(&pph, 1, 7, false, false, false);
         let proof = build_proof(1, &pph, 7, seed, idx.n_chunks, k, t, |o| idx.read_chunk(o), |o| idx.merkle_path(o), false);
         let legacy = borsh::to_vec(&PomProofPreH4 {
             tier: proof.tier,
@@ -1714,8 +1765,8 @@ mod tests {
         let pph = blake(b"h3-pph");
         let nonce = 0xdef;
         // The salted era must diverge from the raw era on both folds.
-        let seed_pre = pom_block_seed(&pph, 42, nonce, false, false);
-        let seed_h3 = pom_block_seed(&pph, 42, nonce, true, false);
+        let seed_pre = pom_block_seed(&pph, 42, nonce, false, false, false);
+        let seed_h3 = pom_block_seed(&pph, 42, nonce, true, false, false);
         assert_ne!(seed_pre, seed_h3, "H3 salt must change the walk seed");
         assert_ne!(pom_pow_value(7, &pph, false), pom_pow_value(7, &pph, true), "H3 salt must change the pow value");
         // A proof built in the H3 era verifies in the H3 era and fails in the pre-H3 era.
@@ -1734,7 +1785,7 @@ mod tests {
         let idx = synth_index(4096);
         let pph = blake(b"pph2");
         let nonce = 7;
-        let seed = pom_block_seed(&pph, 1, nonce, false, false);
+        let seed = pom_block_seed(&pph, 1, nonce, false, false, false);
         let proof =
             build_proof(0, &pph, nonce, seed, idx.n_chunks, k, t, |o| idx.read_chunk(o), |o| idx.merkle_path(o), false);
         assert!(
@@ -1757,7 +1808,7 @@ mod tests {
         let mut target = [0xffu8; 32];
         target[31] = 0x10;
         let (nonce, proof) = mine_pom(&idx, 1, &pph, ts, &target, k, t, 0, 100_000, false).expect("mine a nonce");
-        let seed = pom_block_seed(&pph, ts, nonce, false, false);
+        let seed = pom_block_seed(&pph, ts, nonce, false, false, false);
         // The proof verifies against the same target the node would use.
         assert!(verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, k, t, &idx.r_t, &target, false));
         assert_eq!(proof.tier, 1);
@@ -1781,7 +1832,7 @@ mod tests {
 
         // A real post-H5 (v2 proof, v2 walk) proof over the real model self-verifies against R_T.
         let pph = blake(b"qwen3-8b-pph");
-        let seed = pom_block_seed(&pph, 99, 1234, true, true);
+        let seed = pom_block_seed(&pph, 99, 1234, true, true, false);
         let proof =
             build_proof_v2(0, &pph, seed, idx.n_chunks, 256, |o| idx.read_chunk(o), |o| idx.merkle_path(o), true, true);
         assert!(verify_proof_v2(&proof, &pph, seed, idx.n_chunks, 256, &idx.r_t, &[0xff; 32], true, true));

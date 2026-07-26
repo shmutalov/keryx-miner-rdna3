@@ -196,7 +196,8 @@ impl Client for StratumHandler {
                         // post-H5 it demands >= v0.9.0: "miners below v0.9.0 are rejected and mine
                         // dead work"). This build IS H5-aware: the walk uses the non-foldable
                         // `transition_v2` at/after `pom::h5_activation_daa()`, the seed fold takes
-                        // the H5.1 salt at `pom::h5_1_activation_daa()`, and `pom_tier_index` emits
+                        // the H5.1 salt at `pom::h5_1_activation_daa()` then the H5.2 salt at
+                        // `pom::h5_2_activation_daa()`, and `pom_tier_index` emits
                         // the H5 tier table (tier 0 = Qwen3-8B-abliterated) — so advertise the first
                         // version that clears the H5 floor. Bump this single string if the pool
                         // raises the floor again. (Real build: keryx-miner/CARGO_PKG_VERSION.)

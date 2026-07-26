@@ -119,8 +119,9 @@ pub fn uninstall() {
 
 /// Search nonces `[start, start + batch)` on `device`. None if not installed or no winner.
 ///
-/// `h3` salts the pph words host-side (POM_H3_PPH_SALT); `h5_1` swaps the SEED word set to the
-/// H5.1 salt (POM_H5_1_PPH_SALT) while the POW words stay H3-salted. The walk kernel is
+/// `h3` salts the pph words host-side (POM_H3_PPH_SALT); `h5_1`/`h5_2` swap the SEED word set to
+/// the H5.1/H5.2 salt (H5.2 wins where both are active) while the POW words stay H3-salted. The
+/// walk kernel is
 /// era-agnostic for the folds — it folds whatever word sets it receives — and branches only on
 /// `walk_v2`, which selects the H5 non-foldable mix64-chained transition.
 ///
@@ -138,13 +139,14 @@ pub fn mine(
     h3: bool,
     walk_v2: bool,
     h5_1: bool,
+    h5_2: bool,
 ) -> Option<u64> {
     // Clone the (Arc-backed) entry out and dispatch lock-free: each device has exactly one
     // worker thread, and holding the map lock across a walk batch would serialize other GPUs.
     let m = miner_on(device)?;
     let batch = batch.min(u32::MAX as u64) as u32;
     let p = crate::pom::pph_words_for_era(pre_pow_hash, h3);
-    let s = crate::pom::seed_pph_words_for_era(pre_pow_hash, h3, h5_1);
+    let s = crate::pom::seed_pph_words_for_era(pre_pow_hash, h3, h5_1, h5_2);
     m.mine(&p, &s, timestamp, target_le, start, batch, walk_v2)
 }
 

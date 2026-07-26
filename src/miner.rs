@@ -361,12 +361,13 @@ impl MinerManager {
                             keryx_miner::pom_gpu::ensure_installed(daa, pom_device);
                         }
                         let h3 = daa >= keryx_miner::pom::pom_level_activation_daa();
-                        // H5 / H5.1 eras — MUST be derived from this block's own DAA and MUST match
-                        // what `State::generate_block_if_pom` uses when it rebuilds the walk.
+                        // H5 / H5.1 / H5.2 eras — MUST be derived from this block's own DAA and MUST
+                        // match what `State::generate_block_if_pom` uses when it rebuilds the walk.
                         let walk_v2 = daa >= keryx_miner::pom::h5_activation_daa();
                         let h5_1 = daa >= keryx_miner::pom::h5_1_activation_daa();
+                        let h5_2 = daa >= keryx_miner::pom::h5_2_activation_daa();
                         let found = keryx_miner::pom_gpu::mine(
-                            pom_device, &pph, time, &target_le, pom_nonce, POM_BATCH, h3, walk_v2, h5_1,
+                            pom_device, &pph, time, &target_le, pom_nonce, POM_BATCH, h3, walk_v2, h5_1, h5_2,
                         );
                         pom_nonce = pom_nonce.wrapping_add(POM_BATCH);
                         hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
