@@ -62,10 +62,11 @@ pub struct EscrowEntry {
     /// Never leads to a permanent slash: an unspent escrow UTXO stays claimable.
     #[serde(default)]
     pub submit_retries: u8,
-    /// Set when a batch containing this entry was rejected: the entry is then claimed
-    /// alone so one poisoned input cannot block the others.
+    /// Max claim-batch size this entry may join (0 = uncapped). Halved every time a
+    /// batch containing this entry is rejected: batches bisect until dead inputs are
+    /// isolated into solo claims and valid inputs re-group into accepted batches.
     #[serde(default)]
-    pub solo_only: bool,
+    pub batch_cap: u8,
     /// True for AI inference escrow entries (from AiRequest output[1]).
     /// Red-set slashing is skipped for these since non-coinbase TXs can be re-included.
     #[serde(default)]
@@ -351,7 +352,7 @@ impl EscrowWatcher {
                         orphan_retries: 0,
                         orphan_retry_after_daa: None,
                         submit_retries: 0,
-                        solo_only: false,
+                        batch_cap: 0,
                         is_inference: false,
                     });
                     self.outpoint_set.insert(key);
@@ -404,10 +405,12 @@ impl EscrowWatcher {
         // often not enough, causing seq-lock rejections that get retried every block.
         // Per-entry cooldowns are checked individually so they don't block other claims.
         // Inference entries are prioritised: they carry user fees and must not be starved by the
-        // large coinbase entry queue. solo_only entries (from a rejected batch) are claimed
-        // one at a time, and only when no batchable work is pending.
+        // large coinbase entry queue.
+        // Batch sizing honors every member's batch_cap (the bisection state): the batch never
+        // grows past the smallest cap among its members, and entries whose cap is smaller than
+        // the batch being formed are left for a later, smaller batch.
         let mut batch: Vec<usize> = Vec::new();
-        let mut solo: Option<usize> = None;
+        let mut limit = MAX_CLAIM_BATCH;
         'select: for inference_pass in [true, false] {
             for (i, e) in self.state.entries.iter().enumerate() {
                 if e.is_inference != inference_pass {
@@ -421,18 +424,16 @@ impl EscrowWatcher {
                 if !eligible {
                     continue;
                 }
-                if e.solo_only {
-                    solo.get_or_insert(i);
-                    continue;
+                let cap = if e.batch_cap == 0 { MAX_CLAIM_BATCH } else { (e.batch_cap as usize).min(MAX_CLAIM_BATCH) };
+                if cap.min(limit) < batch.len() + 1 {
+                    continue; // joining would violate this entry's cap (or shrink below current size)
                 }
+                limit = limit.min(cap);
                 batch.push(i);
-                if batch.len() >= MAX_CLAIM_BATCH {
+                if batch.len() >= limit {
                     break 'select;
                 }
             }
-        }
-        if batch.is_empty() {
-            batch.extend(solo);
         }
         if batch.is_empty() {
             return None;
@@ -509,6 +510,11 @@ impl EscrowWatcher {
                 let is_seq_lock = msg.contains("sequence lock");
                 let batch_rejected = n_outputs > 1;
                 let last_daa = self.last_daa_score;
+                // Bisection step: one dead input orphans the whole batch, but most members
+                // are usually fine. Halve every member's cap and retry as smaller batches —
+                // valid entries re-group into accepted batches within log2(batch) rounds,
+                // dead ones converge to solo claims and get slashed there.
+                let halved_cap = ((n_outputs / 2).max(1)).min(u8::MAX as usize) as u8;
                 for (t, i) in &claim.outpoints {
                     let e = match self
                         .state
@@ -519,32 +525,39 @@ impl EscrowWatcher {
                         Some(e) => e,
                         None => continue,
                     };
-                    // A rejected batch degrades its entries to solo claims so one poisoned
-                    // input cannot keep blocking the other outputs.
-                    if batch_rejected {
-                        e.solo_only = true;
-                    }
                     if is_orphan {
-                        e.orphan_retries += 1;
-                        if e.orphan_retries >= MAX_ORPHAN_RETRIES {
-                            e.orphan_slashed = false;
-                            e.slashed = true;
-                            debug!(
-                                "EscrowWatcher: coinbase={}[{}] slashed after {} orphan retries",
-                                t, i, e.orphan_retries
-                            );
+                        if batch_rejected {
+                            // No retry count and no cooldown here: retries are only counted
+                            // on solo claims, so a valid entry repeatedly batched with a
+                            // dead one can never be slashed by association, and the halves
+                            // retry immediately (bisection strictly shrinks, so it ends).
+                            e.batch_cap = halved_cap;
                         } else {
-                            e.orphan_slashed = true;
-                            // Per-entry cooldown: only this entry waits, other claims proceed.
-                            e.orphan_retry_after_daa = Some(last_daa + ORPHAN_RETRY_COOLDOWN_BLOCKS);
+                            e.orphan_retries += 1;
+                            if e.orphan_retries >= MAX_ORPHAN_RETRIES {
+                                e.orphan_slashed = false;
+                                e.slashed = true;
+                                debug!(
+                                    "EscrowWatcher: coinbase={}[{}] slashed after {} orphan retries",
+                                    t, i, e.orphan_retries
+                                );
+                            } else {
+                                e.orphan_slashed = true;
+                                // Per-entry cooldown: only this entry waits, other claims proceed.
+                                e.orphan_retry_after_daa = Some(last_daa + ORPHAN_RETRY_COOLDOWN_BLOCKS);
+                            }
                         }
                     } else if is_seq_lock {
                         // The OP_CSV blue-score check may lag DAA score by a few blocks.
                         e.orphan_retry_after_daa = Some(last_daa + SEQ_LOCK_RETRY_COOLDOWN_BLOCKS);
                     } else {
-                        // Unrecognized rejection: exponential backoff, never a permanent
-                        // slash — an unspent escrow UTXO stays claimable, and deriving an
-                        // irreversible state from an error string has lost real funds before.
+                        // Unrecognized rejection: bisect too (a size-related rejection heals
+                        // that way) with exponential backoff, never a permanent slash — an
+                        // unspent escrow UTXO stays claimable, and deriving an irreversible
+                        // state from an error string has lost real funds before.
+                        if batch_rejected {
+                            e.batch_cap = halved_cap;
+                        }
                         e.submit_retries = e.submit_retries.saturating_add(1);
                         let cooldown = UNKNOWN_RETRY_BASE_COOLDOWN_DAA
                             .saturating_mul(1u64 << (e.submit_retries.min(9) as u32))
@@ -556,7 +569,7 @@ impl EscrowWatcher {
                     "EscrowWatcher: claim {} rejected ({} output(s) released{}): {}",
                     claim_txid,
                     n_outputs,
-                    if batch_rejected { ", degraded to solo claims" } else { "" },
+                    if batch_rejected { ", batch cap halved" } else { "" },
                     msg
                 );
             }
@@ -694,7 +707,7 @@ impl EscrowWatcher {
             orphan_retries: 0,
             orphan_retry_after_daa: None,
             submit_retries: 0,
-            solo_only: false,
+            batch_cap: 0,
             is_inference: true,
         });
         self.outpoint_set.insert(key);

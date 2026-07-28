@@ -408,7 +408,7 @@ async fn run() -> Result<(), Error> {
                 orphan_retries: 0,
                 orphan_retry_after_daa: None,
                 submit_retries: 0,
-                solo_only: false,
+                batch_cap: 0,
                 is_inference: false,
             })
             .collect();

@@ -674,7 +674,7 @@ impl KeryxdHandler {
                     .map_or(false, |w| w.on_submit_response(&res.transaction_id, err.as_deref()));
                 if !handled {
                     if let Some(e) = err {
-                        warn!("OPoI: submit_transaction error: {}", e);
+                        log::debug!("OPoI: submit_transaction error: {}", e);
                     }
                 }
             }
