@@ -89,6 +89,16 @@ pub struct EscrowState {
 const MAX_CLAIM_BATCH: usize = 50;
 /// Max claim TXs awaiting a SubmitTransactionResponse at once.
 const MAX_IN_FLIGHT_CLAIMS: usize = 4;
+
+/// Result of matching a SubmitTransactionResponse against the in-flight claim TXs.
+pub enum SubmitResponseOutcome {
+    /// The response belongs to other traffic (OPoI submissions) — not a claim of ours.
+    NotOurs,
+    /// A claim was matched (rejected/retried); no outputs were finalized.
+    Handled,
+    /// A claim was matched and accepted: its outputs are now claimed.
+    Accepted { outputs: u64, amount_sompi: u64 },
+}
 /// A claim with no response after this many DAA (~1 min at 10 BPS) is released for
 /// retry. Claim TXs are deterministic (same inputs → same txid), so a blind retry of a
 /// claim that actually went through is rejected as a duplicate and marked claimed —
@@ -385,6 +395,21 @@ impl EscrowWatcher {
         }
     }
 
+    /// Count and sum the escrow outputs still awaiting claim: tracked, not claimed, and
+    /// not proven dead (entries solo-rejected as orphans are excluded — including them
+    /// would inflate the figure with outpoints that will never pay).
+    pub fn pending_escrow(&self) -> (u64, u64) {
+        let mut outputs = 0u64;
+        let mut sompi = 0u64;
+        for e in &self.state.entries {
+            if !e.claimed && !e.slashed && !e.orphan_slashed && e.orphan_retries == 0 {
+                outputs += 1;
+                sompi += e.amount_sompi;
+            }
+        }
+        (outputs, sompi)
+    }
+
     /// Release in-flight claims whose response never arrived (connection hiccup, node
     /// restart, lost message). Their outputs become eligible again; because claim TXs are
     /// deterministic, retrying one that actually went through is rejected as a duplicate
@@ -501,13 +526,14 @@ impl EscrowWatcher {
         }
     }
 
-    /// Called for every SubmitTransactionResponse on the gRPC stream. Returns true when
-    /// the response was matched to one of our in-flight claim TXs — by transaction_id for
-    /// accepted TXs; error responses carry an empty transaction_id (the node's error path
-    /// returns a default message), so the rejection text, which embeds the offending txid,
-    /// is matched against in-flight claim txids instead. Returns false for responses that
-    /// belong to other traffic (OPoI submissions), so the caller can log those itself.
-    pub fn on_submit_response(&mut self, response_txid: &str, error: Option<&str>) -> bool {
+    /// Called for every SubmitTransactionResponse on the gRPC stream. The response is
+    /// matched to one of our in-flight claim TXs — by transaction_id for accepted TXs;
+    /// error responses carry an empty transaction_id (the node's error path returns a
+    /// default message), so the rejection text, which embeds the offending txid, is
+    /// matched against in-flight claim txids instead. Returns `NotOurs` for responses
+    /// that belong to other traffic (OPoI submissions), so the caller can log those
+    /// itself, and `Accepted` with the claimed totals so the caller can feed stats.
+    pub fn on_submit_response(&mut self, response_txid: &str, error: Option<&str>) -> SubmitResponseOutcome {
         let matched_txid = if self.in_flight.contains_key(response_txid) {
             Some(response_txid.to_string())
         } else if let Some(msg) = error {
@@ -517,7 +543,7 @@ impl EscrowWatcher {
         };
         let claim_txid = match matched_txid {
             Some(t) => t,
-            None => return false,
+            None => return SubmitResponseOutcome::NotOurs,
         };
         let claim = self.in_flight.remove(&claim_txid).unwrap();
         for (t, i) in &claim.outpoints {
@@ -525,10 +551,12 @@ impl EscrowWatcher {
         }
         let n_outputs = claim.outpoints.len();
 
+        let mut outcome = SubmitResponseOutcome::Handled;
         match error {
             None => {
                 info!("EscrowWatcher: claim accepted ({} output(s), txid={})", n_outputs, claim_txid);
-                self.mark_entries_claimed(&claim.outpoints);
+                let amount_sompi = self.mark_entries_claimed(&claim.outpoints);
+                outcome = SubmitResponseOutcome::Accepted { outputs: n_outputs as u64, amount_sompi };
             }
             // Claim TXs are deterministic (same inputs → same txid), so a retry of one that
             // actually went through is rejected as a duplicate — that IS the lost-response
@@ -538,7 +566,8 @@ impl EscrowWatcher {
                     "EscrowWatcher: claim accepted ({} output(s), txid={} — confirmed via duplicate rejection)",
                     n_outputs, claim_txid
                 );
-                self.mark_entries_claimed(&claim.outpoints);
+                let amount_sompi = self.mark_entries_claimed(&claim.outpoints);
+                outcome = SubmitResponseOutcome::Accepted { outputs: n_outputs as u64, amount_sompi };
             }
             Some(msg) => {
                 // Retriable rejections: sequence-lock timing races and orphan/dag-reorg
@@ -613,11 +642,13 @@ impl EscrowWatcher {
         }
         self.mark_dirty();
         self.maybe_flush();
-        true
+        outcome
     }
 
-    /// Mark every entry matching the given outpoints as claimed.
-    fn mark_entries_claimed(&mut self, outpoints: &[(String, u32)]) {
+    /// Mark every entry matching the given outpoints as claimed. Returns the total amount
+    /// (sompi) newly marked, for stats reporting.
+    fn mark_entries_claimed(&mut self, outpoints: &[(String, u32)]) -> u64 {
+        let mut total_sompi = 0u64;
         for (t, i) in outpoints {
             if let Some(e) = self
                 .state
@@ -625,9 +656,13 @@ impl EscrowWatcher {
                 .iter_mut()
                 .find(|e| e.coinbase_txid == *t && e.output_index == *i)
             {
+                if !e.claimed {
+                    total_sompi += e.amount_sompi;
+                }
                 e.claimed = true;
             }
         }
+        total_sompi
     }
 
     /// Build one claim TX spending every given escrow output to the payout address.

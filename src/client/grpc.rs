@@ -542,6 +542,10 @@ impl KeryxdHandler {
                         self.try_start_inference();
                         // Escrow: check for new escrow UTXOs and mature claims.
                         let claim_tx = self.escrow_watcher.as_mut().and_then(|w| w.handle_block(&block));
+                        if let Some(w) = self.escrow_watcher.as_ref() {
+                            let (outputs, sompi) = w.pending_escrow();
+                            miner.record_escrow_pending(outputs, sompi);
+                        }
                         if let Some(tx) = claim_tx {
                             self.client_send(KaspadMessage::submit_transaction(tx)).await?;
                         }
@@ -655,6 +659,10 @@ impl KeryxdHandler {
                     self.scan_txs_for_ai_requests(&block.transactions);
                     self.try_start_inference();
                     let claim_tx = self.escrow_watcher.as_mut().and_then(|w| w.handle_block(&block));
+                    if let Some(w) = self.escrow_watcher.as_ref() {
+                        let (outputs, sompi) = w.pending_escrow();
+                        miner.record_escrow_pending(outputs, sompi);
+                    }
                     if let Some(tx) = claim_tx {
                         self.client_send(KaspadMessage::submit_transaction(tx)).await?;
                     }
@@ -668,14 +676,23 @@ impl KeryxdHandler {
                 // Escrow claims and OPoI submissions share this stream. Match responses to
                 // in-flight claims by identity (txid, or the txid embedded in the rejection
                 // text) — attributing by position slashed valid escrow entries before.
+                use crate::escrow::SubmitResponseOutcome;
                 let err = res.error.as_ref().map(|e| e.message.clone());
-                let handled = self
+                let outcome = self
                     .escrow_watcher
                     .as_mut()
-                    .map_or(false, |w| w.on_submit_response(&res.transaction_id, err.as_deref()));
-                if !handled {
-                    if let Some(e) = err {
-                        log::debug!("OPoI: submit_transaction error: {}", e);
+                    .map_or(SubmitResponseOutcome::NotOurs, |w| {
+                        w.on_submit_response(&res.transaction_id, err.as_deref())
+                    });
+                match outcome {
+                    SubmitResponseOutcome::Accepted { outputs, amount_sompi } => {
+                        miner.record_claim_accepted(outputs, amount_sompi);
+                    }
+                    SubmitResponseOutcome::Handled => {}
+                    SubmitResponseOutcome::NotOurs => {
+                        if let Some(e) = err {
+                            log::debug!("OPoI: submit_transaction error: {}", e);
+                        }
                     }
                 }
             }

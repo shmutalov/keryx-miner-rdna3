@@ -118,6 +118,11 @@ pub struct MinerManager {
     hashes_by_worker: Arc<Mutex<HashMap<String, Arc<AtomicU64>>>>,
     current_state_id: AtomicUsize,
     opoi_challenge_active: Arc<AtomicBool>,
+    // Escrow claim accounting for the solo/gRPC path (the stratum path has ShareStats).
+    claimed_outputs: AtomicU64,
+    claimed_sompi: AtomicU64,
+    escrow_pending_outputs: AtomicU64,
+    escrow_pending_sompi: AtomicU64,
 }
 
 impl Drop for MinerManager {
@@ -201,6 +206,10 @@ impl MinerManager {
             current_state_id: AtomicUsize::new(0),
             hashes_by_worker,
             opoi_challenge_active,
+            claimed_outputs: AtomicU64::new(0),
+            claimed_sompi: AtomicU64::new(0),
+            escrow_pending_outputs: AtomicU64::new(0),
+            escrow_pending_sompi: AtomicU64::new(0),
         }
     }
 
@@ -243,6 +252,30 @@ impl MinerManager {
 
     pub fn opoi_challenge_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.opoi_challenge_active)
+    }
+
+    // Upstream feeds these into its stats API/panel; this fork has neither on the solo
+    // path, so they keep session counters and log. A claim acceptance is rare (one per
+    // accepted batch) and always worth a line; the pending snapshot arrives on every
+    // BlockAdded, so it only logs when the totals actually move.
+    pub fn record_claim_accepted(&self, outputs: u64, amount_sompi: u64) {
+        let total_outputs = self.claimed_outputs.fetch_add(outputs, Ordering::AcqRel) + outputs;
+        let total_sompi = self.claimed_sompi.fetch_add(amount_sompi, Ordering::AcqRel) + amount_sompi;
+        info!(
+            "escrow: claim accepted — {} output(s), {:.8} KRX (session total: {} output(s), {:.8} KRX)",
+            outputs,
+            amount_sompi as f64 / 1e8,
+            total_outputs,
+            total_sompi as f64 / 1e8,
+        );
+    }
+
+    pub fn record_escrow_pending(&self, outputs: u64, amount_sompi: u64) {
+        let prev_outputs = self.escrow_pending_outputs.swap(outputs, Ordering::AcqRel);
+        let prev_sompi = self.escrow_pending_sompi.swap(amount_sompi, Ordering::AcqRel);
+        if prev_outputs != outputs || prev_sompi != amount_sompi {
+            info!("escrow: {} output(s) pending, {:.8} KRX awaiting maturity", outputs, amount_sompi as f64 / 1e8);
+        }
     }
 
     pub async fn process_block(&mut self, block: Option<BlockSeed>) -> Result<(), Error> {
