@@ -54,8 +54,18 @@ pub struct EscrowEntry {
     pub orphan_slashed: bool,
     #[serde(default)]
     pub orphan_retries: u8,
+    /// Generic retry cooldown (DAA score): set after orphan, sequence-lock and
+    /// unrecognized rejections alike. The entry is skipped until this score passes.
     #[serde(default)]
     pub orphan_retry_after_daa: Option<u64>,
+    /// Consecutive unrecognized rejections — drives an exponential retry backoff.
+    /// Never leads to a permanent slash: an unspent escrow UTXO stays claimable.
+    #[serde(default)]
+    pub submit_retries: u8,
+    /// Set when a batch containing this entry was rejected: the entry is then claimed
+    /// alone so one poisoned input cannot block the others.
+    #[serde(default)]
+    pub solo_only: bool,
     /// True for AI inference escrow entries (from AiRequest output[1]).
     /// Red-set slashing is skipped for these since non-coinbase TXs can be re-included.
     #[serde(default)]
@@ -70,6 +80,27 @@ fn default_output_index() -> u32 {
 pub struct EscrowState {
     pub entries: Vec<EscrowEntry>,
 }
+
+/// Max escrow outputs per claim TX. Each input weighs ~1,110 grams of compute mass
+/// (1,000 per sig-op + ~110 serialized bytes), so 50 inputs ≈ 57k grams — comfortably
+/// under the node's 100,000-gram standard-TX cap. Batching also amortizes the flat
+/// CLAIM_FEE_SOMPI across the whole batch instead of paying it per output.
+const MAX_CLAIM_BATCH: usize = 50;
+/// Max claim TXs awaiting a SubmitTransactionResponse at once.
+const MAX_IN_FLIGHT_CLAIMS: usize = 4;
+/// A claim with no response after this many DAA (~1 min at 10 BPS) is released for
+/// retry. Claim TXs are deterministic (same inputs → same txid), so a blind retry of a
+/// claim that actually went through is rejected as a duplicate and marked claimed —
+/// a lost response can no longer wedge the queue for the life of the process.
+const CLAIM_RESPONSE_TIMEOUT_DAA: u64 = 600;
+/// Emit a status line at most every N processed blocks (~100 s at 10 BPS) while there
+/// is claim work outstanding. Debug level, like all claim machinery — at the default
+/// INFO level only claim acceptances are logged.
+const STATUS_EVERY_BLOCKS: u32 = 1_000;
+/// Base DAA cooldown for unrecognized rejections; doubles per consecutive failure.
+const UNKNOWN_RETRY_BASE_COOLDOWN_DAA: u64 = 100;
+/// Cap for the exponential unknown-rejection backoff (~1.4 h at 10 BPS).
+const UNKNOWN_RETRY_MAX_COOLDOWN_DAA: u64 = 50_000;
 
 /// DAA-score cooldown after an orphan rejection before retrying the claim.
 const ORPHAN_RETRY_COOLDOWN_BLOCKS: u64 = 100;
@@ -92,9 +123,15 @@ pub struct EscrowWatcher {
     payout_spk_script_hex: String,
     pub state: EscrowState,
     state_path: PathBuf,
-    /// Outpoint (txid, output_index) of the claim TX currently in flight.
-    pub pending_claim_txid: Option<String>,
-    pub pending_claim_output_index: Option<u32>,
+    /// Claim TXs submitted and awaiting their SubmitTransactionResponse, keyed by the
+    /// claim txid (computed at build time). Entries expire after CLAIM_RESPONSE_TIMEOUT_DAA
+    /// so a lost response releases its outputs instead of wedging the queue forever.
+    /// In-memory only: a reconnect rebuilds the watcher and clears it, which is correct —
+    /// responses for the old connection can no longer arrive.
+    in_flight: HashMap<String, InFlightClaim>,
+    /// "{txid}:{index}" of every outpoint inside an in-flight claim, so eligibility
+    /// checks stay O(1).
+    in_flight_outpoints: HashSet<String>,
     /// DAA score of the most recent block seen — used to set per-entry orphan cooldowns.
     last_daa_score: u64,
     /// O(1) dedup of tracked outpoints ("{txid}:{output_index}") so tracking a coinbase
@@ -108,6 +145,16 @@ pub struct EscrowWatcher {
     last_save: Instant,
     /// handle_block call counter, used to trigger periodic compaction.
     blocks_since_compact: u32,
+    /// handle_block call counter for the periodic INFO status line.
+    blocks_since_status: u32,
+}
+
+/// A claim TX submitted to the node, awaiting its SubmitTransactionResponse.
+struct InFlightClaim {
+    /// (source txid, output_index) of every escrow output the claim spends.
+    outpoints: Vec<(String, u32)>,
+    /// DAA score at submission — drives the response timeout.
+    submit_daa: u64,
 }
 
 impl EscrowWatcher {
@@ -147,14 +194,15 @@ impl EscrowWatcher {
             payout_spk_script_hex,
             state,
             state_path,
-            pending_claim_txid: None,
-            pending_claim_output_index: None,
+            in_flight: HashMap::new(),
+            in_flight_outpoints: HashSet::new(),
             last_daa_score: 0,
             outpoint_set: HashSet::new(),
             block_index: HashMap::new(),
             dirty: false,
             last_save: Instant::now(),
             blocks_since_compact: 0,
+            blocks_since_status: 0,
         };
         watcher.rebuild_indexes();
         Ok(watcher)
@@ -210,11 +258,35 @@ impl EscrowWatcher {
         let daa_score = block.header.as_ref()?.daa_score;
         self.last_daa_score = daa_score;
 
+        // Release claims whose response never arrived so the queue cannot wedge.
+        self.expire_in_flight(daa_score);
+
         // Periodic compaction so the entry vector / state file stay bounded under a flood.
         self.blocks_since_compact += 1;
         if self.blocks_since_compact >= COMPACT_EVERY_BLOCKS {
             self.blocks_since_compact = 0;
             self.compact();
+        }
+
+        // Periodic status line while claim work is outstanding (debug, like the rest of
+        // the claim machinery — INFO only reports claim acceptances).
+        self.blocks_since_status += 1;
+        if self.blocks_since_status >= STATUS_EVERY_BLOCKS {
+            self.blocks_since_status = 0;
+            let mature = self
+                .state
+                .entries
+                .iter()
+                .filter(|e| !e.claimed && !e.slashed && daa_score >= e.confirm_daa + CHALLENGE_WINDOW_BLOCKS + 10)
+                .count();
+            if mature > 0 || !self.in_flight.is_empty() {
+                debug!(
+                    "EscrowWatcher: {} tracked, {} mature awaiting claim, {} claim TX(s) in flight",
+                    self.state.entries.len(),
+                    mature,
+                    self.in_flight.len()
+                );
+            }
         }
 
         let block_hash = block.verbose_data.as_ref().map(|v| v.hash.clone()).unwrap_or_default();
@@ -229,7 +301,7 @@ impl EscrowWatcher {
                 for i in indices {
                     if let Some(entry) = self.state.entries.get_mut(i) {
                         if !entry.claimed && !entry.slashed && !entry.is_inference && !entry.block_hash.is_empty() {
-                            warn!(
+                            debug!(
                                 "EscrowWatcher: block {} is red — permanently skipping coinbase={}…",
                                 &red_hash[..16.min(red_hash.len())],
                                 &entry.coinbase_txid[..16.min(entry.coinbase_txid.len())]
@@ -259,7 +331,7 @@ impl EscrowWatcher {
                     && spk.version == 0
                     && !self.outpoint_set.contains(&key)
                 {
-                    info!(
+                    debug!(
                         "EscrowWatcher: tracked escrow coinbase={}…[{}] daa={} amount={}",
                         &coinbase_txid[..16.min(coinbase_txid.len())],
                         out_idx,
@@ -294,163 +366,263 @@ impl EscrowWatcher {
         claim
     }
 
-    /// Scan for the next matured, eligible escrow entry and build its claim TX (if any).
+    /// Release in-flight claims whose response never arrived (connection hiccup, node
+    /// restart, lost message). Their outputs become eligible again; because claim TXs are
+    /// deterministic, retrying one that actually went through is rejected as a duplicate
+    /// and resolves to claimed via on_submit_response.
+    fn expire_in_flight(&mut self, daa_score: u64) {
+        let expired: Vec<String> = self
+            .in_flight
+            .iter()
+            .filter(|(_, c)| daa_score >= c.submit_daa + CLAIM_RESPONSE_TIMEOUT_DAA)
+            .map(|(txid, _)| txid.clone())
+            .collect();
+        for txid in expired {
+            let claim = self.in_flight.remove(&txid).unwrap();
+            debug!(
+                "EscrowWatcher: no response for claim {} after {} DAA — releasing {} output(s) for retry",
+                txid,
+                CLAIM_RESPONSE_TIMEOUT_DAA,
+                claim.outpoints.len()
+            );
+            for (t, i) in &claim.outpoints {
+                self.in_flight_outpoints.remove(&format!("{}:{}", t, i));
+            }
+        }
+    }
+
+    /// Scan for matured, eligible escrow entries and build a batched claim TX (if any).
     fn find_claim(&mut self, daa_score: u64) -> Option<RpcTransaction> {
-        // Only one claim TX in flight at a time.
-        if self.pending_claim_txid.is_some() {
+        if self.in_flight.len() >= MAX_IN_FLIGHT_CLAIMS {
             return None;
         }
 
         // +10 margin: OP_CSV validation uses the selected-chain blue score, which can lag the
         // virtual-state DAA score by several blocks in the BlockDAG.  A single +1 margin is
         // often not enough, causing seq-lock rejections that get retried every block.
-        // Per-entry orphan/seq-lock cooldowns are checked individually so they don't block other claims.
+        // Per-entry cooldowns are checked individually so they don't block other claims.
         // Inference entries are prioritised: they carry user fees and must not be starved by the
-        // large coinbase entry queue.
-        let is_eligible = |e: &&EscrowEntry| {
-            !e.claimed
-                && !e.slashed
-                && daa_score >= e.confirm_daa + CHALLENGE_WINDOW_BLOCKS + 10
-                && e.orphan_retry_after_daa.map_or(true, |retry_daa| daa_score >= retry_daa)
-        };
-        let entry = self
-            .state
-            .entries
-            .iter()
-            .find(|e| e.is_inference && is_eligible(e))
-            .or_else(|| self.state.entries.iter().find(|e| !e.is_inference && is_eligible(e)))?
-            .clone();
+        // large coinbase entry queue. solo_only entries (from a rejected batch) are claimed
+        // one at a time, and only when no batchable work is pending.
+        let mut batch: Vec<usize> = Vec::new();
+        let mut solo: Option<usize> = None;
+        'select: for inference_pass in [true, false] {
+            for (i, e) in self.state.entries.iter().enumerate() {
+                if e.is_inference != inference_pass {
+                    continue;
+                }
+                let eligible = !e.claimed
+                    && !e.slashed
+                    && daa_score >= e.confirm_daa + CHALLENGE_WINDOW_BLOCKS + 10
+                    && e.orphan_retry_after_daa.map_or(true, |retry_daa| daa_score >= retry_daa)
+                    && !self.in_flight_outpoints.contains(&format!("{}:{}", e.coinbase_txid, e.output_index));
+                if !eligible {
+                    continue;
+                }
+                if e.solo_only {
+                    solo.get_or_insert(i);
+                    continue;
+                }
+                batch.push(i);
+                if batch.len() >= MAX_CLAIM_BATCH {
+                    break 'select;
+                }
+            }
+        }
+        if batch.is_empty() {
+            batch.extend(solo);
+        }
+        if batch.is_empty() {
+            return None;
+        }
+        let entries: Vec<EscrowEntry> = batch.iter().map(|&i| self.state.entries[i].clone()).collect();
 
-        match self.build_claim_tx(&entry) {
-            Ok(tx) => {
+        match self.build_claim_tx(&entries) {
+            Ok((claim_txid, tx)) => {
+                let total: u64 = entries.iter().map(|e| e.amount_sompi).sum();
                 debug!(
-                    "EscrowWatcher: claiming escrow coinbase={}…[{}] (matured at daa {})",
-                    &entry.coinbase_txid[..16.min(entry.coinbase_txid.len())],
-                    entry.output_index,
-                    entry.confirm_daa + CHALLENGE_WINDOW_BLOCKS
+                    "EscrowWatcher: claiming {} escrow output(s), {:.8} KRX total (claim txid={})",
+                    entries.len(),
+                    total as f64 / 1e8,
+                    claim_txid
                 );
-                self.pending_claim_output_index = Some(entry.output_index);
-                self.pending_claim_txid = Some(entry.coinbase_txid);
+                let outpoints: Vec<(String, u32)> =
+                    entries.iter().map(|e| (e.coinbase_txid.clone(), e.output_index)).collect();
+                for (t, i) in &outpoints {
+                    self.in_flight_outpoints.insert(format!("{}:{}", t, i));
+                }
+                self.in_flight.insert(claim_txid, InFlightClaim { outpoints, submit_daa: daa_score });
                 Some(tx)
             }
             Err(e) => {
-                warn!("EscrowWatcher: failed to build claim TX: {}", e);
+                debug!("EscrowWatcher: failed to build claim TX: {}", e);
                 None
             }
         }
     }
 
-    /// Called when a SubmitTransactionResponse arrives for a pending claim TX.
-    pub fn on_submit_response(&mut self, error: Option<String>) {
-        let txid = match self.pending_claim_txid.take() {
-            Some(t) => t,
-            None => return,
+    /// Called for every SubmitTransactionResponse on the gRPC stream. Returns true when
+    /// the response was matched to one of our in-flight claim TXs — by transaction_id for
+    /// accepted TXs; error responses carry an empty transaction_id (the node's error path
+    /// returns a default message), so the rejection text, which embeds the offending txid,
+    /// is matched against in-flight claim txids instead. Returns false for responses that
+    /// belong to other traffic (OPoI submissions), so the caller can log those itself.
+    pub fn on_submit_response(&mut self, response_txid: &str, error: Option<&str>) -> bool {
+        let matched_txid = if self.in_flight.contains_key(response_txid) {
+            Some(response_txid.to_string())
+        } else if let Some(msg) = error {
+            self.in_flight.keys().find(|t| msg.contains(t.as_str())).cloned()
+        } else {
+            None
         };
-        let out_idx = self.pending_claim_output_index.take().unwrap_or(1);
+        let claim_txid = match matched_txid {
+            Some(t) => t,
+            None => return false,
+        };
+        let claim = self.in_flight.remove(&claim_txid).unwrap();
+        for (t, i) in &claim.outpoints {
+            self.in_flight_outpoints.remove(&format!("{}:{}", t, i));
+        }
+        let n_outputs = claim.outpoints.len();
 
         match error {
             None => {
-                info!("EscrowWatcher: claim accepted for coinbase={}…[{}]", &txid[..16.min(txid.len())], out_idx);
-                if let Some(e) = self.state.entries.iter_mut().find(|e| {
-                    e.coinbase_txid == txid && e.output_index == out_idx
-                }) {
-                    e.claimed = true;
-                }
+                info!("EscrowWatcher: claim accepted ({} output(s), txid={})", n_outputs, claim_txid);
+                self.mark_entries_claimed(&claim.outpoints);
             }
-            Some(err_msg) => {
-                if let Some(e) = self.state.entries.iter_mut().find(|e| {
-                    e.coinbase_txid == txid && e.output_index == out_idx
-                }) {
-                    // Retriable rejections: sequence-lock timing races and orphan/dag-reorg
-                    // situations where the coinbase's block is off the selected chain.
-                    // Any other rejection (double-spend, script failure) is a real slash.
-                    let is_orphan = err_msg.contains("orphan");
-                    let is_seq_lock = err_msg.contains("sequence lock");
+            // Claim TXs are deterministic (same inputs → same txid), so a retry of one that
+            // actually went through is rejected as a duplicate — that IS the lost-response
+            // success path.
+            Some(msg) if msg.contains("already in the mempool") || msg.contains("already accepted") => {
+                info!(
+                    "EscrowWatcher: claim accepted ({} output(s), txid={} — confirmed via duplicate rejection)",
+                    n_outputs, claim_txid
+                );
+                self.mark_entries_claimed(&claim.outpoints);
+            }
+            Some(msg) => {
+                // Retriable rejections: sequence-lock timing races and orphan/dag-reorg
+                // situations where the source block is off the selected chain.
+                let is_orphan = msg.contains("orphan");
+                let is_seq_lock = msg.contains("sequence lock");
+                let batch_rejected = n_outputs > 1;
+                let last_daa = self.last_daa_score;
+                for (t, i) in &claim.outpoints {
+                    let e = match self
+                        .state
+                        .entries
+                        .iter_mut()
+                        .find(|e| e.coinbase_txid == *t && e.output_index == *i)
+                    {
+                        Some(e) => e,
+                        None => continue,
+                    };
+                    // A rejected batch degrades its entries to solo claims so one poisoned
+                    // input cannot keep blocking the other outputs.
+                    if batch_rejected {
+                        e.solo_only = true;
+                    }
                     if is_orphan {
                         e.orphan_retries += 1;
                         if e.orphan_retries >= MAX_ORPHAN_RETRIES {
                             e.orphan_slashed = false;
                             e.slashed = true;
                             debug!(
-                                "EscrowWatcher: coinbase={}…[{}] slashed after {} orphan retries",
-                                &txid[..16.min(txid.len())],
-                                out_idx,
-                                e.orphan_retries
+                                "EscrowWatcher: coinbase={}[{}] slashed after {} orphan retries",
+                                t, i, e.orphan_retries
                             );
                         } else {
-                            debug!(
-                                "EscrowWatcher: claim rejected for coinbase={}…[{}] (orphan, retry {}/{})",
-                                &txid[..16.min(txid.len())],
-                                out_idx,
-                                e.orphan_retries,
-                                MAX_ORPHAN_RETRIES
-                            );
                             e.orphan_slashed = true;
                             // Per-entry cooldown: only this entry waits, other claims proceed.
-                            e.orphan_retry_after_daa =
-                                Some(self.last_daa_score + ORPHAN_RETRY_COOLDOWN_BLOCKS);
+                            e.orphan_retry_after_daa = Some(last_daa + ORPHAN_RETRY_COOLDOWN_BLOCKS);
                         }
                     } else if is_seq_lock {
-                        // Apply a per-entry cooldown instead of retrying every block —
-                        // the OP_CSV blue-score check may lag DAA score by a few blocks.
-                        e.orphan_retry_after_daa =
-                            Some(self.last_daa_score + SEQ_LOCK_RETRY_COOLDOWN_BLOCKS);
-                        debug!(
-                            "EscrowWatcher: claim rejected for coinbase={}…[{}] (sequence lock, retry after daa {})",
-                            &txid[..16.min(txid.len())],
-                            out_idx,
-                            self.last_daa_score + SEQ_LOCK_RETRY_COOLDOWN_BLOCKS,
-                        );
+                        // The OP_CSV blue-score check may lag DAA score by a few blocks.
+                        e.orphan_retry_after_daa = Some(last_daa + SEQ_LOCK_RETRY_COOLDOWN_BLOCKS);
                     } else {
-                        warn!(
-                            "EscrowWatcher: claim rejected for coinbase={}…[{}]: {}",
-                            &txid[..16.min(txid.len())], out_idx, err_msg
-                        );
-                        e.slashed = true;
+                        // Unrecognized rejection: exponential backoff, never a permanent
+                        // slash — an unspent escrow UTXO stays claimable, and deriving an
+                        // irreversible state from an error string has lost real funds before.
+                        e.submit_retries = e.submit_retries.saturating_add(1);
+                        let cooldown = UNKNOWN_RETRY_BASE_COOLDOWN_DAA
+                            .saturating_mul(1u64 << (e.submit_retries.min(9) as u32))
+                            .min(UNKNOWN_RETRY_MAX_COOLDOWN_DAA);
+                        e.orphan_retry_after_daa = Some(last_daa + cooldown);
                     }
                 }
+                debug!(
+                    "EscrowWatcher: claim {} rejected ({} output(s) released{}): {}",
+                    claim_txid,
+                    n_outputs,
+                    if batch_rejected { ", degraded to solo claims" } else { "" },
+                    msg
+                );
             }
         }
         self.mark_dirty();
         self.maybe_flush();
+        true
     }
 
-    fn build_claim_tx(&self, entry: &EscrowEntry) -> Result<RpcTransaction, String> {
-        let amount_out = entry
-            .amount_sompi
+    /// Mark every entry matching the given outpoints as claimed.
+    fn mark_entries_claimed(&mut self, outpoints: &[(String, u32)]) {
+        for (t, i) in outpoints {
+            if let Some(e) = self
+                .state
+                .entries
+                .iter_mut()
+                .find(|e| e.coinbase_txid == *t && e.output_index == *i)
+            {
+                e.claimed = true;
+            }
+        }
+    }
+
+    /// Build one claim TX spending every given escrow output to the payout address.
+    /// All inputs share the miner's escrow script; each carries its own signature and the
+    /// CSV sequence. The flat CLAIM_FEE_SOMPI is paid once for the whole batch. Returns
+    /// the claim txid (for response matching) together with the transaction.
+    fn build_claim_tx(&self, entries: &[EscrowEntry]) -> Result<(String, RpcTransaction), String> {
+        if entries.is_empty() {
+            return Err("empty claim batch".into());
+        }
+        let total_in: u64 = entries.iter().map(|e| e.amount_sompi).sum();
+        let amount_out = total_in
             .checked_sub(CLAIM_FEE_SOMPI)
             .filter(|&a| a > 0)
             .ok_or("escrow amount too small to cover claim fee")?;
 
-        let coinbase_bytes: [u8; 32] = hex::decode(&entry.coinbase_txid)
-            .map_err(|e| format!("bad coinbase txid: {}", e))?
-            .try_into()
-            .map_err(|_| "coinbase txid must be 32 bytes")?;
+        let mut inputs_meta: Vec<([u8; 32], u32, u64)> = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let txid_bytes: [u8; 32] = hex::decode(&entry.coinbase_txid)
+                .map_err(|e| format!("bad source txid: {}", e))?
+                .try_into()
+                .map_err(|_| "source txid must be 32 bytes")?;
+            inputs_meta.push((txid_bytes, entry.output_index, entry.amount_sompi));
+        }
 
-        let sighash = compute_sighash(
-            &coinbase_bytes,
-            entry.output_index,
-            entry.amount_sompi,
-            &self.escrow_script,
+        let reused = SighashReused::new(
+            &inputs_meta,
+            amount_out,
             self.payout_spk_version,
             &self.payout_spk_script,
-            amount_out,
         );
-
-        let msg = secp256k1::Message::from_digest_slice(&sighash)
-            .map_err(|e| format!("sighash message error: {}", e))?;
         let keypair = secp256k1::Keypair::from_secret_key(&self.secp, &self.secret_key);
-        let sig = self.secp.sign_schnorr_no_aux_rand(&msg, &keypair);
 
-        // signature_script: OpData65 (0x41) | 64-byte sig | SIG_HASH_ALL (0x01)
-        let mut sig_script = Vec::with_capacity(66);
-        sig_script.push(0x41u8);
-        sig_script.extend_from_slice(sig.as_ref());
-        sig_script.push(SIG_HASH_ALL);
+        let mut inputs: Vec<RpcTransactionInput> = Vec::with_capacity(entries.len());
+        for (entry, meta) in entries.iter().zip(&inputs_meta) {
+            let sighash = compute_sighash(meta, &self.escrow_script, &reused);
+            let msg = secp256k1::Message::from_digest_slice(&sighash)
+                .map_err(|e| format!("sighash message error: {}", e))?;
+            let sig = self.secp.sign_schnorr_no_aux_rand(&msg, &keypair);
 
-        Ok(RpcTransaction {
-            version: 0,
-            inputs: vec![RpcTransactionInput {
+            // signature_script: OpData65 (0x41) | 64-byte sig | SIG_HASH_ALL (0x01)
+            let mut sig_script = Vec::with_capacity(66);
+            sig_script.push(0x41u8);
+            sig_script.extend_from_slice(sig.as_ref());
+            sig_script.push(SIG_HASH_ALL);
+
+            inputs.push(RpcTransactionInput {
                 previous_outpoint: Some(RpcOutpoint {
                     transaction_id: entry.coinbase_txid.clone(),
                     index: entry.output_index,
@@ -459,22 +631,37 @@ impl EscrowWatcher {
                 sequence: CHALLENGE_WINDOW_BLOCKS,
                 sig_op_count: 1,
                 verbose_data: None,
-            }],
-            outputs: vec![RpcTransactionOutput {
-                amount: amount_out,
-                script_public_key: Some(RpcScriptPublicKey {
-                    version: self.payout_spk_version as u32,
-                    script_public_key: self.payout_spk_script_hex.clone(),
-                }),
+            });
+        }
+
+        let claim_txid = compute_claim_txid(
+            &inputs_meta,
+            amount_out,
+            self.payout_spk_version,
+            &self.payout_spk_script,
+        );
+
+        Ok((
+            claim_txid,
+            RpcTransaction {
+                version: 0,
+                inputs,
+                outputs: vec![RpcTransactionOutput {
+                    amount: amount_out,
+                    script_public_key: Some(RpcScriptPublicKey {
+                        version: self.payout_spk_version as u32,
+                        script_public_key: self.payout_spk_script_hex.clone(),
+                    }),
+                    verbose_data: None,
+                }],
+                lock_time: 0,
+                subnetwork_id: NATIVE_SUBNETWORK.to_string(),
+                gas: 0,
+                payload: String::new(),
+                mass: 0,
                 verbose_data: None,
-            }],
-            lock_time: 0,
-            subnetwork_id: NATIVE_SUBNETWORK.to_string(),
-            gas: 0,
-            payload: String::new(),
-            mass: 0,
-            verbose_data: None,
-        })
+            },
+        ))
     }
 
     /// Record an AI inference escrow outpoint (AiRequest output[1]) to claim after the challenge window.
@@ -487,7 +674,7 @@ impl EscrowWatcher {
         if self.outpoint_set.contains(&key) {
             return;
         }
-        info!(
+        debug!(
             "EscrowWatcher: tracking inference escrow txid={}… daa={} amount={}",
             &ai_request_txid[..16.min(ai_request_txid.len())],
             confirm_daa,
@@ -649,82 +836,130 @@ fn build_p2pk_script(pubkey: &[u8; 32]) -> Vec<u8> {
 
 // ── Sighash ───────────────────────────────────────────────────────────────────
 
-/// Compute the Keryx Schnorr sighash (SIG_HASH_ALL) for a single-input escrow claim TX.
-///
-/// Mirrors `calc_schnorr_signature_hash` in consensus/core/src/hashing/sighash.rs.
-/// All sub-hashes use Blake2b-256 keyed with `b"TransactionSigningHash"`.
-fn compute_sighash(
-    coinbase_txid: &[u8; 32],
-    output_index: u32,
-    escrow_amount: u64,
-    escrow_script: &[u8],
-    payout_spk_version: u16,
-    payout_spk_script: &[u8],
-    payout_amount: u64,
-) -> [u8; 32] {
-    const KEY: &[u8] = b"TransactionSigningHash";
-    let new_h = || Blake2bParams::new().hash_length(32).key(KEY).to_state();
+/// Blake2b-256 keyed with the node's transaction-signing domain.
+fn sighash_hasher() -> blake2b_simd::State {
+    Blake2bParams::new().hash_length(32).key(b"TransactionSigningHash").to_state()
+}
 
-    // previous_outputs_hash: Blake2b(txid_32 | index_u32_LE)
-    let prev_out_hash = {
-        let mut h = new_h();
-        h.update(coinbase_txid);
-        h.update(&output_index.to_le_bytes());
-        h.finalize()
-    };
+fn finalize32(h: blake2b_simd::State) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out.copy_from_slice(h.finalize().as_bytes());
+    out
+}
 
-    // sequences_hash: Blake2b(sequence_u64_LE)
-    let seqs_hash = {
-        let mut h = new_h();
-        h.update(&CHALLENGE_WINDOW_BLOCKS.to_le_bytes());
-        h.finalize()
-    };
+/// Sighash components shared by every input of a claim TX. The node caches these as
+/// `SigHashReusedValues` to avoid quadratic hashing; we precompute them once per batch.
+struct SighashReused {
+    prev_out_hash: [u8; 32],
+    seqs_hash: [u8; 32],
+    sigops_hash: [u8; 32],
+    outs_hash: [u8; 32],
+}
 
-    // sig_op_counts_hash: Blake2b(sig_op_count_u8)
-    let sigops_hash = {
-        let mut h = new_h();
-        h.update(&[1u8]);
-        h.finalize()
-    };
+impl SighashReused {
+    /// `inputs`: (source txid bytes, output index, escrow amount) per claim input.
+    fn new(
+        inputs: &[([u8; 32], u32, u64)],
+        payout_amount: u64,
+        payout_spk_version: u16,
+        payout_spk_script: &[u8],
+    ) -> Self {
+        // previous_outputs_hash: Blake2b(txid_32 | index_u32_LE, per input)
+        let mut h = sighash_hasher();
+        for (txid, index, _) in inputs {
+            h.update(txid);
+            h.update(&index.to_le_bytes());
+        }
+        let prev_out_hash = finalize32(h);
 
-    // outputs_hash: Blake2b(value_u64_LE | spk_version_u16_LE | len_u64_LE | spk_script)
-    let outs_hash = {
-        let mut h = new_h();
+        // sequences_hash: Blake2b(sequence_u64_LE, per input)
+        let mut h = sighash_hasher();
+        for _ in inputs {
+            h.update(&CHALLENGE_WINDOW_BLOCKS.to_le_bytes());
+        }
+        let seqs_hash = finalize32(h);
+
+        // sig_op_counts_hash: Blake2b(sig_op_count_u8, per input)
+        let mut h = sighash_hasher();
+        for _ in inputs {
+            h.update(&[1u8]);
+        }
+        let sigops_hash = finalize32(h);
+
+        // outputs_hash: Blake2b(value_u64_LE | spk_version_u16_LE | len_u64_LE | spk_script)
+        let mut h = sighash_hasher();
         h.update(&payout_amount.to_le_bytes());
         h.update(&payout_spk_version.to_le_bytes());
         h.update(&(payout_spk_script.len() as u64).to_le_bytes()); // write_var_bytes len
         h.update(payout_spk_script);
-        h.finalize()
-    };
+        let outs_hash = finalize32(h);
 
-    // payload_hash = ZERO_HASH (native subnetwork + empty payload)
-    let payload_hash = [0u8; 32];
+        Self { prev_out_hash, seqs_hash, sigops_hash, outs_hash }
+    }
+}
 
-    let mut h = new_h();
+/// Compute the Keryx Schnorr sighash (SIG_HASH_ALL) for one input of an escrow claim TX.
+///
+/// Mirrors `calc_schnorr_signature_hash` in consensus/core/src/hashing/sighash.rs.
+/// Byte-identical to the historical single-input version when the batch has one entry.
+fn compute_sighash(input: &([u8; 32], u32, u64), escrow_script: &[u8], reused: &SighashReused) -> [u8; 32] {
+    let (txid, index, amount) = input;
+    let mut h = sighash_hasher();
     h.update(&0u16.to_le_bytes()); // tx.version
-    h.update(prev_out_hash.as_bytes());
-    h.update(seqs_hash.as_bytes());
-    h.update(sigops_hash.as_bytes());
+    h.update(&reused.prev_out_hash);
+    h.update(&reused.seqs_hash);
+    h.update(&reused.sigops_hash);
     // Input-specific:
-    h.update(coinbase_txid); // prev_outpoint.transaction_id
-    h.update(&output_index.to_le_bytes()); // prev_outpoint.index
+    h.update(txid); // prev_outpoint.transaction_id
+    h.update(&index.to_le_bytes()); // prev_outpoint.index
     h.update(&0u16.to_le_bytes()); // utxo spk version = 0
     h.update(&(escrow_script.len() as u64).to_le_bytes()); // write_var_bytes len
     h.update(escrow_script); // write_var_bytes data
-    h.update(&escrow_amount.to_le_bytes()); // utxo.amount
+    h.update(&amount.to_le_bytes()); // utxo.amount
     h.update(&CHALLENGE_WINDOW_BLOCKS.to_le_bytes()); // input.sequence
     h.update(&[1u8]); // input.sig_op_count
-    h.update(outs_hash.as_bytes());
+    h.update(&reused.outs_hash);
     h.update(&0u64.to_le_bytes()); // tx.lock_time
     h.update(&[0u8; 20]); // tx.subnetwork_id (NATIVE = all zeros 20 bytes)
     h.update(&0u64.to_le_bytes()); // tx.gas
-    h.update(&payload_hash); // payload_hash (ZERO_HASH)
+    h.update(&[0u8; 32]); // payload_hash (ZERO_HASH: native subnetwork + empty payload)
     h.update(&[SIG_HASH_ALL]); // hash_type
+    finalize32(h)
+}
 
-    let out = h.finalize();
-    let mut result = [0u8; 32];
-    result.copy_from_slice(out.as_bytes());
-    result
+// ── Claim txid ────────────────────────────────────────────────────────────────
+
+/// Compute the claim TX's transaction id, mirroring `tx::id()` in the node's
+/// consensus/core/src/hashing/tx.rs: Blake2b-256 keyed `b"TransactionID"` over the TX
+/// with signature scripts excluded (empty var-bytes, no sig_op_count byte) and no mass
+/// commitment. Needed to match SubmitTransactionResponses to in-flight claims — and
+/// because claim TXs are fully deterministic, a resubmission after a lost response
+/// carries the same txid and resolves as a duplicate instead of double-spending.
+fn compute_claim_txid(
+    inputs: &[([u8; 32], u32, u64)],
+    payout_amount: u64,
+    payout_spk_version: u16,
+    payout_spk_script: &[u8],
+) -> String {
+    let mut h = Blake2bParams::new().hash_length(32).key(b"TransactionID").to_state();
+    h.update(&0u16.to_le_bytes()); // tx.version
+    h.update(&(inputs.len() as u64).to_le_bytes()); // write_len(inputs)
+    for (txid, index, _) in inputs {
+        h.update(txid); // outpoint.transaction_id
+        h.update(&index.to_le_bytes()); // outpoint.index
+        h.update(&0u64.to_le_bytes()); // write_var_bytes(&[]) — sig script excluded
+        h.update(&CHALLENGE_WINDOW_BLOCKS.to_le_bytes()); // sequence
+    }
+    h.update(&1u64.to_le_bytes()); // write_len(outputs)
+    h.update(&payout_amount.to_le_bytes()); // output.value
+    h.update(&payout_spk_version.to_le_bytes()); // spk version
+    h.update(&(payout_spk_script.len() as u64).to_le_bytes()); // write_var_bytes len
+    h.update(payout_spk_script);
+    h.update(&0u64.to_le_bytes()); // tx.lock_time
+    h.update(&[0u8; 20]); // subnetwork_id (NATIVE)
+    h.update(&0u64.to_le_bytes()); // tx.gas
+    h.update(&0u64.to_le_bytes()); // write_var_bytes(payload = [])
+    hex::encode(finalize32(h))
 }
 
 // ── Address decoding ──────────────────────────────────────────────────────────

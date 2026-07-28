@@ -664,11 +664,18 @@ impl KeryxdHandler {
                 Some(e) => warn!("Failed submitting block: {:?}", e),
             },
             Payload::SubmitTransactionResponse(res) => {
-                if self.escrow_watcher.as_ref().map_or(false, |w| w.pending_claim_txid.is_some()) {
-                    let err = res.error.map(|e| e.message);
-                    self.escrow_watcher.as_mut().unwrap().on_submit_response(err);
-                } else if let Some(e) = res.error {
-                    warn!("OPoI: submit_transaction error: {:?}", e);
+                // Escrow claims and OPoI submissions share this stream. Match responses to
+                // in-flight claims by identity (txid, or the txid embedded in the rejection
+                // text) — attributing by position slashed valid escrow entries before.
+                let err = res.error.as_ref().map(|e| e.message.clone());
+                let handled = self
+                    .escrow_watcher
+                    .as_mut()
+                    .map_or(false, |w| w.on_submit_response(&res.transaction_id, err.as_deref()));
+                if !handled {
+                    if let Some(e) = err {
+                        warn!("OPoI: submit_transaction error: {}", e);
+                    }
                 }
             }
             Payload::GetInfoResponse(info) => {
