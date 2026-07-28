@@ -6,6 +6,7 @@ use crate::proto::rpc_client::RpcClient;
 use crate::proto::{
     GetBlockRequestMessage, GetBlockTemplateRequestMessage, GetInfoRequestMessage, KaspadMessage,
     NotifyBlockAddedRequestMessage, NotifyNewBlockTemplateRequestMessage,
+    NotifyVirtualSelectedParentChainChangedRequestMessage,
 };
 use crate::{miner::MinerManager, Error};
 use async_trait::async_trait;
@@ -680,12 +681,15 @@ impl KeryxdHandler {
             }
             Payload::GetInfoResponse(info) => {
                 info!("Keryxd version: {}", info.server_version);
-                // Register for both notification types:
+                // Register for all notification types:
                 // - NewBlockTemplate drives the mining loop
                 // - BlockAdded lets us scan confirmed blocks for AiRequests
                 //   that were confirmed before the miner saw them in mempool
+                // - VirtualChainChanged drives escrow tracking: only chain-block coinbases
+                //   materialize UTXOs, so escrow outputs are tracked from chain blocks only
                 self.client_send(NotifyNewBlockTemplateRequestMessage {}).await?;
                 self.client_send(NotifyBlockAddedRequestMessage {}).await?;
+                self.client_send(NotifyVirtualSelectedParentChainChangedRequestMessage {}).await?;
                 self.client_get_block_template().await?;
             }
             Payload::NotifyNewBlockTemplateResponse(res) => match res.error {
@@ -696,6 +700,20 @@ impl KeryxdHandler {
                 None => info!("Registered for block added notifications (AI request scanning)"),
                 Some(e) => error!("Failed registering for block added notifications: {:?}", e),
             },
+            Payload::NotifyVirtualSelectedParentChainChangedResponse(res) => match res.error {
+                None => info!("Registered for virtual chain notifications (escrow tracking)"),
+                Some(e) => error!("Failed registering for virtual chain notifications: {:?}", e),
+            },
+            // Virtual chain advanced: fetch every added chain block in full. Their coinbases
+            // are the only ones that materialize UTXOs, so escrow tracking feeds off this
+            // stream (handle_block gates tracking on is_chain_block). Removed chain blocks
+            // are ignored: entries from reorged-out blocks fail their claims as orphans and
+            // are cleaned up by the existing retry/slash machinery.
+            Payload::VirtualSelectedParentChainChangedNotification(notif) => {
+                for hash in notif.added_chain_block_hashes {
+                    self.client_send(GetBlockRequestMessage { hash, include_transactions: true }).await?;
+                }
+            }
             msg => info!("got unknown msg: {:?}", msg),
         }
         Ok(())

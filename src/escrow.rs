@@ -315,11 +315,31 @@ impl EscrowWatcher {
             }
         }
 
+        // Track new escrow outputs from CHAIN blocks only. Every block's coinbase pays
+        // its mergeset's blues, but only chain-block coinbases enter the UTXO set —
+        // an escrow output seen in a non-chain block's coinbase is a phantom outpoint
+        // whose claim can only be rejected as an orphan. Chain blocks arrive in full via
+        // the VirtualChainChanged → GetBlock path; BlockAdded blocks carry
+        // is_chain_block=false at notification time and are skipped here.
+        let is_chain_block = block.verbose_data.as_ref().map_or(false, |v| v.is_chain_block);
+        if is_chain_block {
+            self.track_block_escrows(block, daa_score, &block_hash);
+        }
+
+        let claim = self.find_claim(daa_score);
+        self.maybe_flush();
+        claim
+    }
+
+    /// Scan a chain block's coinbase for outputs paying our escrow script and track them.
+    fn track_block_escrows(&mut self, block: &crate::proto::RpcBlock, daa_score: u64, block_hash: &str) {
         // Find coinbase TX (no inputs).
-        let coinbase = block.transactions.iter().find(|tx| tx.inputs.is_empty())?;
-        let coinbase_txid = coinbase.verbose_data.as_ref()?.transaction_id.clone();
+        let Some(coinbase) = block.transactions.iter().find(|tx| tx.inputs.is_empty()) else { return };
+        let Some(coinbase_txid) = coinbase.verbose_data.as_ref().map(|v| v.transaction_id.clone()) else {
+            return;
+        };
         if coinbase_txid.is_empty() {
-            return None;
+            return;
         }
 
         // Scan all coinbase outputs — a multi-blue mergeset produces one escrow output
@@ -342,7 +362,7 @@ impl EscrowWatcher {
                     let idx = self.state.entries.len();
                     self.state.entries.push(EscrowEntry {
                         coinbase_txid: coinbase_txid.clone(),
-                        block_hash: block_hash.clone(),
+                        block_hash: block_hash.to_string(),
                         confirm_daa: daa_score,
                         amount_sompi: output.amount,
                         output_index: out_idx as u32,
@@ -357,16 +377,12 @@ impl EscrowWatcher {
                     });
                     self.outpoint_set.insert(key);
                     if !block_hash.is_empty() {
-                        self.block_index.entry(block_hash.clone()).or_default().push(idx);
+                        self.block_index.entry(block_hash.to_string()).or_default().push(idx);
                     }
                     self.mark_dirty();
                 }
             }
         }
-
-        let claim = self.find_claim(daa_score);
-        self.maybe_flush();
-        claim
     }
 
     /// Release in-flight claims whose response never arrived (connection hiccup, node
@@ -404,16 +420,34 @@ impl EscrowWatcher {
         // virtual-state DAA score by several blocks in the BlockDAG.  A single +1 margin is
         // often not enough, causing seq-lock rejections that get retried every block.
         // Per-entry cooldowns are checked individually so they don't block other claims.
-        // Inference entries are prioritised: they carry user fees and must not be starved by the
-        // large coinbase entry queue.
         // Batch sizing honors every member's batch_cap (the bisection state): the batch never
         // grows past the smallest cap among its members, and entries whose cap is smaller than
         // the batch being formed are left for a later, smaller batch.
+        //
+        // Selection runs in priority passes, and a batch never mixes passes:
+        //   0 — inference entries: they carry user fees and must not be starved by the
+        //       large coinbase entry queue;
+        //   1 — coinbase entries never rejected SOLO (not proven dead): the common case,
+        //       including batches mid-bisection — a batch rejection says nothing about an
+        //       individual member, so it must not demote it behind the dead pool. Without
+        //       this pass, a large backlog of dead relics cycling through retry cooldowns
+        //       sits ahead in queue order and starves everything else indefinitely
+        //       (at most one new claim per block, first-eligible-first);
+        //   2 — the known-dead pool (solo-orphaned at least once), ground down whenever
+        //       nothing fresher is claimable.
+        // Mixing passes would batch live entries with known-dead ones: one dead input
+        // orphans the whole TX and stalls the live entries' bisection.
         let mut batch: Vec<usize> = Vec::new();
         let mut limit = MAX_CLAIM_BATCH;
-        'select: for inference_pass in [true, false] {
+        'select: for pass in 0..3u8 {
             for (i, e) in self.state.entries.iter().enumerate() {
-                if e.is_inference != inference_pass {
+                let proven_dead = e.orphan_slashed || e.orphan_retries > 0;
+                let in_pass = match pass {
+                    0 => e.is_inference,
+                    1 => !e.is_inference && !proven_dead,
+                    _ => !e.is_inference && proven_dead,
+                };
+                if !in_pass {
                     continue;
                 }
                 let eligible = !e.claimed
@@ -433,6 +467,9 @@ impl EscrowWatcher {
                 if batch.len() >= limit {
                     break 'select;
                 }
+            }
+            if !batch.is_empty() {
+                break; // partial batch stays single-pass — never top it up from a lower one
             }
         }
         if batch.is_empty() {
