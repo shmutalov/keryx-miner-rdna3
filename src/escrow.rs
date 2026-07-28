@@ -350,6 +350,8 @@ impl EscrowWatcher {
                         orphan_slashed: false,
                         orphan_retries: 0,
                         orphan_retry_after_daa: None,
+                        submit_retries: 0,
+                        solo_only: false,
                         is_inference: false,
                     });
                     self.outpoint_set.insert(key);
@@ -691,6 +693,8 @@ impl EscrowWatcher {
             orphan_slashed: false,
             orphan_retries: 0,
             orphan_retry_after_daa: None,
+            submit_retries: 0,
+            solo_only: false,
             is_inference: true,
         });
         self.outpoint_set.insert(key);
