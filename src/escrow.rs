@@ -82,11 +82,28 @@ pub struct EscrowState {
     pub entries: Vec<EscrowEntry>,
 }
 
-/// Max escrow outputs per claim TX. Each input weighs ~1,110 grams of compute mass
-/// (1,000 per sig-op + ~110 serialized bytes), so 50 inputs ≈ 57k grams — comfortably
-/// under the node's 100,000-gram standard-TX cap. Batching also amortizes the flat
-/// CLAIM_FEE_SOMPI across the whole batch instead of paying it per output.
-const MAX_CLAIM_BATCH: usize = 50;
+/// Max escrow outputs per claim TX. Compute mass is `506 + 1118 * inputs` grams (1,000 per
+/// sig-op + 118 serialized bytes per input, plus the single-output overhead) against the
+/// node's 100,000-gram standard-TX cap, so 88 inputs is the hard ceiling (89 lands at
+/// 100,008 and is rejected). 80 keeps a margin for any future growth of the input layout.
+/// Transient mass (size * 4) and storage mass are never binding here: an N-to-1
+/// consolidation has zero storage mass under KIP-9.
+/// Batching also amortizes the flat CLAIM_FEE_SOMPI across the whole batch instead of
+/// paying it per output — the mass-derived minimum fee (~90k sompi at this size) stays far
+/// below the node's flat 0.3 KRX floor, so a bigger batch costs exactly the same.
+const MAX_CLAIM_BATCH: usize = 80;
+/// Minimum outputs per claim TX: the flat claim fee is amortized across the batch, so
+/// uncapped claims are held back until a full batch is ready instead of paying the fee
+/// on many small TXs. Batches carrying a bisection cap are exempt and keep flowing.
+const MIN_CLAIM_BATCH: usize = MAX_CLAIM_BATCH;
+/// How long (DAA score, 24h at 10 BPS) the oldest matured entry may wait for a full batch.
+/// Past this, the partial batch is submitted anyway — a remnant below MIN_CLAIM_BATCH is
+/// never held indefinitely. This is a safety net, not the normal release path: filling 80
+/// outputs in one hour would take 80 blocks/h (~0.2% of a 10 BPS network), so a short
+/// timeout would fire before nearly every batch and defeat the amortization. Over 24h the
+/// same batch needs ~3.3 blocks/h. Waiting costs nothing beyond deferred liquidity — the
+/// outputs are matured UTXOs sitting in the UTXO set, with no expiry and no slash risk.
+const CLAIM_BATCH_TIMEOUT_DAA: u64 = 864_000;
 /// Max claim TXs awaiting a SubmitTransactionResponse at once.
 const MAX_IN_FLIGHT_CLAIMS: usize = 4;
 
@@ -447,7 +464,8 @@ impl EscrowWatcher {
         // Per-entry cooldowns are checked individually so they don't block other claims.
         // Batch sizing honors every member's batch_cap (the bisection state): the batch never
         // grows past the smallest cap among its members, and entries whose cap is smaller than
-        // the batch being formed are left for a later, smaller batch.
+        // the batch being formed are left for a later, smaller batch. Uncapped batches are
+        // additionally held for MIN_CLAIM_BATCH outputs (fee amortization, see below).
         //
         // Selection runs in priority passes, and a batch never mixes passes:
         //   0 — inference entries: they carry user fees and must not be starved by the
@@ -499,6 +517,23 @@ impl EscrowWatcher {
         }
         if batch.is_empty() {
             return None;
+        }
+        // Fee amortization: an uncapped partial batch waits until MIN_CLAIM_BATCH outputs
+        // are ready, so the flat claim fee is split across a full TX. Two release valves:
+        // a batch carrying a bisection cap (limit < MAX_CLAIM_BATCH) keeps flowing so dead
+        // inputs still get isolated, and once the oldest member has been claimable for
+        // CLAIM_BATCH_TIMEOUT_DAA the partial batch is submitted anyway. The timeout is
+        // derived from confirm_daa (no extra state), so an old backlog flows immediately —
+        // only freshly matured entries wait for a full batch.
+        if limit == MAX_CLAIM_BATCH && batch.len() < MIN_CLAIM_BATCH {
+            let oldest_eligible = batch
+                .iter()
+                .map(|&i| self.state.entries[i].confirm_daa + CHALLENGE_WINDOW_BLOCKS + 10)
+                .min()
+                .expect("batch is non-empty");
+            if daa_score < oldest_eligible + CLAIM_BATCH_TIMEOUT_DAA {
+                return None;
+            }
         }
         let entries: Vec<EscrowEntry> = batch.iter().map(|&i| self.state.entries[i].clone()).collect();
 
