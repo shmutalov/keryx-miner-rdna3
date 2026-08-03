@@ -677,10 +677,13 @@ impl KeryxdHandler {
                     }
                 } else if let Some(block) = msg.block {
                     let hash = block.verbose_data.as_ref().map(|v| v.hash.clone()).unwrap_or_default();
+                    // Chain membership from the node's live verdict: a stored-but-reorged
+                    // block must purge its entries just like a missing one.
+                    let is_chain = block.verbose_data.as_ref().map_or(false, |v| v.is_chain_block);
                     was_validation = self
                         .escrow_watcher
                         .as_mut()
-                        .map_or(false, |w| w.consume_validation_ok(&hash));
+                        .map_or(false, |w| w.consume_validation_ok(&hash, is_chain));
                     if !was_validation {
                         self.scan_txs_for_ai_requests(&block.transactions);
                         self.try_start_inference();

@@ -542,9 +542,15 @@ impl EscrowWatcher {
     /// Consume a successful GetBlock answer for a pending validation hash. Returns true
     /// when the response belonged to the validation flow (the caller then skips the
     /// regular block-scan path — validation responses carry no transactions).
-    pub fn consume_validation_ok(&mut self, hash: &str) -> bool {
+    ///
+    /// `is_chain_block` is the node's CURRENT verdict: escrow entries come from chain-block
+    /// coinbases, so a block that got reorged out of the selected chain (still stored,
+    /// no longer chain — invisible to a pure existence check, especially on archival
+    /// nodes) never materialized its coinbase and its entries are ghosts too. Entries are
+    /// at least a challenge-window old when claimed, so the chain verdict is final here.
+    pub fn consume_validation_ok(&mut self, hash: &str, is_chain_block: bool) -> bool {
         if self.validation_pending.contains(hash) {
-            self.on_block_validated(hash, true);
+            self.on_block_validated(hash, is_chain_block);
             true
         } else {
             false
