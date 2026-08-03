@@ -809,9 +809,9 @@ impl EscrowWatcher {
                         e.orphan_retry_after_daa = Some(last_daa + cooldown);
                     }
                 }
-                // WARN, not debug: a whole batch silently bouncing is exactly the failure
-                // mode that must be visible to the operator.
-                warn!(
+                // Debug level: with boot-time state validation in place, rejections are
+                // rare and transient (bisection repair) — not worth operator noise.
+                debug!(
                     "EscrowWatcher: claim {} rejected ({} output(s) released{}): {}",
                     claim_txid,
                     n_outputs,
