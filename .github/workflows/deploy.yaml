@@ -158,8 +158,13 @@ jobs:
           cp -L /usr/lib/x86_64-linux-gnu/libvulkan.so.1 "$asset/"
           tar czvf "$asset.tgz" "$asset"
 
-      # HiveOS custom-miner package: the *-hiveos.tgz a flightsheet's "Installation URL" points
-      # at; extracts to its OWN /hive/miners/custom/keryx-miner-rdna3/ (distinct from the official
+      # HiveOS custom-miner package: the tgz a flightsheet's "Installation URL" points at.
+      # NAMING IS LOAD-BEARING: the HiveOS installer derives the miner name from the filename by
+      # stripping the last dash-segment as the version, and requires the archive's top-level folder
+      # to match that derived name — so the file MUST be <minername>-<version>.tgz with no suffix
+      # after the version (issue #3: "keryx-miner-v0.3.18-rdna3-hiveos.tgz" derived the name
+      # "keryx-miner-v0.3.18-rdna3", mismatching the "keryx-miner-rdna3/" folder inside).
+      # Extracts to its OWN /hive/miners/custom/keryx-miner-rdna3/ (distinct from the official
       # miner, so no stale CUDA/OpenCL plugin .so is inherited). Ships the ZERO-DUP binary: a single
       # process (inference in-process, PoM walk over shared weights) — no llama-server child for
       # h-run.sh to manage. Bundles the Vulkan loader; needs a Vulkan-capable amdgpu driver ICD
@@ -181,7 +186,7 @@ jobs:
           # this is found even on HiveOS images without libvulkan1 (or with broken apt).
           cp -L /usr/lib/x86_64-linux-gnu/libvulkan.so.1 "$pkg/"
           chmod +x "$pkg"/*.sh "$pkg/keryx-miner-rdna3"
-          tar czvf "keryx-miner-${TAG}-hiveos.tgz" "$pkg"
+          tar czvf "keryx-miner-rdna3-${TAG#v}.tgz" "$pkg"
 
       - name: Upload artifacts (always)
         uses: actions/upload-artifact@v7
