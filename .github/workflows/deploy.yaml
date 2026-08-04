@@ -173,7 +173,12 @@ jobs:
         run: |
           set -euxo pipefail
           pkg="keryx-miner-rdna3"
-          ( cd integrations/hiveos && bash createmanifest.sh "${TAG#v}" keryx-miner-rdna3 )
+          # Bare numeric version: strip the leading "v" AND the "-rdna3" tag suffix. The suffix in
+          # the filename re-broke the installer's name derivation for v0.3.19 (it derived
+          # "keryx-miner-rdna3-0.3.19" from "keryx-miner-rdna3-0.3.19-rdna3.tgz") — the version
+          # MUST be the last dash-segment of the filename, with nothing after it.
+          ver="${TAG#v}"; ver="${ver%-rdna3}"
+          ( cd integrations/hiveos && bash createmanifest.sh "$ver" keryx-miner-rdna3 )
           mkdir -p "$pkg"
           cp integrations/hiveos/h-config.sh \
              integrations/hiveos/h-run.sh \
@@ -186,7 +191,7 @@ jobs:
           # this is found even on HiveOS images without libvulkan1 (or with broken apt).
           cp -L /usr/lib/x86_64-linux-gnu/libvulkan.so.1 "$pkg/"
           chmod +x "$pkg"/*.sh "$pkg/keryx-miner-rdna3"
-          tar czvf "keryx-miner-rdna3-${TAG#v}.tgz" "$pkg"
+          tar czvf "keryx-miner-rdna3-${ver}.tgz" "$pkg"
 
       - name: Upload artifacts (always)
         uses: actions/upload-artifact@v7
