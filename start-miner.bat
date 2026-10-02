@@ -37,7 +37,18 @@ set RUST_BACKTRACE=1
 
 REM ----------------------------------------------------------------------------
 cd /d "%~dp0"
-set "MINER=%~dp0target\release\keryx-miner-rdna3.exe"
+set "RELEASE_DIR=%~dp0target\release\"
+set "MINER=%RELEASE_DIR%keryx-miner-rdna3.exe"
+
+REM The miner runs from target\release, next to its models and ipfs.exe. If cargo builds
+REM elsewhere (a target dir set in .cargo\config.toml or CARGO_TARGET_DIR, e.g. a short path for
+REM MSVC), ask cargo where, and copy a newer build in on every (re)start. Skipped when cargo is
+REM not installed or builds into target\ itself.
+set "BUILT="
+for /f "usebackq delims=" %%d in (`powershell -NoProfile -Command "try { $t = (cargo metadata --format-version 1 --no-deps 2>$null | ConvertFrom-Json).target_directory; if ($t) { [IO.Path]::GetFullPath($t) } } catch {}"`) do set "BUILT=%%d\release\keryx-miner-rdna3.exe"
+if /i "%BUILT%"=="%MINER%" set "BUILT="
+
+call :sync_build
 
 if not exist "%MINER%" (
     echo ERROR: miner binary not found at:
@@ -55,9 +66,15 @@ echo   Worker  : %WORKER%
 echo.
 
 :run
+call :sync_build
 "%MINER%" --mining-address "%MINING_ADDRESS%" --keryxd-address "%POOL%" --worker "%WORKER%"
 
 echo.
 echo Miner exited (code %errorlevel%). Restarting in 5s -- close this window to stop.
 timeout /t 5 >nul
 goto run
+
+REM Copy a newer cargo build (if any) next to the models; /D copies only when it is newer.
+:sync_build
+if defined BUILT if exist "%BUILT%" xcopy /D /Y /Q "%BUILT%" "%RELEASE_DIR%" >nul
+exit /b
