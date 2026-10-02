@@ -1,5 +1,5 @@
 use bytes::BytesMut;
-use log::error;
+use log::{error, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt::{Display, Formatter};
@@ -177,11 +177,52 @@ pub(crate) enum StratumCommand {
     // response. The nonce is echoed back so the bridge can reject replayed/stale responses.
     #[serde(rename = "mining.challenge_response")]
     MiningChallengeResponse((String, String, String)),
+    // Suprnova H6 chat extension: pool → miner — off-chain inference answered inline (no tx, no
+    // escrow); `params` is the object itself. Also the pool's "ping" serve-ability probe.
+    #[serde(rename = "mining.inference_request")]
+    MiningInferenceRequest(InferenceRequestParams),
+    // miner → pool: the answer (`reqId/ok/text/tokens/ms`) or an error (`reqId/ok/error`).
+    #[serde(rename = "mining.inference_result")]
+    MiningInferenceResult(InferenceResultParams),
     /*#[serde(rename = "mining.submit_hashrate")]
     MiningSubmitHashrate {
         params: (String, String),
         worker: String,
     },*/ //{"id":9,"method":"mining.submit_hashrate","jsonrpc":"2.0","worker":"rig","params":["0x00000000000000000000000000000000","0x85198cd10b915d560722cdfdf490d4d93892d2cc3fa5f2ff2195d499d04ee54c"]}
+}
+
+/// `mining.inference_request` params (wire format of keryx-miner-supr's H6 chat extension).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub(crate) struct InferenceRequestParams {
+    #[serde(rename = "reqId")]
+    pub req_id: String,
+    /// 64-hex tier model id the chat must be answered by.
+    pub model_id: String,
+    pub prompt: String,
+    pub max_tokens: usize,
+    #[serde(default)]
+    pub stream: bool,
+    /// The pool's routing budget (ms); 0/absent = its default. This miner never queues, so it
+    /// only bounds-checks it.
+    #[serde(default)]
+    pub deadline_ms: u64,
+}
+
+/// `mining.inference_result` params: `{ reqId, ok: true, text, tokens, ms }` or
+/// `{ reqId, ok: false, error }` — absent fields are omitted.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub(crate) struct InferenceResultParams {
+    #[serde(rename = "reqId")]
+    pub req_id: String,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub ms: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub error: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -242,6 +283,11 @@ pub(crate) struct NewLineJsonCodec {
     lines_codec: LinesCodec,
 }
 
+/// The `method` of a JSON line, if it has one (a pool request/notification, not a response).
+fn pool_method(line: &str) -> Option<String> {
+    serde_json::from_str::<Value>(line).ok()?.get("method")?.as_str().map(str::to_owned)
+}
+
 impl NewLineJsonCodec {
     pub fn new() -> Self {
         Self { lines_codec: LinesCodec::new() }
@@ -253,12 +299,21 @@ impl Decoder for NewLineJsonCodec {
     type Error = NewLineJsonCodecError;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        match self.lines_codec.decode(src) {
-            Ok(Some(s)) => {
-                serde_json::from_str::<StratumLine>(s.as_str()).map_err(|e| (e.to_string(), s).into()).map(Some)
+        loop {
+            match self.lines_codec.decode(src) {
+                Ok(Some(s)) => match serde_json::from_str::<StratumLine>(s.as_str()) {
+                    Ok(line) => return Ok(Some(line)),
+                    // A pool method this miner doesn't speak (pools extend the protocol on their
+                    // own schedule) is skipped, not fatal: a decode error tears the connection
+                    // down, and the pool would just send it again after the reconnect.
+                    Err(e) => match pool_method(&s) {
+                        Some(method) => warn!("Ignoring unsupported pool message '{method}': {e}"),
+                        None => return Err((e.to_string(), s).into()),
+                    },
+                },
+                Err(_) => return Err(NewLineJsonCodecError::LineSplitError),
+                _ => return Ok(None),
             }
-            Err(_) => Err(NewLineJsonCodecError::LineSplitError),
-            _ => Ok(None),
         }
     }
 
@@ -333,5 +388,68 @@ mod tests {
     fn error_serializes_as_array() {
         let json = serde_json::to_string(&StratumError(ErrorCode::NotSubscribed, "Not subscribed".into(), None)).unwrap();
         assert_eq!(json, r#"[25,"Not subscribed",null]"#);
+    }
+
+    /// The suprnova bridge's serve-ability probe, verbatim from a live session.
+    #[test]
+    fn inference_request_decodes() {
+        let raw = r#"{"id":1,"method":"mining.inference_request","params":{"reqId":"probe-f3dc7301-6684-44e6-aebc-1b4c51e21f19","model_id":"b8bdc01fa407eab943e4fefc807483b39f8142785256049e1f559698a5284746","prompt":"ping","max_tokens":8,"stream":false}}"#;
+        let line: StratumLine = serde_json::from_str(raw).unwrap();
+        match line.payload {
+            StratumLinePayload::StratumCommand(StratumCommand::MiningInferenceRequest(p)) => {
+                assert_eq!(p.req_id, "probe-f3dc7301-6684-44e6-aebc-1b4c51e21f19");
+                assert_eq!(p.prompt, "ping");
+                assert_eq!(p.max_tokens, 8);
+                assert_eq!(p.deadline_ms, 0);
+            }
+            other => panic!("expected MiningInferenceRequest, got {other:?}"),
+        }
+    }
+
+    /// Both result shapes match keryx-miner-supr's: absent fields are omitted, not null.
+    #[test]
+    fn inference_result_shapes() {
+        let line = |params| StratumLine {
+            id: None,
+            payload: StratumLinePayload::StratumCommand(StratumCommand::MiningInferenceResult(params)),
+            jsonrpc: None,
+            error: None,
+        };
+        let ok = serde_json::to_value(line(InferenceResultParams {
+            req_id: "c-1".into(),
+            ok: true,
+            text: Some("pong".into()),
+            tokens: Some(1),
+            ms: Some(42),
+            error: None,
+        }))
+        .unwrap();
+        assert_eq!(ok["method"], "mining.inference_result");
+        assert_eq!(ok["params"], serde_json::json!({"reqId": "c-1", "ok": true, "text": "pong", "tokens": 1, "ms": 42}));
+        let err = serde_json::to_value(line(InferenceResultParams {
+            req_id: "c-1".into(),
+            ok: false,
+            text: None,
+            tokens: None,
+            ms: None,
+            error: Some("busy".into()),
+        }))
+        .unwrap();
+        assert_eq!(err["params"], serde_json::json!({"reqId": "c-1", "ok": false, "error": "busy"}));
+    }
+
+    /// An unknown pool method is skipped and the next line in the same buffer still decodes;
+    /// an unparseable response (no method) is still an error.
+    #[test]
+    fn unknown_pool_method_is_skipped() {
+        let mut codec = NewLineJsonCodec::new();
+        let mut buf = BytesMut::from(
+            "{\"id\":7,\"method\":\"mining.some_future_thing\",\"params\":{\"x\":1}}\n\
+             {\"id\":null,\"method\":\"mining.set_difficulty\",\"params\":[0.5],\"error\":null}\n",
+        );
+        let line = codec.decode(&mut buf).unwrap().expect("the second line");
+        assert!(matches!(line.payload, StratumLinePayload::StratumCommand(StratumCommand::MiningSetDifficulty(_))));
+        let mut bad = BytesMut::from("{\"id\":3,\"result\":{\"weird\":true}}\n");
+        assert!(codec.decode(&mut bad).is_err());
     }
 }

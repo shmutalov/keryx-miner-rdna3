@@ -13,7 +13,8 @@ mod statum_codec;
 
 use crate::client::stratum::statum_codec::{ErrorCode, MiningNotify, MiningSubmit, NewLineJsonCodecError, StratumLine};
 use crate::client::stratum::statum_codec::{
-    MiningSubscribe, SetExtranonce, StratumCommand, StratumError, StratumLinePayload, StratumResult,
+    InferenceRequestParams, InferenceResultParams, MiningSubscribe, SetExtranonce, StratumCommand, StratumError,
+    StratumLinePayload, StratumResult,
 };
 use crate::client::Client;
 use crate::pow::BlockSeed;
@@ -39,6 +40,11 @@ const DIFFICULTY_1_TARGET: (u64, i16) = (0xffffu64, 208); // 0xffff 2^208
 const KERYX_STRATUM_DAA_CAPABILITY: &str = "keryx-stratum-v3";
 const LOG_RATE: Duration = Duration::from_secs(30);
 const CHALLENGE_MAX_TOKENS: usize = 128;
+// Pool chat (`mining.inference_request`) bounds — the same limits keryx-miner-supr enforces.
+const MAX_CHAT_REQ_ID_BYTES: usize = 256;
+const MAX_CHAT_PROMPT_BYTES: usize = 4 * 1024;
+const MAX_CHAT_TOKENS: usize = 2_048;
+const MAX_CHAT_DEADLINE_MS: u64 = 120_000;
 
 // ── Phase 2 OPoI — inference cache & task types ─────────────────────────────
 
@@ -630,6 +636,10 @@ impl StratumHandler {
                             self.handle_ai_request(fields, miner).await;
                             Ok(())
                         }
+                        StratumCommand::MiningInferenceRequest(req) => {
+                            self.handle_inference_request(req, miner).await;
+                            Ok(())
+                        }
                         _ => Err(format!("Unexpected stratum message: {:?}", msg).into()),
                     },
                     _ => Err(format!("Inconsistent stratum message: {:?}", msg).into()),
@@ -764,6 +774,76 @@ impl StratumHandler {
                     }
                 }
                 Err(error) => warn!("AI request {:.16}: {}", request.task_id, error),
+            }
+        });
+    }
+
+    /// Pool chat (`mining.inference_request` → `mining.inference_result`; suprnova's H6 extension,
+    /// also its "ping" serve-ability probe): off-chain inference answered inline — no tx, no
+    /// escrow. Pauses mining like `mining.ai_request`. Unlike that consensus path, every outcome
+    /// is answered: a busy, unready or failed run replies `{ reqId, ok: false, error }` so the
+    /// pool can route the chat elsewhere instead of waiting out its deadline.
+    async fn handle_inference_request(&mut self, req: InferenceRequestParams, miner: &mut MinerManager) {
+        let sender = self.send_channel.clone();
+        if req.req_id.is_empty() || req.req_id.len() > MAX_CHAT_REQ_ID_BYTES {
+            warn!("chat: invalid reqId");
+            sender.send(inference_result(String::new(), Err("invalid reqId"))).await.ok();
+            return;
+        }
+        let rejection = if req.prompt.is_empty() || req.prompt.len() > MAX_CHAT_PROMPT_BYTES {
+            Some("prompt must be 1..=4096 bytes")
+        } else if req.max_tokens == 0 || req.max_tokens > MAX_CHAT_TOKENS {
+            Some("max_tokens must be 1..=2048")
+        } else if req.deadline_ms > MAX_CHAT_DEADLINE_MS {
+            Some("deadline_ms exceeds 120000")
+        } else {
+            None
+        };
+        if let Some(reason) = rejection {
+            warn!("chat[{}]: rejected: {}", req.req_id, reason);
+            sender.send(inference_result(req.req_id, Err(reason))).await.ok();
+            return;
+        }
+        let model_id: [u8; 32] = match hex::decode(&req.model_id).ok().and_then(|b| b.try_into().ok()) {
+            Some(id) => id,
+            None => {
+                warn!("chat[{}]: invalid model_id '{}'", req.req_id, req.model_id);
+                sender.send(inference_result(req.req_id, Err("invalid model_id"))).await.ok();
+                return;
+            }
+        };
+        if keryx_miner::pow_only() || !keryx_miner::slm::is_model_ready(&model_id) {
+            warn!("chat[{}]: model {:.8} not ready", req.req_id, req.model_id);
+            sender.send(inference_result(req.req_id, Err("model not ready"))).await.ok();
+            return;
+        }
+        if self.ai_response_pending.lock().await.is_some() || self.challenge_in_flight.swap(true, Ordering::SeqCst) {
+            info!("chat[{}]: inference busy — replying busy", req.req_id);
+            sender.send(inference_result(req.req_id, Err("busy"))).await.ok();
+            return;
+        }
+        let guard = ai::InferenceGuard::new(miner.opoi_challenge_flag(), self.challenge_in_flight.clone());
+        if let Err(error) = miner.process_block(None).await {
+            warn!("chat[{}]: could not pause mining: {}", req.req_id, error);
+            sender.send(inference_result(req.req_id, Err("inference failed"))).await.ok();
+            return;
+        }
+        info!("chat[{}]: inference (max_tokens={}) — mining paused", req.req_id, req.max_tokens);
+        task::spawn_blocking(move || {
+            let _guard = guard;
+            let started = std::time::Instant::now();
+            let text =
+                keryx_miner::slm::load_and_run_inference(&model_id, &req.prompt, req.max_tokens).unwrap_or_default();
+            let ms = started.elapsed().as_millis() as u32;
+            let line = if text.is_empty() {
+                warn!("chat[{}]: inference produced no output", req.req_id);
+                inference_result(req.req_id.clone(), Err("inference failed"))
+            } else {
+                info!("chat[{}]: done in {} ms — mining resumes", req.req_id, ms);
+                inference_result(req.req_id.clone(), Ok((text, ms)))
+            };
+            if sender.blocking_send(line).is_err() {
+                warn!("chat[{}]: connection closed before the result was sent", req.req_id);
             }
         });
     }
@@ -983,6 +1063,35 @@ fn run_inference_and_upload(
             guard.results.shrink_to_fit();
         }
         guard.results.insert(stable_id, cid);
+    }
+}
+
+/// A `mining.inference_result` notification: `Ok((text, ms))` or `Err(reason)`. `tokens` is a
+/// whitespace word count, as keryx-miner-supr reports it.
+fn inference_result(req_id: String, outcome: std::result::Result<(String, u32), &str>) -> StratumLine {
+    let params = match outcome {
+        Ok((text, ms)) => InferenceResultParams {
+            req_id,
+            ok: true,
+            tokens: Some(text.split_whitespace().count() as u32),
+            text: Some(text),
+            ms: Some(ms),
+            error: None,
+        },
+        Err(reason) => InferenceResultParams {
+            req_id,
+            ok: false,
+            text: None,
+            tokens: None,
+            ms: None,
+            error: Some(reason.to_string()),
+        },
+    };
+    StratumLine {
+        id: None,
+        payload: StratumLinePayload::StratumCommand(StratumCommand::MiningInferenceResult(params)),
+        jsonrpc: None,
+        error: None,
     }
 }
 
