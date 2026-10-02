@@ -760,7 +760,6 @@ impl StratumHandler {
         let pending = self.ai_response_pending.clone();
         let last_id = self.last_stratum_id.clone();
         task::spawn_blocking(move || {
-            let _guard = guard;
             let result =
                 keryx_miner::slm::load_and_run_inference(&request.model_id, &request.prompt, request.max_tokens)
                     .unwrap_or_default();
@@ -768,12 +767,18 @@ impl StratumHandler {
             match request.response(id, worker, &result) {
                 Ok(line) => {
                     *pending.blocking_lock() = Some(id);
+                    // The GPU is done: resume mining before the send, which blocks while the pool
+                    // connection is backed up. `pending` keeps further requests out until the ack.
+                    drop(guard);
                     if sender.blocking_send(line).is_err() {
                         *pending.blocking_lock() = None;
                         warn!("AI response {:.16}: connection closed", request.task_id);
                     }
                 }
-                Err(error) => warn!("AI request {:.16}: {}", request.task_id, error),
+                Err(error) => {
+                    drop(guard);
+                    warn!("AI request {:.16}: {}", request.task_id, error);
+                }
             }
         });
     }
@@ -800,7 +805,14 @@ impl StratumHandler {
             None
         };
         if let Some(reason) = rejection {
-            warn!("chat[{}]: rejected: {}", req.req_id, reason);
+            warn!(
+                "chat[{}]: rejected: {} (prompt {} B, max_tokens {}, deadline_ms {})",
+                req.req_id,
+                reason,
+                req.prompt.len(),
+                req.max_tokens,
+                req.deadline_ms
+            );
             sender.send(inference_result(req.req_id, Err(reason))).await.ok();
             return;
         }
@@ -830,11 +842,14 @@ impl StratumHandler {
         }
         info!("chat[{}]: inference (max_tokens={}) — mining paused", req.req_id, req.max_tokens);
         task::spawn_blocking(move || {
-            let _guard = guard;
             let started = std::time::Instant::now();
             let text =
                 keryx_miner::slm::load_and_run_inference(&model_id, &req.prompt, req.max_tokens).unwrap_or_default();
             let ms = started.elapsed().as_millis() as u32;
+            // The GPU is done: resume mining before the send, which blocks while the pool
+            // connection is backed up (a held pause once kept mining stopped ~1 min past a 0.65 s
+            // probe).
+            drop(guard);
             let line = if text.is_empty() {
                 warn!("chat[{}]: inference produced no output", req.req_id);
                 inference_result(req.req_id.clone(), Err("inference failed"))
