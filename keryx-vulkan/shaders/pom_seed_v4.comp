@@ -1,0 +1,157 @@
+#version 460
+// Keryx PoM v4 seed pre-pass — one invocation per nonce writes the walk seed consumed by
+// `pom_walk_v4.comp`: the H10 seed (keccak PowHash front-end over the host-absorbed sponge, nonce in
+// lane 9) or the pre-H10 v4-salted mix64 fold. BYTE-IDENTICAL to `pom::pom_block_seed_h10` /
+// `pom::pom_block_seed_v4`.
+//
+// Split out of the walk on purpose: the 25-lane keccak state alone raised the walk shader from 68
+// to 110 VGPRs (gfx1100), cutting the occupancy that hides its 256 dependent tile reads. Here it
+// runs once per nonce at 64 nonces per wave instead of redundantly on all 32 lanes of a walk.
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 64) in;
+
+// Binding 0: the walk's dispatch I/O block (only `h10` is read here).
+layout(std430, binding = 0) readonly buffer Io {
+    uint offset;
+    uint _pad;
+    uint64_t t[4];
+    uint64_t h10[25];
+} IO;
+// Binding 1: one seed per nonce of the dispatch, indexed by batch offset.
+layout(std430, binding = 1) writeonly buffer Seeds { uint64_t s[]; } SEEDS;
+
+layout(push_constant) uniform Push {
+    uint64_t s0, s1, s2, s3;   // pre-H10 SEED-fold pph words (v4-salted); unused when seed_h10
+    uint64_t timestamp;        // header timestamp (pre-H10 fold only; H10 has it in IO.h10)
+    uint64_t start_nonce;      // first nonce of this dispatch
+    uint batch;                // nonces in this dispatch
+    uint seed_h10;             // 1 = H10 keccak seed, 0 = pre-H10 mix64 fold
+} pc;                          // 48 + 8 = 56 B
+
+// splitmix64 finalizer — exactly `pom::mix64`.
+uint64_t mix64(uint64_t x) {
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9UL;
+    x ^= x >> 27;
+    x *= 0x94d049bb133111ebUL;
+    x ^= x >> 31;
+    return x;
+}
+
+// pom_block_seed_from_words — the pre-H10 v4 fold over the v4-salted pph words.
+uint64_t seed_fold(uint64_t nonce) {
+    uint64_t s = mix64(nonce ^ 0x4B65727978531UL);
+    s = mix64(s ^ pc.timestamp);
+    s = mix64(s ^ pc.s0);
+    s = mix64(s ^ pc.s1);
+    s = mix64(s ^ pc.s2);
+    s = mix64(s ^ pc.s3);
+    return s;
+}
+
+// --- Keccak-f[1600] (FIPS 202), identical to khh.comp's B-array round ---
+
+const uint64_t RC[24] = uint64_t[24](
+    0x0000000000000001UL, 0x0000000000008082UL, 0x800000000000808aUL, 0x8000000080008000UL,
+    0x000000000000808bUL, 0x0000000080000001UL, 0x8000000080008081UL, 0x8000000000008009UL,
+    0x000000000000008aUL, 0x0000000000000088UL, 0x0000000080008009UL, 0x000000008000000aUL,
+    0x000000008000808bUL, 0x800000000000008bUL, 0x8000000000008089UL, 0x8000000000008003UL,
+    0x8000000000008002UL, 0x8000000000000080UL, 0x000000000000800aUL, 0x800000008000000aUL,
+    0x8000000080008081UL, 0x8000000000008080UL, 0x0000000080000001UL, 0x8000000080008008UL);
+
+uint64_t rotl64(uint64_t x, uint r) {
+    return (x << r) | (x >> (64u - r));
+}
+
+void keccakf(inout uint64_t a[25]) {
+    for (uint round = 0u; round < 24u; ++round) {
+        uint64_t c0 = a[0] ^ a[5] ^ a[10] ^ a[15] ^ a[20];
+        uint64_t c1 = a[1] ^ a[6] ^ a[11] ^ a[16] ^ a[21];
+        uint64_t c2 = a[2] ^ a[7] ^ a[12] ^ a[17] ^ a[22];
+        uint64_t c3 = a[3] ^ a[8] ^ a[13] ^ a[18] ^ a[23];
+        uint64_t c4 = a[4] ^ a[9] ^ a[14] ^ a[19] ^ a[24];
+        uint64_t d0 = c4 ^ rotl64(c1, 1u);
+        uint64_t d1 = c0 ^ rotl64(c2, 1u);
+        uint64_t d2 = c1 ^ rotl64(c3, 1u);
+        uint64_t d3 = c2 ^ rotl64(c4, 1u);
+        uint64_t d4 = c3 ^ rotl64(c0, 1u);
+        a[0] ^= d0; a[5] ^= d0; a[10] ^= d0; a[15] ^= d0; a[20] ^= d0;
+        a[1] ^= d1; a[6] ^= d1; a[11] ^= d1; a[16] ^= d1; a[21] ^= d1;
+        a[2] ^= d2; a[7] ^= d2; a[12] ^= d2; a[17] ^= d2; a[22] ^= d2;
+        a[3] ^= d3; a[8] ^= d3; a[13] ^= d3; a[18] ^= d3; a[23] ^= d3;
+        a[4] ^= d4; a[9] ^= d4; a[14] ^= d4; a[19] ^= d4; a[24] ^= d4;
+
+        uint64_t b0  = a[0];
+        uint64_t b1  = rotl64(a[6],  44u);
+        uint64_t b2  = rotl64(a[12], 43u);
+        uint64_t b3  = rotl64(a[18], 21u);
+        uint64_t b4  = rotl64(a[24], 14u);
+        uint64_t b5  = rotl64(a[3],  28u);
+        uint64_t b6  = rotl64(a[9],  20u);
+        uint64_t b7  = rotl64(a[10],  3u);
+        uint64_t b8  = rotl64(a[16], 45u);
+        uint64_t b9  = rotl64(a[22], 61u);
+        uint64_t b10 = rotl64(a[1],   1u);
+        uint64_t b11 = rotl64(a[7],   6u);
+        uint64_t b12 = rotl64(a[13], 25u);
+        uint64_t b13 = rotl64(a[19],  8u);
+        uint64_t b14 = rotl64(a[20], 18u);
+        uint64_t b15 = rotl64(a[4],  27u);
+        uint64_t b16 = rotl64(a[5],  36u);
+        uint64_t b17 = rotl64(a[11], 10u);
+        uint64_t b18 = rotl64(a[17], 15u);
+        uint64_t b19 = rotl64(a[23], 56u);
+        uint64_t b20 = rotl64(a[2],  62u);
+        uint64_t b21 = rotl64(a[8],  55u);
+        uint64_t b22 = rotl64(a[14], 39u);
+        uint64_t b23 = rotl64(a[15], 41u);
+        uint64_t b24 = rotl64(a[21],  2u);
+
+        a[0]  = b0  ^ ((~b1)  & b2);
+        a[1]  = b1  ^ ((~b2)  & b3);
+        a[2]  = b2  ^ ((~b3)  & b4);
+        a[3]  = b3  ^ ((~b4)  & b0);
+        a[4]  = b4  ^ ((~b0)  & b1);
+        a[5]  = b5  ^ ((~b6)  & b7);
+        a[6]  = b6  ^ ((~b7)  & b8);
+        a[7]  = b7  ^ ((~b8)  & b9);
+        a[8]  = b8  ^ ((~b9)  & b5);
+        a[9]  = b9  ^ ((~b5)  & b6);
+        a[10] = b10 ^ ((~b11) & b12);
+        a[11] = b11 ^ ((~b12) & b13);
+        a[12] = b12 ^ ((~b13) & b14);
+        a[13] = b13 ^ ((~b14) & b10);
+        a[14] = b14 ^ ((~b10) & b11);
+        a[15] = b15 ^ ((~b16) & b17);
+        a[16] = b16 ^ ((~b17) & b18);
+        a[17] = b17 ^ ((~b18) & b19);
+        a[18] = b18 ^ ((~b19) & b15);
+        a[19] = b19 ^ ((~b15) & b16);
+        a[20] = b20 ^ ((~b21) & b22);
+        a[21] = b21 ^ ((~b22) & b23);
+        a[22] = b22 ^ ((~b23) & b24);
+        a[23] = b23 ^ ((~b24) & b20);
+        a[24] = b24 ^ ((~b20) & b21);
+        a[0] ^= RC[round];
+    }
+}
+
+// H10 seed: lane 0 of keccak_f1600 over the host-absorbed sponge with the nonce in lane 9.
+uint64_t seed_h10(uint64_t nonce) {
+    uint64_t a[25];
+    [[unroll]] for (int i = 0; i < 25; i++) a[i] = IO.h10[i];
+    a[9] ^= nonce;
+    keccakf(a);
+    return a[0];
+}
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.batch) {
+        return;
+    }
+    const uint64_t nonce = pc.start_nonce + uint64_t(i);
+    SEEDS.s[i] = pc.seed_h10 != 0u ? seed_h10(nonce) : seed_fold(nonce);
+}

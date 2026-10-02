@@ -4,8 +4,8 @@
 // host mirror, which re-walks every winner before submit — a kernel bug can cost hashrate, never
 // a rejected block).
 //
-// Per nonce: seed (H10 keccak PowHash front-end, or the pre-H10 salted mix64 fold) -> S_0 (32x32
-// int8, mix64 keystream) -> K steps of { read 1 KB tile at the chained offset; S = rho8(S x tile^T) }
+// Per nonce: seed (from the `pom_seed_v4.comp` pre-pass: H10 keccak PowHash front-end, or the pre-H10
+// salted mix64 fold) -> S_0 (32x32 int8, mix64 keystream) -> K steps of { read 1 KB tile at the chained offset; S = rho8(S x tile^T) }
 // -> blake3 row leaves + depth-5 tree -> fold64(root) -> H3 pow fold -> <= target.
 //
 // Layout: NPW nonces per workgroup, 32 invocations per nonce (gl_LocalInvocationID.x = state row
@@ -14,24 +14,34 @@
 //
 // The offset chain depends only on the seed and each tile's first 32 bytes (the snippet), never
 // on the walk state, so the next tile's global load is issued BEFORE the current transition and
-// lands in registers while the dot products run; the tile is double-buffered in shared memory,
-// so one barrier per step suffices (a buffer is rewritten two steps after it was read, and the
-// intervening barrier orders every read before that write).
+// lands in registers while the dot products run. The tile is single-buffered in shared memory
+// with two barriers per step (both wave-local with one nonce per workgroup): the shared footprint
+// — not registers — bounds occupancy, and 2 KB per wave is what lets a SIMD hold 16 waves (RGP on
+// a 7900 XT: the 3.1 KB double-buffered layout allocated 4 KB and capped it at 8).
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_integer_dot_product : require
 #extension GL_EXT_control_flow_attributes : require
 
+// Nonces per workgroup. 1 measured fastest on a 7900 XT (1.12 M/s vs 0.99 at 2, 0.95 at 4, 0.91 at
+// 8): with one nonce per workgroup the per-step barrier couples no other walk. The host pins
+// wave32, so the workgroup is exactly one full wave.
 #ifndef NPW
-#define NPW 4
+#define NPW 1
 #endif
 layout(local_size_x = 32, local_size_y = NPW) in;
 
 #define V4_D4 8u              // packed uints per row / column
 #define V4_TILE_UINTS 256u    // 1 KB tile
-// Per-slot shared region: two tile buffers (512 uints, reused as the blake3 tree scratch after the
-// last step) + 16 pad, so the broadcast column reads of slots sharing a wave64 hit different banks.
+// Per-slot shared region: the tile (256 uints) + the next-state rows (256 uints, one private 8-uint
+// row per invocation); after the last step it is the blake3 tree scratch. Several slots get a
+// 16-uint pad so the broadcast column reads of slots sharing a wave64 hit different banks.
+#define V4_NEW_OFF 256u
+#if NPW > 1
 #define V4_SLOT_UINTS 528u
+#else
+#define V4_SLOT_UINTS 512u
+#endif
 
 #define V4_S0_ROW_SALT 0x03421325594C3C51UL       // sha256("keryx-v4-s0-row-salt")
 #define V4_OFFSET_FIRST_SALT 0x6D1CCF96AC4D76F9UL // sha256("keryx-v4-offset-first-salt")
@@ -43,8 +53,8 @@ layout(std430, buffer_reference, buffer_reference_align = 8) readonly buffer Seg
 };
 
 // Binding 0: dispatch I/O — the atomicMin winner slot, the 256-bit LE target, and the H10 sponge
-// state with pre_pow_hash + timestamp absorbed (`pom::pom_seed_h10_state`). Host writes it in one
-// mapped pre-dispatch write; only the first 4 bytes are read back.
+// state with pre_pow_hash + timestamp absorbed (`pom::pom_seed_h10_state`, read by the seed
+// pre-pass). Host writes it in one mapped pre-dispatch write; only the first 4 bytes are read back.
 layout(std430, binding = 0) buffer Io {
     uint offset;
     uint _pad;
@@ -58,19 +68,18 @@ layout(std430, binding = 2) readonly buffer Addrs { uint64_t a[]; } ADDRS;
 // Binding 3: bucket LUT — LUT.s[b] = the segment holding chunk (b << lut_sh). A chunk's segment is
 // found by a short forward scan from its bucket's entry (identical result to a binary search).
 layout(std430, binding = 3) readonly buffer Lut { uint s[]; } LUT;
+// Binding 4: per-nonce walk seeds written by the `pom_seed_v4.comp` pre-pass (batch offset index).
+layout(std430, binding = 4) readonly buffer Seeds { uint64_t s[]; } SEEDS;
 
 layout(push_constant) uniform Push {
     uint64_t p0, p1, p2, p3;   // POW-fold pph words (H3-salted)
-    uint64_t s0, s1, s2, s3;   // pre-H10 SEED-fold pph words (v4-salted); unused when seed_h10
-    uint64_t timestamp;        // header timestamp (pre-H10 seed fold only; H10 has it in IO.h10)
     uint64_t n_tiles;          // floor(n_chunks / 32)
     uint64_t inv_n;            // u64::MAX / n_tiles — Barrett reciprocal for % n_tiles
-    uint64_t start_nonce;      // first nonce of this dispatch
     uint batch;                // nonces in this dispatch
     uint t_count;              // number of segments (T)
     uint lut_sh;               // LUT bucket shift
-    uint seed_h10;             // 1 = H10 keccak seed, 0 = pre-H10 mix64 fold
-} pc;                          // 96 + 16 = 112 B — inside the guaranteed 128 B cap
+    uint zero;                 // always 0 — see rho8
+} pc;                          // 48 + 16 = 64 B
 
 shared uint s_mem[NPW * V4_SLOT_UINTS];
 
@@ -107,119 +116,18 @@ uint64_t mod_tiles(uint64_t x) {
     return r;
 }
 
-// pom_block_seed_from_words — the pre-H10 v4 fold over the v4-salted pph words.
-uint64_t seed_fold(uint64_t nonce) {
-    uint64_t s = mix64(nonce ^ 0x4B65727978531UL);
-    s = mix64(s ^ pc.timestamp);
-    s = mix64(s ^ pc.s0);
-    s = mix64(s ^ pc.s1);
-    s = mix64(s ^ pc.s2);
-    s = mix64(s ^ pc.s3);
-    return s;
-}
-
-// --- Keccak-f[1600] (FIPS 202), identical to khh.comp's B-array round ---
-
-const uint64_t RC[24] = uint64_t[24](
-    0x0000000000000001UL, 0x0000000000008082UL, 0x800000000000808aUL, 0x8000000080008000UL,
-    0x000000000000808bUL, 0x0000000080000001UL, 0x8000000080008081UL, 0x8000000000008009UL,
-    0x000000000000008aUL, 0x0000000000000088UL, 0x0000000080008009UL, 0x000000008000000aUL,
-    0x000000008000808bUL, 0x800000000000008bUL, 0x8000000000008089UL, 0x8000000000008003UL,
-    0x8000000000008002UL, 0x8000000000000080UL, 0x000000000000800aUL, 0x800000008000000aUL,
-    0x8000000080008081UL, 0x8000000000008080UL, 0x0000000080000001UL, 0x8000000080008008UL);
-
-uint64_t rotl64(uint64_t x, uint r) {
-    return (x << r) | (x >> (64u - r));
-}
-
-void keccakf(inout uint64_t a[25]) {
-    for (uint round = 0u; round < 24u; ++round) {
-        uint64_t c0 = a[0] ^ a[5] ^ a[10] ^ a[15] ^ a[20];
-        uint64_t c1 = a[1] ^ a[6] ^ a[11] ^ a[16] ^ a[21];
-        uint64_t c2 = a[2] ^ a[7] ^ a[12] ^ a[17] ^ a[22];
-        uint64_t c3 = a[3] ^ a[8] ^ a[13] ^ a[18] ^ a[23];
-        uint64_t c4 = a[4] ^ a[9] ^ a[14] ^ a[19] ^ a[24];
-        uint64_t d0 = c4 ^ rotl64(c1, 1u);
-        uint64_t d1 = c0 ^ rotl64(c2, 1u);
-        uint64_t d2 = c1 ^ rotl64(c3, 1u);
-        uint64_t d3 = c2 ^ rotl64(c4, 1u);
-        uint64_t d4 = c3 ^ rotl64(c0, 1u);
-        a[0] ^= d0; a[5] ^= d0; a[10] ^= d0; a[15] ^= d0; a[20] ^= d0;
-        a[1] ^= d1; a[6] ^= d1; a[11] ^= d1; a[16] ^= d1; a[21] ^= d1;
-        a[2] ^= d2; a[7] ^= d2; a[12] ^= d2; a[17] ^= d2; a[22] ^= d2;
-        a[3] ^= d3; a[8] ^= d3; a[13] ^= d3; a[18] ^= d3; a[23] ^= d3;
-        a[4] ^= d4; a[9] ^= d4; a[14] ^= d4; a[19] ^= d4; a[24] ^= d4;
-
-        uint64_t b0  = a[0];
-        uint64_t b1  = rotl64(a[6],  44u);
-        uint64_t b2  = rotl64(a[12], 43u);
-        uint64_t b3  = rotl64(a[18], 21u);
-        uint64_t b4  = rotl64(a[24], 14u);
-        uint64_t b5  = rotl64(a[3],  28u);
-        uint64_t b6  = rotl64(a[9],  20u);
-        uint64_t b7  = rotl64(a[10],  3u);
-        uint64_t b8  = rotl64(a[16], 45u);
-        uint64_t b9  = rotl64(a[22], 61u);
-        uint64_t b10 = rotl64(a[1],   1u);
-        uint64_t b11 = rotl64(a[7],   6u);
-        uint64_t b12 = rotl64(a[13], 25u);
-        uint64_t b13 = rotl64(a[19],  8u);
-        uint64_t b14 = rotl64(a[20], 18u);
-        uint64_t b15 = rotl64(a[4],  27u);
-        uint64_t b16 = rotl64(a[5],  36u);
-        uint64_t b17 = rotl64(a[11], 10u);
-        uint64_t b18 = rotl64(a[17], 15u);
-        uint64_t b19 = rotl64(a[23], 56u);
-        uint64_t b20 = rotl64(a[2],  62u);
-        uint64_t b21 = rotl64(a[8],  55u);
-        uint64_t b22 = rotl64(a[14], 39u);
-        uint64_t b23 = rotl64(a[15], 41u);
-        uint64_t b24 = rotl64(a[21],  2u);
-
-        a[0]  = b0  ^ ((~b1)  & b2);
-        a[1]  = b1  ^ ((~b2)  & b3);
-        a[2]  = b2  ^ ((~b3)  & b4);
-        a[3]  = b3  ^ ((~b4)  & b0);
-        a[4]  = b4  ^ ((~b0)  & b1);
-        a[5]  = b5  ^ ((~b6)  & b7);
-        a[6]  = b6  ^ ((~b7)  & b8);
-        a[7]  = b7  ^ ((~b8)  & b9);
-        a[8]  = b8  ^ ((~b9)  & b5);
-        a[9]  = b9  ^ ((~b5)  & b6);
-        a[10] = b10 ^ ((~b11) & b12);
-        a[11] = b11 ^ ((~b12) & b13);
-        a[12] = b12 ^ ((~b13) & b14);
-        a[13] = b13 ^ ((~b14) & b10);
-        a[14] = b14 ^ ((~b10) & b11);
-        a[15] = b15 ^ ((~b16) & b17);
-        a[16] = b16 ^ ((~b17) & b18);
-        a[17] = b17 ^ ((~b18) & b19);
-        a[18] = b18 ^ ((~b19) & b15);
-        a[19] = b19 ^ ((~b15) & b16);
-        a[20] = b20 ^ ((~b21) & b22);
-        a[21] = b21 ^ ((~b22) & b23);
-        a[22] = b22 ^ ((~b23) & b24);
-        a[23] = b23 ^ ((~b24) & b20);
-        a[24] = b24 ^ ((~b20) & b21);
-        a[0] ^= RC[round];
-    }
-}
-
-// H10 seed: lane 0 of keccak_f1600 over the host-absorbed sponge with the nonce in lane 9.
-uint64_t seed_h10(uint64_t nonce) {
-    uint64_t a[25];
-    [[unroll]] for (int i = 0; i < 25; i++) a[i] = IO.h10[i];
-    a[9] ^= nonce;
-    keccakf(a);
-    return a[0];
-}
-
-// rho8 — the murmur-style byte reduction (`pom_v3::rho8`).
+// rho8 — the murmur-style byte reduction (`pom_v3::rho8`). Only bits 0..7 and 13..20 of the second
+// product reach the byte, and a product's low 24 bits depend only on its factors' low 24 bits, so
+// that multiply runs on 24-bit factors: a full-rate v_mul_u32_u24 instead of the quarter-rate
+// v_mul_lo_u32 (+8% on a 7900 XT). The width-24 extract takes its offset from the push constant
+// `zero`: with a literal 0 the compiler drops the mask as redundant for the bits the product
+// needs, loses the proof that the factor fits in 24 bits, and goes back to v_mul_lo_u32.
 uint rho8(int acc, uint tweak) {
     uint z = uint(acc) ^ tweak;
     z *= 0x9E3779B9u;
     z ^= z >> 16;
-    z *= 0x85EBCA6Bu;
+    z = bitfieldExtract(z, int(pc.zero), 24);
+    z *= 0x85EBCA6Bu & 0xFFFFFFu;
     z ^= z >> 13;
     return z & 0xffu;
 }
@@ -284,13 +192,9 @@ void main() {
     const uint slot = gl_LocalInvocationID.y;  // nonce slot in the workgroup
     const uint base = slot * V4_SLOT_UINTS;
     const uint i = gl_WorkGroupID.x * uint(NPW) + slot;
-    // Slots past the batch still walk (in-bounds: every offset is % n_tiles) so every invocation
-    // reaches every barrier; they just never report.
-    const uint64_t nonce = pc.start_nonce + uint64_t(i);
-
-    // The seed is identical across the slot's 32 invocations; computing it redundantly costs the
-    // same wave time as one lane computing it (SIMT), with no broadcast barrier.
-    const uint64_t seed = pc.seed_h10 != 0u ? seed_h10(nonce) : seed_fold(nonce);
+    // Slots past the batch still walk (in-bounds: every offset is % n_tiles, and they reuse the
+    // last seed) so every invocation reaches every barrier; they just never report.
+    const uint64_t seed = SEEDS.s[min(i, pc.batch - 1u)];
 
     // S_0: mix64 keystream per row.
     uint row4[V4_D4];
@@ -310,8 +214,8 @@ void main() {
         w0 = c.words[0]; w1 = c.words[1]; w2 = c.words[2]; w3 = c.words[3];
     }
 
+    const uint buf = base;
     for (uint step = 1u; step <= 256u; step++) {
-        const uint buf = base + (step & 1u) * V4_TILE_UINTS;
         s_mem[buf + x * 8u + 0u] = uint(w0); s_mem[buf + x * 8u + 1u] = uint(w0 >> 32);
         s_mem[buf + x * 8u + 2u] = uint(w1); s_mem[buf + x * 8u + 3u] = uint(w1 >> 32);
         s_mem[buf + x * 8u + 4u] = uint(w2); s_mem[buf + x * 8u + 5u] = uint(w2 >> 32);
@@ -319,7 +223,8 @@ void main() {
         barrier();
 
         // Next offset from THIS tile's snippet (its first 8 words); issue the next tile's load now
-        // so it is in flight during the transition below.
+        // so it is in flight during the transition below. (Splitting the lookup's dependent reads
+        // across the transition measured no faster: the walk is throughput-bound, not latency-bound.)
         if (step < 256u) {
             uint64_t sf = 0UL;
             [[unroll]] for (uint w = 0u; w < 8u; w++) {
@@ -331,30 +236,37 @@ void main() {
         }
 
         // Row x of S_t: byte j = rho8(row . column_j, tweak(step, x, j)) — packed signed 4x8 dots.
-        // |acc| <= 32*128*128 = 2^19, exact in i32.
+        // |acc| <= 32*128*128 = 2^19, exact in i32, so the saturating accumulate never saturates;
+        // it is the form that folds the running sum into each v_dot4 (the plain dot + add costs 16
+        // extra adds per column group, ~12% of the walk). The column-group loop stays rolled: fully
+        // unrolled, the compiler hoists all 256 column loads ahead of the math (256 VGPRs, scratch
+        // spills in this loop, minimum occupancy). Each packed word lands in this invocation's
+        // private next-row slot (no other invocation touches it, so no barrier).
         const uint tweak0 = step * 0x9E3779B9u + x * 0xC2B2AE35u;
-        uint new4[V4_D4];
-        [[unroll]] for (uint j4 = 0u; j4 < V4_D4; j4++) {
-            uint packed = 0u;
+        const uint new_row = base + V4_NEW_OFF + x * 8u;
+        [[dont_unroll]] for (uint j4 = 0u; j4 < V4_D4; j4++) {
+            uint r[4];
             [[unroll]] for (uint jj = 0u; jj < 4u; jj++) {
                 const uint j = j4 * 4u + jj;
                 const uint col = buf + j * 8u;
                 int acc = 0;
                 [[unroll]] for (uint k = 0u; k < V4_D4; k++) {
-                    acc += dotPacked4x8EXT(int(row4[k]), int(s_mem[col + k]));
+                    acc = dotPacked4x8AccSatEXT(int(row4[k]), int(s_mem[col + k]), acc);
                 }
-                packed |= rho8(acc, tweak0 + j * 0x85EBCA6Bu) << (8u * jj);
+                r[jj] = rho8(acc, tweak0 + j * 0x85EBCA6Bu);
             }
-            new4[j4] = packed;
+            // Two 16-bit halves, each a single byte permute.
+            s_mem[new_row + j4] = (r[0] | (r[1] << 8u)) | ((r[2] | (r[3] << 8u)) << 16u);
         }
         [[unroll]] for (uint k4 = 0u; k4 < V4_D4; k4++) {
-            row4[k4] = new4[k4];
+            row4[k4] = s_mem[new_row + k4];
         }
+        // Every invocation is done reading this tile (and its own next-state row) before the next
+        // step — or, after the last one, the tree — overwrites the slot region.
+        barrier();
     }
-    // Every invocation is done reading the last tile before the tree overwrites the slot region.
-    barrier();
 
-    // root_K: 32 blake3 row leaves + complete depth-5 tree; scratch = the slot's tile region
+    // root_K: 32 blake3 row leaves + complete depth-5 tree; scratch = the slot region
     // (leaves at [0, 256), then levels ping-pong with [256, 384)).
     {
         uint m[16];

@@ -127,6 +127,9 @@ pub struct Vk {
     device_index: usize,
     /// False when the instance/device are borrowed (ggml owns them; we only own cmd_pool).
     owned: bool,
+    /// `subgroupSizeControl` was enabled at device creation, so pipelines may pin their subgroup
+    /// size. False on a borrowed device (its owner chose the features).
+    subgroup_size_control: bool,
     /// Present iff borrowed: the owner's serialized queue-submit hook.
     external_submit: Option<ExternalSubmit>,
 }
@@ -211,7 +214,15 @@ impl Vk {
             // is >4 GiB, which exceeds `maxStorageBufferRange` (0xFFFFFFFF on AMD) — accessing it by
             // device address sidesteps that per-descriptor cap. Core in Vulkan 1.2; RDNA3 supports it.
             let mut features12 = vk::PhysicalDeviceVulkan12Features::default().buffer_device_address(true);
-            let mut features13 = vk::PhysicalDeviceVulkan13Features::default().shader_integer_dot_product(true);
+            // subgroupSizeControl (when supported) lets a kernel pin wave32 on RDNA — see
+            // `make_kernel_with_subgroup`.
+            let mut supported13 = vk::PhysicalDeviceVulkan13Features::default();
+            let mut supported = vk::PhysicalDeviceFeatures2::default().push_next(&mut supported13);
+            instance.get_physical_device_features2(pdevice, &mut supported);
+            let subgroup_size_control = supported13.subgroup_size_control == vk::TRUE;
+            let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
+                .shader_integer_dot_product(true)
+                .subgroup_size_control(subgroup_size_control);
             let dci = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&qcis)
                 .enabled_features(&features)
@@ -244,6 +255,7 @@ impl Vk {
                 device_index,
                 owned: true,
                 external_submit: None,
+                subgroup_size_control,
             })
         }
     }
@@ -293,6 +305,7 @@ impl Vk {
             device_index,
             owned: false,
             external_submit: Some(external_submit),
+            subgroup_size_control: false,
         })
     }
 
@@ -368,6 +381,33 @@ impl Vk {
                     None,
                 )
                 .map_err(|e| e.to_string())?;
+            self.device.bind_buffer_memory(buffer, memory, 0).map_err(|e| e.to_string())?;
+            Ok(GpuBuffer { buffer, memory, size })
+        }
+    }
+
+    /// Allocate a `DEVICE_LOCAL` STORAGE buffer the host never touches — GPU-written, GPU-read
+    /// scratch between dispatches (e.g. the v4 walk's per-nonce seeds).
+    pub fn create_device_local_buffer(&self, size: u64) -> Result<GpuBuffer, String> {
+        assert!(size > 0, "zero-size buffer");
+        unsafe {
+            let info = vk::BufferCreateInfo::default()
+                .size(size)
+                .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let buffer = self.device.create_buffer(&info, None).map_err(|e| e.to_string())?;
+            let req = self.device.get_buffer_memory_requirements(buffer);
+            let mt = self.find_memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+            let memory = match self
+                .device
+                .allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(mt), None)
+            {
+                Ok(m) => m,
+                Err(e) => {
+                    self.device.destroy_buffer(buffer, None);
+                    return Err(e.to_string());
+                }
+            };
             self.device.bind_buffer_memory(buffer, memory, 0).map_err(|e| e.to_string())?;
             Ok(GpuBuffer { buffer, memory, size })
         }
@@ -652,6 +692,20 @@ impl Vk {
     /// Build a compute pipeline from SPIR-V with `n_bindings` storage buffers and `push_size`
     /// bytes of push constants. The returned `Kernel` is reusable across dispatches.
     pub fn make_kernel(&self, spirv: &[u32], n_bindings: u32, push_size: u32) -> Result<Kernel, String> {
+        self.make_kernel_with_subgroup(spirv, n_bindings, push_size, None)
+    }
+
+    /// [`make_kernel`](Self::make_kernel), optionally pinning the pipeline's subgroup (wave) size —
+    /// e.g. 32 so a 32-invocation workgroup runs as one full wave32 instead of a half-empty wave64
+    /// on RDNA. Ignored (driver default) when the device was not created with
+    /// `subgroupSizeControl`; the shader must be correct at any subgroup size either way.
+    pub fn make_kernel_with_subgroup(
+        &self,
+        spirv: &[u32],
+        n_bindings: u32,
+        push_size: u32,
+        required_subgroup_size: Option<u32>,
+    ) -> Result<Kernel, String> {
         unsafe {
             let bindings: Vec<_> = (0..n_bindings)
                 .map(|i| {
@@ -688,10 +742,15 @@ impl Vk {
                 .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(spirv), None)
                 .map_err(|e| e.to_string())?;
             let entry = CString::new("main").unwrap();
-            let stage = vk::PipelineShaderStageCreateInfo::default()
+            let mut required = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
+                .required_subgroup_size(required_subgroup_size.unwrap_or(0));
+            let mut stage = vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::COMPUTE)
                 .module(module)
                 .name(&entry);
+            if required_subgroup_size.is_some() && self.subgroup_size_control {
+                stage = stage.push_next(&mut required);
+            }
             let pipeline = self
                 .device
                 .create_compute_pipelines(
@@ -733,49 +792,79 @@ impl Vk {
     /// Bind `buffers` (in binding order 0..n) + `push` constants and dispatch `groups` workgroups
     /// on x. Blocks until the GPU finishes (fence wait).
     pub fn dispatch(&self, k: &Kernel, buffers: &[&GpuBuffer], push: &[u8], groups: u32) {
+        self.dispatch_seq(&[(k, buffers, push, groups)]);
+    }
+
+    /// Record several dispatches into ONE command buffer (the first kernel's), separated by
+    /// compute→compute memory barriers so each step reads what the previous one wrote, and submit
+    /// them once. Blocks until all finish. Every kernel binds its own descriptor set, so a kernel
+    /// may appear at most once per call.
+    pub fn dispatch_seq(&self, steps: &[(&Kernel, &[&GpuBuffer], &[u8], u32)]) {
+        assert!(!steps.is_empty(), "empty dispatch sequence");
         unsafe {
             let dev = &self.device;
-            dev.reset_descriptor_pool(k.desc_pool, vk::DescriptorPoolResetFlags::empty()).unwrap();
-            let layouts = [k.set_layout];
-            let set = dev
-                .allocate_descriptor_sets(
-                    &vk::DescriptorSetAllocateInfo::default().descriptor_pool(k.desc_pool).set_layouts(&layouts),
-                )
-                .unwrap()[0];
-            let infos: Vec<_> = buffers
-                .iter()
-                .map(|b| vk::DescriptorBufferInfo::default().buffer(b.buffer).offset(0).range(vk::WHOLE_SIZE))
-                .collect();
-            let writes: Vec<_> = (0..buffers.len())
-                .map(|i| {
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(set)
-                        .dst_binding(i as u32)
-                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                        .buffer_info(std::slice::from_ref(&infos[i]))
-                })
-                .collect();
-            dev.update_descriptor_sets(&writes, &[]);
+            let mut sets = Vec::with_capacity(steps.len());
+            for &(k, buffers, _, _) in steps {
+                dev.reset_descriptor_pool(k.desc_pool, vk::DescriptorPoolResetFlags::empty()).unwrap();
+                let layouts = [k.set_layout];
+                let set = dev
+                    .allocate_descriptor_sets(
+                        &vk::DescriptorSetAllocateInfo::default().descriptor_pool(k.desc_pool).set_layouts(&layouts),
+                    )
+                    .unwrap()[0];
+                let infos: Vec<_> = buffers
+                    .iter()
+                    .map(|b| vk::DescriptorBufferInfo::default().buffer(b.buffer).offset(0).range(vk::WHOLE_SIZE))
+                    .collect();
+                let writes: Vec<_> = (0..buffers.len())
+                    .map(|i| {
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(set)
+                            .dst_binding(i as u32)
+                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                            .buffer_info(std::slice::from_ref(&infos[i]))
+                    })
+                    .collect();
+                dev.update_descriptor_sets(&writes, &[]);
+                sets.push(set);
+            }
 
-            dev.reset_command_buffer(k.cmd, vk::CommandBufferResetFlags::empty()).unwrap();
+            let head = steps[0].0;
+            dev.reset_command_buffer(head.cmd, vk::CommandBufferResetFlags::empty()).unwrap();
             dev.begin_command_buffer(
-                k.cmd,
+                head.cmd,
                 &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )
             .unwrap();
-            dev.cmd_bind_pipeline(k.cmd, vk::PipelineBindPoint::COMPUTE, k.pipeline);
-            dev.cmd_bind_descriptor_sets(k.cmd, vk::PipelineBindPoint::COMPUTE, k.pipeline_layout, 0, &[set], &[]);
-            if !push.is_empty() {
-                dev.cmd_push_constants(k.cmd, k.pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, push);
+            for (i, (&(k, _, push, groups), &set)) in steps.iter().zip(&sets).enumerate() {
+                if i > 0 {
+                    let barrier = vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::SHADER_READ);
+                    dev.cmd_pipeline_barrier(
+                        head.cmd,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &[barrier],
+                        &[],
+                        &[],
+                    );
+                }
+                dev.cmd_bind_pipeline(head.cmd, vk::PipelineBindPoint::COMPUTE, k.pipeline);
+                dev.cmd_bind_descriptor_sets(head.cmd, vk::PipelineBindPoint::COMPUTE, k.pipeline_layout, 0, &[set], &[]);
+                if !push.is_empty() {
+                    dev.cmd_push_constants(head.cmd, k.pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, push);
+                }
+                dev.cmd_dispatch(head.cmd, groups, 1, 1);
             }
-            dev.cmd_dispatch(k.cmd, groups, 1, 1);
-            dev.end_command_buffer(k.cmd).unwrap();
+            dev.end_command_buffer(head.cmd).unwrap();
 
-            let cmds = [k.cmd];
+            let cmds = [head.cmd];
             let submit = vk::SubmitInfo::default().command_buffers(&cmds);
-            dev.reset_fences(&[k.fence]).unwrap();
-            self.queue_submit_routed(&submit, k.fence).expect("queue submit");
-            dev.wait_for_fences(&[k.fence], true, u64::MAX).unwrap();
+            dev.reset_fences(&[head.fence]).unwrap();
+            self.queue_submit_routed(&submit, head.fence).expect("queue submit");
+            dev.wait_for_fences(&[head.fence], true, u64::MAX).unwrap();
         }
     }
 

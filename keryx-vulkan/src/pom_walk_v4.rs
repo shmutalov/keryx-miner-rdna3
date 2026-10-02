@@ -11,11 +11,15 @@
 use crate::{GpuBuffer, Kernel, Vk};
 use std::io::Cursor;
 
-/// SPIR-V for the v4 walk, compiled from `shaders/pom_walk_v4.comp` by build.rs.
+/// SPIR-V for the v4 walk and its seed pre-pass, compiled from `shaders/` by build.rs.
 const POM_WALK_V4_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pom_walk_v4.spv"));
+const POM_SEED_V4_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pom_seed_v4.spv"));
+
+/// Invocations per workgroup of the seed pre-pass (`local_size_x` in pom_seed_v4.comp).
+const SEED_WG: u32 = 64;
 
 /// Nonces per workgroup — MUST match `NPW` in pom_walk_v4.comp (local_size = 32 x NPW).
-pub const V4_NPW: u32 = 4;
+pub const V4_NPW: u32 = 1;
 
 /// Canonical 32 B chunks per 1 KB tile (`pom_v4::POM_V4_TILE_CHUNKS`).
 pub const V4_TILE_CHUNKS: u64 = 32;
@@ -31,20 +35,30 @@ const V4_LUT_MAX_ENTRIES: u64 = 1 << 20;
 
 const NO_WINNER: u32 = 0xFFFF_FFFF;
 
-/// Push-constant block — layout MUST match `Push` in pom_walk_v4.comp (std430: twelve u64 at
-/// 0..96, four u32 at 96..112; 112 bytes).
+/// Walk push-constant block — layout MUST match `Push` in pom_walk_v4.comp (std430: six u64 at
+/// 0..48, four u32 at 48..64; 64 bytes).
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct V4Push {
     p: [u64; 4],
-    s: [u64; 4],
-    timestamp: u64,
     n_tiles: u64,
     inv_n: u64,
-    start_nonce: u64,
     batch: u32,
     t_count: u32,
     lut_sh: u32,
+    /// Always 0: the shader's rho8 uses it as a bit-field offset the compiler can't fold.
+    zero: u32,
+}
+
+/// Seed pre-pass push-constant block — layout MUST match `Push` in pom_seed_v4.comp (std430: six
+/// u64 at 0..48, two u32 at 48..56; 56 bytes).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SeedPush {
+    s: [u64; 4],
+    timestamp: u64,
+    start_nonce: u64,
+    batch: u32,
     seed_h10: u32,
 }
 
@@ -78,6 +92,9 @@ pub struct V4Job {
 /// that also owns the `Vk`; released through [`destroy`](Self::destroy) before that `Vk` drops.
 pub struct PomWalkV4 {
     kernel: Kernel,
+    seed_kernel: Kernel,
+    /// Per-nonce seeds of one dispatch, written by the pre-pass and read by the walk (VRAM only).
+    seeds: GpuBuffer,
     io: GpuBuffer,
     prefix: GpuBuffer,
     addrs: GpuBuffer,
@@ -108,7 +125,12 @@ impl PomWalkV4 {
         let (lut, lut_sh) = build_lut(prefix);
 
         let spirv = ash::util::read_spv(&mut Cursor::new(POM_WALK_V4_SPV)).map_err(|e| e.to_string())?;
-        let kernel = vk.make_kernel(&spirv, 4, std::mem::size_of::<V4Push>() as u32)?;
+        // wave32: each 32-invocation nonce slot is exactly one full wave on RDNA (driver default
+        // where subgroup size control is unavailable, e.g. on ggml's borrowed device).
+        let kernel = vk.make_kernel_with_subgroup(&spirv, 5, std::mem::size_of::<V4Push>() as u32, Some(32))?;
+        let seed_spirv = ash::util::read_spv(&mut Cursor::new(POM_SEED_V4_SPV)).map_err(|e| e.to_string())?;
+        let seed_kernel = vk.make_kernel(&seed_spirv, 2, std::mem::size_of::<SeedPush>() as u32)?;
+        let seeds = vk.create_device_local_buffer(V4_MAX_DISPATCH_NONCES as u64 * 8)?;
         let io = vk.create_buffer_vram_mapped(std::mem::size_of::<V4Io>() as u64)?;
         let prefix_buf = vk.create_buffer_vram_mapped((prefix.len() * 8) as u64)?;
         vk.write_buffer(&prefix_buf, as_bytes(prefix));
@@ -119,6 +141,8 @@ impl PomWalkV4 {
 
         Ok(Self {
             kernel,
+            seed_kernel,
+            seeds,
             io,
             prefix: prefix_buf,
             addrs: addrs_buf,
@@ -144,19 +168,29 @@ impl PomWalkV4 {
         while done < batch {
             let sub = (batch - done).min(V4_MAX_DISPATCH_NONCES);
             vk.write_buffer(&self.io, struct_bytes(&io));
-            let push = V4Push {
-                p: job.pow_words,
+            let seed_push = SeedPush {
                 s: job.seed_words,
                 timestamp: job.timestamp,
+                start_nonce: start.wrapping_add(done as u64),
+                batch: sub,
+                seed_h10: job.h10_state.is_some() as u32,
+            };
+            let push = V4Push {
+                p: job.pow_words,
                 n_tiles: self.n_tiles,
                 inv_n: self.inv_n,
-                start_nonce: start.wrapping_add(done as u64),
                 batch: sub,
                 t_count: self.t_count,
                 lut_sh: self.lut_sh,
-                seed_h10: job.h10_state.is_some() as u32,
+                zero: 0,
             };
-            vk.dispatch(&self.kernel, &[&self.io, &self.prefix, &self.addrs, &self.lut], struct_bytes(&push), sub.div_ceil(V4_NPW));
+            // Seeds first, then the walk that reads them — one submit, barrier in between.
+            let seed_bufs: [&GpuBuffer; 2] = [&self.io, &self.seeds];
+            let walk_bufs: [&GpuBuffer; 5] = [&self.io, &self.prefix, &self.addrs, &self.lut, &self.seeds];
+            vk.dispatch_seq(&[
+                (&self.seed_kernel, &seed_bufs[..], struct_bytes(&seed_push), sub.div_ceil(SEED_WG)),
+                (&self.kernel, &walk_bufs[..], struct_bytes(&push), sub.div_ceil(V4_NPW)),
+            ]);
 
             let mut out = [0u8; 4];
             vk.read_buffer(&self.io, &mut out);
@@ -174,6 +208,8 @@ impl PomWalkV4 {
         vk.destroy_buffer(&self.addrs);
         vk.destroy_buffer(&self.prefix);
         vk.destroy_buffer(&self.io);
+        vk.destroy_buffer(&self.seeds);
+        vk.destroy_kernel(&self.seed_kernel);
         vk.destroy_kernel(&self.kernel);
     }
 }
@@ -251,7 +287,8 @@ mod tests {
 
     #[test]
     fn push_and_io_layouts_match_the_shader() {
-        assert_eq!(std::mem::size_of::<V4Push>(), 112);
+        assert_eq!(std::mem::size_of::<V4Push>(), 64);
+        assert_eq!(std::mem::size_of::<SeedPush>(), 56);
         assert_eq!(std::mem::size_of::<V4Io>(), 240);
     }
 }
