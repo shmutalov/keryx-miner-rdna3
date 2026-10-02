@@ -7,7 +7,7 @@ use std::ffi::OsStr;
 
 use clap::{App, FromArgMatches, IntoApp};
 use keryx_miner::PluginManager;
-use log::{error, info};
+use log::{error, info, warn};
 use rand::{thread_rng, RngCore};
 use std::fs;
 use std::sync::atomic::AtomicU16;
@@ -91,9 +91,16 @@ fn spawn_shutdown_handler() {
             }
             info!("Received Ctrl-C — shutting down.");
         }
+        // Give the client loop a moment to flush the escrow journal (funds-critical), then
+        // exit regardless — a stuck flush must never block a supervisor stop.
+        SHUTDOWN.notify_waiters();
+        tokio::time::sleep(Duration::from_secs(3)).await;
         std::process::exit(0);
     });
 }
+
+/// Signalled by the shutdown handler; `client_main` flushes escrow state and exits on it.
+static SHUTDOWN: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
 fn filter_plugins(dirname: &str) -> Vec<String> {
     match fs::read_dir(dirname) {
@@ -214,6 +221,7 @@ async fn get_client(
     block_template_ctr: Arc<AtomicU16>,
     escrow_privkey: Option<String>,
     escrow_state_file: String,
+    escrow_cert: Option<String>,
     ipfs_url: String,
 ) -> Result<Box<dyn Client + 'static>, Error> {
     if keryxd_address.starts_with("stratum+tcp://") {
@@ -233,9 +241,9 @@ async fn get_client(
             keryxd_address.clone(),
             mining_address.clone(),
             mine_when_not_synced,
-            Some(block_template_ctr.clone()),
             escrow_privkey,
             escrow_state_file,
+            escrow_cert,
             ipfs_url,
         )
         .await?)
@@ -249,6 +257,7 @@ async fn client_main(
     block_template_ctr: Arc<AtomicU16>,
     plugin_manager: &PluginManager,
     escrow_privkey: Option<String>,
+    escrow_cert: Option<String>,
 ) -> Result<(), Error> {
     // IPFS is only needed to serve/fetch OPoI model files; skip it in PoW-only test mode.
     if !keryx_miner::pow_only() {
@@ -265,6 +274,7 @@ async fn client_main(
         block_template_ctr.clone(),
         escrow_privkey,
         opt.escrow_state_file.clone(),
+        escrow_cert,
         opt.ipfs_url.clone(),
     )
     .await?;
@@ -274,9 +284,22 @@ async fn client_main(
     }
     client.register().await?;
     let mut miner_manager = MinerManager::new(client.get_block_channel(), opt.num_threads, plugin_manager);
-    client.listen(&mut miner_manager).await?;
+    let shutdown = SHUTDOWN.notified();
+    tokio::pin!(shutdown);
+    let listen_result = tokio::select! {
+        r = client.listen(&mut miner_manager) => r,
+        _ = &mut shutdown => {
+            if let Err(e) = client.flush_escrow_state() {
+                error!("Escrow final flush failed: {}", e);
+            }
+            std::process::exit(0);
+        }
+    };
+    if let Err(e) = client.flush_escrow_state() {
+        warn!("Escrow state flush failed: {}", e);
+    }
     drop(miner_manager);
-    Ok(())
+    listen_result
 }
 
 /// Tokio async worker count. The miner's async workload is tiny (one gRPC/stratum connection +
@@ -411,14 +434,14 @@ async fn run() -> Result<(), Error> {
                 batch_cap: 0,
                 cap_set_daa: 0,
                 is_inference: false,
+                csv_window: escrow::csv_window_for_daa(a.confirm_daa as u64),
             })
             .collect();
 
         let total_sompi: u64 = entries.iter().map(|e| e.amount_sompi).sum();
         let count = entries.len();
-        let state = escrow::EscrowState { entries };
-        let json = serde_json::to_string_pretty(&state)?;
-        fs::write(&opt.escrow_state_file, &json)?;
+        let state = escrow::EscrowState { entries, journal_seq: 0 };
+        escrow::save_state_atomic(std::path::Path::new(&opt.escrow_state_file), &state)?;
 
         info!(
             "Recovered {} escrow entries — claimable: {:.4} KRX",
@@ -439,6 +462,76 @@ async fn run() -> Result<(), Error> {
             error!("Failed to load/generate OPoI escrow key: {}", e);
             return Err(e.into());
         }
+    };
+
+    // Escrow delegation cert: binds the escrow key to the payout address. From H6 (past on every
+    // network) a solo coinbase without a valid `/escrow:` + `/esig:` pair is an invalid block, so
+    // a missing or bad cert stops the miner here instead of producing rejected blocks. Pool mining
+    // does not need it — the pool builds the coinbase.
+    let solo = opt.keryxd_address.starts_with("grpc://");
+    let escrow_cert: Option<String> = match (&escrow_privkey, opt.mining_address.as_deref()) {
+        (Some(privkey), Some(address)) if solo => {
+            let escrow_pubkey_hex = escrow::pubkey_hex_from_privkey(privkey)?;
+            // Printed on every start: this public key is what the operator pastes into their
+            // wallet to authorise this miner.
+            info!("Escrow key to authorise in your wallet: {}", escrow_pubkey_hex);
+            // An explicitly supplied cert wins; otherwise the miner signs its own when the payout
+            // address is its escrow key's; otherwise the file, for a payout key held in a wallet.
+            let supplied = opt.escrow_cert.as_deref().map(|c| {
+                let cert = c.trim().to_ascii_lowercase();
+                escrow::verify_escrow_cert(address, &escrow_pubkey_hex, &cert).map(|()| cert)
+            });
+            let resolved = match supplied {
+                Some(Ok(cert)) => {
+                    info!("Escrow delegation cert taken from --escrow-cert.");
+                    match escrow::save_cert(&opt.escrow_cert_file, &cert) {
+                        Ok(true) => info!(
+                            "Escrow delegation cert saved to '{}' — future starts need no --escrow-cert.",
+                            opt.escrow_cert_file
+                        ),
+                        Ok(false) => {}
+                        Err(e) => warn!(
+                            "Could not persist escrow cert to '{}': {} (running this session anyway).",
+                            opt.escrow_cert_file, e
+                        ),
+                    }
+                    Ok(cert)
+                }
+                Some(Err(e)) => Err(e),
+                None => match escrow::self_sign_cert(privkey, address) {
+                    Some(cert) => {
+                        info!("Payout address is this miner's escrow key — delegation signed locally, nothing to set up.");
+                        Ok(cert)
+                    }
+                    None => escrow::load_cert(&opt.escrow_cert_file, address, &escrow_pubkey_hex).map(|cert| {
+                        info!("Escrow delegation cert loaded from '{}'.", opt.escrow_cert_file);
+                        cert
+                    }),
+                },
+            };
+            match resolved {
+                Ok(cert) => Some(cert),
+                Err(e) => {
+                    let guidance = [
+                        e,
+                        String::new(),
+                        "This miner works for your payout address, and your wallet has to say so once.".to_string(),
+                        String::new(),
+                        "  1. Open your wallet, card \"Authorise a miner\", and paste this escrow key:".to_string(),
+                        format!("       {}", escrow_pubkey_hex),
+                        "  2. Copy the line it returns and add it to this miner:".to_string(),
+                        "       --escrow-cert <the 128 hex characters>".to_string(),
+                        String::new(),
+                        format!("Signed once, valid for as long as you keep this address and '{}'.", opt.escrow_key_file),
+                        format!("Mine with this exact address: {}", address),
+                    ]
+                    .join("\n");
+                    error!("{}", guidance);
+                    return Err(guidance.into());
+                }
+            }
+        }
+        _ => None,
     };
 
     // Phase-3 OPoI / PoM: load inference models before mining starts. Under PoM each tier
@@ -568,7 +661,9 @@ async fn run() -> Result<(), Error> {
     let mut short_sessions: u32 = 0;
     loop {
         let started = std::time::Instant::now();
-        match client_main(&opt, block_template_ctr.clone(), &plugin_manager, escrow_privkey.clone()).await {
+        match client_main(&opt, block_template_ctr.clone(), &plugin_manager, escrow_privkey.clone(), escrow_cert.clone())
+            .await
+        {
             Ok(_) => info!("Client closed gracefully"),
             Err(e) => error!("Client closed with error {:?}", e),
         }

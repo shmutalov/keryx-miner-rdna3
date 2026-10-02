@@ -298,13 +298,13 @@ pub fn probe_gpu_inference() -> GpuProbe {
 pub fn prefetch_models(specs: &'static [&'static ModelSpec]) -> Result<()> {
     for spec in specs {
         log::debug!("SlmEngine: prefetching model '{}'…", spec.name);
-        // The whole H4 lineup is GGUF (llama-served); the format only routes the prompt template.
+        // The whole H6 lineup is GGUF (llama-served); the format only routes the prompt template.
         let result = match spec.format {
             ModelFormat::Gguf
-            | ModelFormat::GgufExaone4
             | ModelFormat::GgufGlm4
             | ModelFormat::GgufQwen35
-            | ModelFormat::GgufKimiLinear => ensure_gguf(spec).map(|_| ()),
+            | ModelFormat::GgufKimiLinear
+            | ModelFormat::GgufGemma4 => ensure_gguf(spec).map(|_| ()),
         };
         match result {
             Ok(()) => log::debug!("SlmEngine: '{}' files ready.", spec.name),

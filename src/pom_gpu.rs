@@ -54,12 +54,20 @@ impl Resident {
         }
     }
 
+    /// PoM v4 grind (see [`keryx_vulkan::pom_walk_v4::PomWalkV4::mine`]).
+    fn mine_v4(&self, job: &keryx_vulkan::pom_walk_v4::V4Job, start: u64, batch: u32) -> Option<u64> {
+        match self {
+            Resident::Blob(m) => m.mine_v4(job, start, batch),
+            Resident::Shared { walk, .. } => walk.mine_v4(job, start, batch),
+        }
+    }
+
     /// EXTRA VRAM the miner itself holds for this entry: the blob's n_chunks*32, or 0 for the
     /// shared walk (weights belong to the inference engine either way).
     fn extra_vram_bytes(&self) -> u64 {
         match self {
             Resident::Blob(m) => m.n_chunks() * 32,
-                    Resident::Shared { .. } => 0,
+            Resident::Shared { .. } => 0,
         }
     }
 }
@@ -148,6 +156,48 @@ pub fn mine(
     let p = crate::pom::pph_words_for_era(pre_pow_hash, h3);
     let s = crate::pom::seed_pph_words_for_era(pre_pow_hash, h3, h5_1, h5_2);
     m.mine(&p, &s, timestamp, target_le, start, batch, walk_v2)
+}
+
+/// Default PoM v4 nonces per `mine_v4` call. A v4 nonce costs ~256 dependent 1 KB tile reads plus
+/// a 32x32 int8 matmul per step, so a batch must stay short enough to pick up a new template
+/// promptly at 10 BPS; `KERYX_POM_V4_BATCH` overrides.
+const POM_V4_BATCH_DEFAULT: u64 = 1 << 15;
+
+/// The PoM v4 batch for this process (`KERYX_POM_V4_BATCH`, else [`POM_V4_BATCH_DEFAULT`]).
+pub fn v4_batch() -> u64 {
+    static BATCH: OnceLock<u64> = OnceLock::new();
+    *BATCH.get_or_init(|| {
+        std::env::var("KERYX_POM_V4_BATCH")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&b| b > 0)
+            .unwrap_or(POM_V4_BATCH_DEFAULT)
+    })
+}
+
+/// PoM v4 search of nonces `[start, start + batch)` on `device` for a block at `daa` (>= the v4
+/// gate). The seed era (H10 keccak vs the pre-H10 v4-salted fold) comes from `daa` through the
+/// same `pom` helpers the host proof build uses, so a GPU winner always re-walks to the same
+/// `final_state` on the host. None if not installed or no winner.
+pub fn mine_v4(
+    device: u32,
+    pre_pow_hash: &[u8; 32],
+    timestamp: u64,
+    target_le: &[u8; 32],
+    start: u64,
+    batch: u64,
+    daa: u64,
+) -> Option<u64> {
+    let m = miner_on(device)?;
+    let h10 = daa >= crate::pom::h10_activation_daa();
+    let job = keryx_vulkan::pom_walk_v4::V4Job {
+        pow_words: crate::pom::pph_words_for_era(pre_pow_hash, true),
+        seed_words: crate::pom::pph_words_v4(pre_pow_hash),
+        timestamp,
+        h10_state: h10.then(|| crate::pom::pom_seed_h10_state(pre_pow_hash, timestamp)),
+        target_le: *target_le,
+    };
+    m.mine_v4(&job, start, batch.min(u32::MAX as u64) as u32)
 }
 
 /// Ensure the GPU PoM miner is installed on `device`; build the host possession index (first

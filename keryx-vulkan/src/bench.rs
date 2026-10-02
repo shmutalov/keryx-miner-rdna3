@@ -8,6 +8,7 @@
 //!   * `wave32`   — identical math, `local_size_x = 32` (native RDNA3 wave width)
 //!   * `magic`    — hardware `%` replaced by a precomputed libdivide multiply-shift
 //!   * `ilp4`     — 4 independent nonces per thread (4× memory-level parallelism)
+//!   * `vec2`     — production kernel with the 32-byte chunk read as 2× `u64vec2` (128-bit loads)
 //!
 //! Every variant is first checked BIT-EXACT against a host reference (an exact copy of the
 //! `src/pom.rs` folds) on a small blob; a variant that fails verification is reported and excluded
@@ -16,6 +17,9 @@
 //! Run:  `cargo run -p keryx-vulkan --example bench_pom_walk --features bench --release`
 //! Env:  POM_BENCH_BLOB_MB (default 1024)  POM_BENCH_NONCES (default 16777216)  POM_BENCH_ITERS (default 5)
 //!       POM_BENCH_WALK_V2 (default 1 — the live H5 era; set 0 to measure the frozen pre-H5 fold)
+//!       POM_BENCH_VARIANTS (CSV subset + ORDER, e.g. `vec2,baseline`) — variants are timed
+//!         sequentially, so the GPU is hotter/lower-clocked for whatever runs last. Any claimed
+//!         delta under ~2% MUST be re-run with the order reversed before it is believed.
 //!
 //! ─────────────────────────────────────────────────────────────────────────────────────────────
 //! H5 FINDING (2026-07-25, RX 7900 XT, 1 GiB blob) — the H5 `transition_v2` is FREE on RDNA3:
@@ -32,20 +36,45 @@
 //! If a rig reports a large post-H5 hashrate drop, look OUTSIDE the walk (OPoI inference pauses,
 //! model load/index build stalls, tier reassignment, clocks) — not at these kernels.
 //!
-//! FINDINGS (RX 7900 XT, 20 GiB, driver 32.0.31019.2002, 1 GiB blob) — READ THIS BEFORE OPTIMIZING:
+//! ─────────────────────────────────────────────────────────────────────────────────────────────
+//! METHODOLOGY WARNING (2026-07-28) — variants are timed SEQUENTIALLY in one process, so the GPU
+//! is progressively hotter and lower-clocked for whatever runs last. This is worth several percent
+//! and it silently penalises the tail of the list. Measured, same build, same 8 GiB blob:
 //!
-//!   variant    median MH/s   vs baseline
-//!   baseline      ~20.0          —
-//!   wave32        ~19.7        -1.3%
-//!   magic         ~18.6        -7.1%
-//!   ilp4          ~18.2        -9.0%
+//!   vec2 as the 5th variant (baseline first) ........ -8.2% vs baseline
+//!   vec2 as the 1st variant (baseline second) ....... -1.0% vs baseline
+//!   vec2 as the 2nd of only two ..................... -0.5% vs baseline
 //!
-//! Every perturbation REGRESSED. What each one rules out:
+//! Same kernel, three different answers. ALWAYS re-run a candidate with `POM_BENCH_VARIANTS`
+//! reversed (and ideally as a 2-variant A/B) before believing any delta under ~2%. The pre-2026-07-28
+//! magnitudes in the table below were measured with the 5-variant sequential sweep and are therefore
+//! INFLATED; the sign is right, the size is not.
+//!
+//! FINDINGS (RX 7900 XT, 20 GiB, driver 32.0.31019.2002) — READ THIS BEFORE OPTIMIZING:
+//!
+//!   variant    1 GiB blob    8 GiB blob (clean A/B)   verdict
+//!   baseline     19.87           18.53                  —
+//!   wave32       19.90           18.71 *                neutral
+//!   magic        19.80           17.78 *                neutral→slower
+//!   ilp4         19.50           17.61 *                slower
+//!   vec2         19.76           18.43                  neutral, NOT ported
+//!   (* still from the confounded 5-variant sweep — treat as an upper bound on the regression)
+//!
+//! No perturbation has ever BEATEN baseline. What each one rules out:
 //!   * magic slower  → the walk is NOT ALU/modulo-bound; the hardware 64-bit `%` is already fully
 //!                     hidden under memory-stall latency, so removing it only adds register pressure.
 //!   * wave32 slower → occupancy/wave-width is not the lever; the default wave64 packs better here.
 //!   * ilp4 slower   → the memory system is ALREADY saturated at 1 nonce/thread; more per-thread
 //!                     outstanding reads don't add throughput, they just cost registers → occupancy.
+//!   * vec2 flat     → load WIDTH is not the lever on RDNA3. Reading the 32-byte chunk as 2x
+//!                     `u64vec2` instead of 4x scalar `uint64_t` changes nothing measurable, which
+//!                     means the driver was already coalescing the four 8-byte loads (they are
+//!                     independent within a step and to the same 32-byte line), OR the per-step cost
+//!                     is pure dependent-fetch latency that no issue-side change can touch.
+//!                     This is the direct port of upstream keryx-miner 02fe488, which reported
+//!                     ~+47% on a 3090 (GDDR6X) and only +1.8% on H200 (HBM) — the gain is
+//!                     NVIDIA-LSU-specific and does not transfer. Verified bit-exact here, so the
+//!                     null result is a real measurement, not a broken kernel.
 //!
 //! Conclusion: the baseline kernel sits at a local optimum on RDNA3. ~20 MH/s is the practical
 //! ceiling for this GPU on the consensus-fixed walk (256 dependent random 32-byte reads/nonce over
@@ -65,6 +94,7 @@ const BASELINE_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pom_walk.s
 const WAVE32_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pom_walk_wave32.spv"));
 const MAGIC_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pom_walk_magic.spv"));
 const ILP4_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pom_walk_ilp4.spv"));
+const VEC2_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pom_walk_vec2.spv"));
 
 /// Nonces per invocation for the ILP variant — MUST match `const uint G` in pom_walk_ilp4.comp.
 const ILP4_G: u32 = 4;
@@ -465,8 +495,24 @@ pub fn run() {
     // 257 chunks (non-power-of-two) exercises the magic branchfree path; 256 exercises the
     // is_pow2 mask fast-path.
     println!("== bit-exactness ==");
+    // POM_BENCH_VARIANTS selects BOTH the subset and the run order — see the module docs on why
+    // reversing the order is mandatory before believing a small delta.
+    const ALL_VARIANTS: [&str; 5] = ["baseline", "wave32", "magic", "ilp4", "vec2"];
+    let selected: Vec<&'static str> = match std::env::var("POM_BENCH_VARIANTS") {
+        Ok(s) => s
+            .split(',')
+            .filter_map(|want| {
+                let want = want.trim();
+                ALL_VARIANTS.iter().copied().find(|v| *v == want).or_else(|| {
+                    eprintln!("unknown variant '{want}' — ignored (known: {})", ALL_VARIANTS.join(","));
+                    None
+                })
+            })
+            .collect(),
+        Err(_) => ALL_VARIANTS.to_vec(),
+    };
     let mut ok_variants: Vec<&'static str> = Vec::new();
-    for &vn in &["baseline", "wave32", "magic", "ilp4"] {
+    for &vn in &selected {
         let mut all_ok = true;
         for &nc in &[257u64, 256u64] {
             selftest_magic(nc); // host-only sanity for the magic used at this n_chunks
@@ -523,7 +569,9 @@ pub fn run() {
     let shard_shift = SHARD_CHUNKS.trailing_zeros();
 
     println!("{:<10} {:>10} {:>10} {:>10}   {:>8}", "variant", "min MH/s", "med MH/s", "max MH/s", "vs base");
-    let mut baseline_med = 0.0f64;
+    // Collected then printed after the sweep: with POM_BENCH_VARIANTS the baseline may not run
+    // first, so "vs base" cannot be resolved until every median is in.
+    let mut results: Vec<(&'static str, f64, f64, f64)> = Vec::with_capacity(ok_variants.len());
     for &vn in &ok_variants {
         let variant = match build_named(&vk, vn, n_chunks) {
             Ok(v) => v,
@@ -549,14 +597,16 @@ pub fn run() {
             median(rates.clone()),
             rates.iter().cloned().fold(0.0, f64::max),
         );
-        if vn == "baseline" {
-            baseline_med = md;
-        }
-        let vs = if baseline_med > 0.0 { format!("{:+.1}%", (md / baseline_med - 1.0) * 100.0) } else { "—".into() };
-        println!("{:<10} {:>10.2} {:>10.2} {:>10.2}   {:>8}", vn, mn, md, mx, vs);
+        results.push((vn, mn, md, mx));
         vk.destroy_kernel(&variant.kernel);
     }
+    let baseline_med = results.iter().find(|(n, ..)| *n == "baseline").map(|(_, _, md, _)| *md).unwrap_or(0.0);
+    for (vn, mn, md, mx) in &results {
+        let vs = if baseline_med > 0.0 { format!("{:+.1}%", (md / baseline_med - 1.0) * 100.0) } else { "—".into() };
+        println!("{:<10} {:>10.2} {:>10.2} {:>10.2}   {:>8}", vn, mn, md, mx, vs);
+    }
     println!("\n(median is the comparison figure; 'vs base' is median vs baseline median)");
+    println!("(variants ran in the order listed — re-run with POM_BENCH_VARIANTS reversed to rule out thermal drift)");
 }
 
 /// Build the named variant with the correct magic for `n_chunks`.
@@ -566,6 +616,10 @@ fn build_named(vk: &Vk, name: &str, n_chunks: u64) -> Result<Variant, String> {
         "wave32" => make_variant(vk, "wave32", WAVE32_SPV, 32, 1, None, false),
         "magic" => make_variant(vk, "magic", MAGIC_SPV, 64, 1, Some(magic_gen(n_chunks)), false),
         "ilp4" => make_variant(vk, "ilp4", ILP4_SPV, 64, ILP4_G, None, false),
+        // `prod: true` — vec2 carries the PRODUCTION push layout and buffer-side target, so it
+        // differs from `baseline` in exactly one way: the width of the chunk load. Anything else
+        // would confound the measurement.
+        "vec2" => make_variant(vk, "vec2", VEC2_SPV, 64, 1, None, true),
         other => Err(format!("unknown variant {other}")),
     }
 }

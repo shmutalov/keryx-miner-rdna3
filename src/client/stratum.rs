@@ -8,6 +8,7 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 
+mod ai;
 mod statum_codec;
 
 use crate::client::stratum::statum_codec::{ErrorCode, MiningNotify, MiningSubmit, NewLineJsonCodecError, StratumLine};
@@ -34,7 +35,8 @@ use tokio_stream::wrappers::ReceiverStream;
 
 //const DIFFICULTY_1_TARGET: Uint256 = Uint256([0x00000000ffff0000, 0x0000000000000000, 0x0000000000000000, 0x0000000000000000]);
 const DIFFICULTY_1_TARGET: (u64, i16) = (0xffffu64, 208); // 0xffff 2^208
-const KERYX_STRATUM_DAA_CAPABILITY: &str = "keryx-stratum-v2";
+// v3: notifies carry the block's compact bits (v2 forms are still decoded for older bridges).
+const KERYX_STRATUM_DAA_CAPABILITY: &str = "keryx-stratum-v3";
 const LOG_RATE: Duration = Duration::from_secs(30);
 const CHALLENGE_MAX_TOKENS: usize = 128;
 
@@ -103,6 +105,25 @@ static SHARE_STATS: OnceLock<Arc<ShareStats>> = OnceLock::new();
 /// hashing kHeavyHash post-fork and submits an empty/invalid PoM proof the pool rejects. Remembering
 /// the last real daa lets `Short` inherit it so PoM activates. (Ported from keryx-miner-supr v0.6.3.)
 static LAST_DAA_SCORE: AtomicU64 = AtomicU64::new(0);
+
+/// Share target for a job: the pool target, or the block's own target when that is easier (a v3
+/// notify carries the block bits). With the pool difficulty set above the network's — right after
+/// a relaunch difficulty reset — a nonce that solves the block would otherwise be discarded.
+fn effective_target(pool_target: Uint256, block_bits: Option<u32>) -> Result<Uint256, Error> {
+    let Some(bits) = block_bits else {
+        return Ok(pool_target);
+    };
+    let size = bits >> 24;
+    let mantissa = bits & 0x007fffff;
+    if bits & 0x00800000 != 0 || size > 34 || (size > 33 && mantissa > 0xff) || (size > 32 && mantissa > 0xffff) {
+        return Err("Invalid block target".into());
+    }
+    let target = crate::target::u256_from_compact_target(bits);
+    if target == Uint256::default() {
+        return Err("Invalid block target".into());
+    }
+    Ok(pool_target.max(target))
+}
 
 impl Display for ShareStats {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -175,6 +196,8 @@ pub struct StratumHandler {
     inference_cache: InferenceCache,
     /// True while a capability challenge inference is in flight — prevents duplicate spawns.
     challenge_in_flight: Arc<AtomicBool>,
+    /// Stratum id of the in-flight `mining.ai_response`, until the bridge acknowledges it.
+    ai_response_pending: Arc<Mutex<Option<u32>>>,
 }
 
 #[async_trait(?Send)]
@@ -192,17 +215,13 @@ impl Client for StratumHandler {
                 payload: StratumLinePayload::StratumCommand(StratumCommand::Subscribe(
                     MiningSubscribe::MiningSubscribeOptions((
                         // suprnova's bridge version-gates PoM shares by the reported keryx-miner-supr
-                        // version (post-H2 it rejected <= v0.6.3.6; post-H4 it demanded >= v0.7.0;
-                        // post-H5 it first demanded >= v0.9.0, then >= v0.9.2 once H5.2 landed:
-                        // "miners below v0.9.2 are rejected and mine dead work"). This build IS
-                        // H5.2-aware: the walk uses the non-foldable
-                        // `transition_v2` at/after `pom::h5_activation_daa()`, the seed fold takes
-                        // the H5.1 salt at `pom::h5_1_activation_daa()` then the H5.2 salt at
-                        // `pom::h5_2_activation_daa()`, and `pom_tier_index` emits
-                        // the H5 tier table (tier 0 = Qwen3-8B-abliterated) — so advertise the first
-                        // version that clears the current floor. Bump this single string if the pool
-                        // raises the floor again. (Real build: keryx-miner/CARGO_PKG_VERSION.)
-                        "keryx-miner-supr/0.9.2.0".to_string(),
+                        // version, raising the floor at every hardfork (H4 >= 0.7.0, H5.2 >= 0.9.2,
+                        // H10 >= 0.12.0 — the mandatory one-way-seed release). This build mines the
+                        // live consensus: PoM v4 (D=32 re-walk) with the H10 keccak seed, the H6
+                        // header fields, and stratum-v3 notifies (supr >= 0.13.0) — so advertise the
+                        // current supr release. Bump this single string if the pool raises the floor
+                        // again. (Real build: keryx-miner/CARGO_PKG_VERSION.)
+                        "keryx-miner-supr/0.13.3.0".to_string(),
                         KERYX_STRATUM_DAA_CAPABILITY.into(),
                     )),
                 )),
@@ -360,6 +379,7 @@ impl StratumHandler {
             current_task_slot,
             inference_cache,
             challenge_in_flight: Arc::new(AtomicBool::new(false)),
+            ai_response_pending: Arc::new(Mutex::new(None)),
         }))
     }
 
@@ -477,6 +497,8 @@ impl StratumHandler {
                                 if removed.is_some() {
                                     self.shares_stats.accepted.fetch_add(1, Ordering::SeqCst);
                                     info!("Share accepted");
+                                } else if self.take_ai_response_ack(id).await {
+                                    info!("AI response accepted by the pool");
                                 } else {
                                     info!("{:?} (Last: {})", msg.clone(), self.last_stratum_id.load(Ordering::SeqCst));
                                     warn!("Ignoring result for now");
@@ -502,14 +524,27 @@ impl StratumHandler {
                             ref nonce_size,
                         ))) => self.set_extranonce(extranonce.as_str(), nonce_size),
                         StratumCommand::MiningSetDifficulty((ref difficulty,)) => self.set_difficulty(difficulty),
-                        // Phase 2 OPoI: bridge dispatches an AiRequest task alongside the block.
-                        StratumCommand::MiningNotify(MiningNotify::MiningNotifyWithTask((
-                            id,
-                            header_hash,
-                            timestamp,
-                            daa_score,
-                            task_json,
-                        ))) => {
+                        // Every notify form that carries the real DAA score: v3 (with the block's compact
+                        // bits) and v2, each with or without an AiRequest task (Phase 2 OPoI).
+                        StratumCommand::MiningNotify(
+                            notify @ (MiningNotify::MiningNotifyWithTaskV3(_)
+                            | MiningNotify::MiningNotifyShortV3(_)
+                            | MiningNotify::MiningNotifyWithTask(_)
+                            | MiningNotify::MiningNotifyShortV2(_)),
+                        ) => {
+                            let (id, header_hash, timestamp, daa_score, block_bits, task_json) = match notify {
+                                MiningNotify::MiningNotifyWithTaskV3((id, hash, time, daa, bits, task)) => {
+                                    (id, hash, time, daa, Some(bits), Some(task))
+                                }
+                                MiningNotify::MiningNotifyShortV3((id, hash, time, daa, bits)) => {
+                                    (id, hash, time, daa, Some(bits), None)
+                                }
+                                MiningNotify::MiningNotifyWithTask((id, hash, time, daa, task)) => {
+                                    (id, hash, time, daa, None, Some(task))
+                                }
+                                MiningNotify::MiningNotifyShortV2((id, hash, time, daa)) => (id, hash, time, daa, None, None),
+                                _ => unreachable!("matched above"),
+                            };
                             self.block_template_ctr
                                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v + 1) % 10_000))
                                 .unwrap();
@@ -522,11 +557,16 @@ impl StratumHandler {
                                 }
                                 return miner.process_block(None).await;
                             }
-                            // PoW-only test mode: ignore the AiRequest task entirely and just mine.
-                            let inference_started = if keryx_miner::pow_only() {
-                                false
-                            } else {
-                                self.handle_ai_task(id.clone(), task_json, miner).await
+                            let target = effective_target(self.target_pool, block_bits)?;
+                            let inference_started = match task_json {
+                                // PoW-only test mode: ignore the AiRequest task entirely and just mine.
+                                Some(_) if keryx_miner::pow_only() => false,
+                                Some(task_json) => self.handle_ai_task(id.clone(), task_json, miner).await,
+                                None => {
+                                    // No AiRequest in this job — clear the task slot.
+                                    *self.current_task_slot.lock().await = None;
+                                    false
+                                }
                             };
                             if inference_started {
                                 // PoW already paused inside handle_ai_task — do NOT feed a new
@@ -540,7 +580,7 @@ impl StratumHandler {
                                         timestamp,
                                         daa_score,
                                         nonce: 0,
-                                        target: self.target_pool,
+                                        target,
                                         nonce_mask: self.nonce_mask,
                                         nonce_fixed: self.nonce_fixed,
                                         hash: None,
@@ -548,41 +588,6 @@ impl StratumHandler {
                                     }))
                                     .await
                             }
-                        }
-                        StratumCommand::MiningNotify(MiningNotify::MiningNotifyShortV2((
-                            id,
-                            header_hash,
-                            timestamp,
-                            daa_score,
-                        ))) => {
-                            self.block_template_ctr
-                                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v + 1) % 10_000))
-                                .unwrap();
-                            // Remember the real daa so plain `Short` notifies can inherit it (PoM gate).
-                            LAST_DAA_SCORE.store(daa_score, Ordering::Relaxed);
-                            // OPoI hard gate (mirrors solo grpc.rs): no models ready = no mining.
-                            if !keryx_miner::pow_only() && keryx_miner::slm::loaded_model_ids().is_empty() {
-                                if self.block_template_ctr.load(Ordering::SeqCst) % 200 == 0 {
-                                    warn!("OPoI: no models ready — mining suspended (no inference = no mining)");
-                                }
-                                return miner.process_block(None).await;
-                            }
-                            // No AiRequest in this job — clear the task slot.
-                            *self.current_task_slot.lock().await = None;
-                            miner
-                                .process_block(Some(PartialBlock {
-                                    id,
-                                    header_hash,
-                                    timestamp,
-                                    daa_score,
-                                    nonce: 0,
-                                    target: self.target_pool,
-                                    nonce_mask: self.nonce_mask,
-                                    nonce_fixed: self.nonce_fixed,
-                                    hash: None,
-                                    pom_proof: Vec::new(),
-                                }))
-                                .await
                         }
                         StratumCommand::MiningNotify(MiningNotify::MiningNotifyShort((id, header_hash, timestamp))) => {
                             self.block_template_ctr
@@ -621,6 +626,10 @@ impl StratumHandler {
                             self.handle_challenge(model_id_hex, nonce_hex, miner).await;
                             Ok(())
                         }
+                        StratumCommand::MiningAiRequest(fields) => {
+                            self.handle_ai_request(fields, miner).await;
+                            Ok(())
+                        }
                         _ => Err(format!("Unexpected stratum message: {:?}", msg).into()),
                     },
                     _ => Err(format!("Inconsistent stratum message: {:?}", msg).into()),
@@ -632,6 +641,10 @@ impl StratumHandler {
                 error: Some(StratumError(code, error, _)),
                 ..
             } => {
+                if self.take_ai_response_ack(Some(id)).await {
+                    warn!("AI response rejected by the pool: {}", error);
+                    return Ok(());
+                }
                 // Option, not unwrap(): a pool error for an id we never tracked (or already
                 // removed) must not panic — jobid is only used for the warn! below.
                 let jobid = self.shares_stats.shares_pending.lock().unwrap().remove(&id);
@@ -688,6 +701,71 @@ impl StratumHandler {
             }
             _ => Err(format!("Unhandled stratum response: {:?}", msg).into()),
         }
+    }
+
+    /// True (and cleared) when `id` acknowledges the in-flight `mining.ai_response`.
+    async fn take_ai_response_ack(&self, id: Option<u32>) -> bool {
+        let mut pending = self.ai_response_pending.lock().await;
+        if id.is_some() && *pending == id {
+            *pending = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Pool-dispatched inference (`mining.ai_request`): pause mining, run the request on the
+    /// served model, and answer with `mining.ai_response`. One request at a time, shared with
+    /// capability challenges; a busy or unready miner declines by staying silent.
+    async fn handle_ai_request(
+        &mut self,
+        fields: (String, String, String, String, String, u32, String),
+        miner: &mut MinerManager,
+    ) {
+        let request = match ai::AiRequest::parse(fields) {
+            Ok(request) => request,
+            Err(error) => {
+                warn!("Invalid AI request: {}", error);
+                return;
+            }
+        };
+        if keryx_miner::pow_only() || !keryx_miner::slm::is_model_ready(&request.model_id) {
+            warn!("AI request {:.16}: model is not ready", request.task_id);
+            return;
+        }
+        if self.ai_response_pending.lock().await.is_some() || self.challenge_in_flight.swap(true, Ordering::SeqCst) {
+            warn!("AI request {:.16}: inference is busy", request.task_id);
+            return;
+        }
+        let guard = ai::InferenceGuard::new(miner.opoi_challenge_flag(), self.challenge_in_flight.clone());
+        if let Err(error) = miner.process_block(None).await {
+            warn!("Could not pause mining for AI request: {}", error);
+            return;
+        }
+        info!("AI request {:.16}: running inference (max_tokens={})", request.task_id, request.max_tokens);
+        let sender = self.send_channel.clone();
+        // The username this connection authorized with.
+        let worker =
+            if self.worker.is_empty() { self.miner_address.clone() } else { format!("{}.{}", self.miner_address, self.worker) };
+        let pending = self.ai_response_pending.clone();
+        let last_id = self.last_stratum_id.clone();
+        task::spawn_blocking(move || {
+            let _guard = guard;
+            let result =
+                keryx_miner::slm::load_and_run_inference(&request.model_id, &request.prompt, request.max_tokens)
+                    .unwrap_or_default();
+            let id = last_id.fetch_add(1, Ordering::SeqCst);
+            match request.response(id, worker, &result) {
+                Ok(line) => {
+                    *pending.blocking_lock() = Some(id);
+                    if sender.blocking_send(line).is_err() {
+                        *pending.blocking_lock() = None;
+                        warn!("AI response {:.16}: connection closed", request.task_id);
+                    }
+                }
+                Err(error) => warn!("AI request {:.16}: {}", request.task_id, error),
+            }
+        });
     }
 
     fn set_difficulty(&mut self, difficulty: &f32) -> Result<(), Error> {

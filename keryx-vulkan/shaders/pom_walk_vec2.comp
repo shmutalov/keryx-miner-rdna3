@@ -1,0 +1,122 @@
+#version 460
+// BENCH-ONLY variant of pom_walk.comp — 128-bit vectorized chunk read.
+//
+// Identical to the production kernel in EVERY respect (same push layout, same binding-0 I/O block,
+// same local_size, same folds) except one thing: the 32-byte chunk is read as 2x `u64vec2` instead
+// of 4x scalar `uint64_t`, and both loads are issued BEFORE the era branch so their DRAM latencies
+// overlap. BYTE-EXACT: pair[0].xy = words 0,1 and pair[1].xy = words 2,3 on a little-endian GPU,
+// so the walk consumes the same words in the same order.
+//
+// Ports the idea behind upstream keryx-miner 02fe488 ("cuda: vectorize PoM chunk read, 2x
+// ulonglong2 — ~+47% on GDDR6X"), which took a 3090 from ~17 to ~25 MH/s. The walk is
+// memory-LATENCY-bound on RDNA3 too, so this is the one perturbation whose mechanism matches the
+// measured bottleneck (unlike magic/wave32/ilp4, which all regressed — see src/bench.rs).
+//
+// Keeping it as a separate file rather than editing pom_walk.comp means the shipping consensus
+// kernel is untouched until this proves bit-exact AND faster in the bench.
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference : require
+
+layout(local_size_x = 64) in; // RDNA3 wavefront width — same as production
+
+// Same shard layout as production, but viewed as 16-byte pairs so each load is a single 128-bit
+// fetch (`global_load_dwordx4` on RDNA3) instead of two 64-bit ones.
+//
+// `buffer_reference_align = 16` is sound here: every chunk address is `shard_base + local * 32`,
+// and a Vulkan buffer device address is at least 16-byte aligned (allocations come back 256-byte
+// aligned in practice), so `local * 32` preserves 16-byte alignment for both pairs.
+layout(std430, buffer_reference, buffer_reference_align = 16) readonly buffer Shard {
+    u64vec2 pair[];
+};
+
+// Binding-0 I/O block — byte-identical to production's `Io` (winner slot + 256-bit LE target).
+layout(std430, binding = 0) buffer Io {
+    uint offset;
+    uint _pad;
+    uint64_t t[4];
+} OUT;
+
+// One GPU device address per weight shard, in shard order.
+layout(std430, binding = 1) readonly buffer ShardAddrs { uint64_t addr[]; } SHARDS;
+
+// Byte-identical to production's `Push` (112 B) so the bench drives this with `ProdPush`.
+layout(push_constant) uniform Push {
+    uint64_t p0, p1, p2, p3;   // POW-fold pph words
+    uint64_t s0, s1, s2, s3;   // SEED-fold pph words
+    uint64_t timestamp;
+    uint64_t n_chunks;
+    uint64_t start_nonce;
+    uint64_t shard_mask;
+    uint k;
+    uint batch;
+    uint shard_shift;
+    uint walk_v2;
+} pc;
+
+uint64_t mix64(uint64_t x) {
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9UL;
+    x ^= x >> 27;
+    x *= 0x94d049bb133111ebUL;
+    x ^= x >> 31;
+    return x;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.batch) {
+        return;
+    }
+    uint64_t nonce = pc.start_nonce + uint64_t(idx);
+
+    uint64_t state = mix64(nonce ^ 0x4B65727978531UL);
+    state = mix64(state ^ pc.timestamp);
+    state = mix64(state ^ pc.s0);
+    state = mix64(state ^ pc.s1);
+    state = mix64(state ^ pc.s2);
+    state = mix64(state ^ pc.s3);
+
+    uint64_t off = state % pc.n_chunks;
+    for (uint i = 0u; i < pc.k; ++i) {
+        uint shard = uint(off >> pc.shard_shift);
+        uint64_t local = off & pc.shard_mask;
+        Shard chunk = Shard(SHARDS.addr[shard] + local * 32UL);
+        // Both 128-bit loads issued up front, before the era branch — the whole point of the
+        // variant. a.x,a.y,c.x,c.y == words[0],words[1],words[2],words[3].
+        u64vec2 a = chunk.pair[0];
+        u64vec2 c = chunk.pair[1];
+        uint64_t h = state;
+        if (pc.walk_v2 != 0u) {
+            // H5 non-foldable walk (mix64 chained through every word).
+            h = mix64(h ^ a.x);
+            h = mix64(h ^ a.y);
+            h = mix64(h ^ c.x);
+            h = mix64(h ^ c.y);
+            state = h;
+        } else {
+            // Pre-H5 fold (frozen).
+            h ^= a.x;
+            h ^= a.y;
+            h ^= c.x;
+            h ^= c.y;
+            state = mix64(h);
+        }
+        off = state % pc.n_chunks;
+    }
+
+    uint64_t o0 = mix64(state ^ pc.p0 ^ 0x9E3779B97F4A7C15UL);
+    uint64_t o1 = mix64(o0 ^ pc.p1 ^ 0xC2B2AE3D27D4EB4FUL);
+    uint64_t o2 = mix64(o1 ^ pc.p2 ^ 0x165667B19E3779F9UL);
+    uint64_t o3 = mix64(o2 ^ pc.p3 ^ 0xD6E8FEB86659FD93UL);
+
+    bool le;
+    if (o3 != OUT.t[3]) { le = o3 < OUT.t[3]; }
+    else if (o2 != OUT.t[2]) { le = o2 < OUT.t[2]; }
+    else if (o1 != OUT.t[1]) { le = o1 < OUT.t[1]; }
+    else if (o0 != OUT.t[0]) { le = o0 < OUT.t[0]; }
+    else { le = true; }
+
+    if (le) {
+        atomicMin(OUT.offset, idx);
+    }
+}

@@ -4,13 +4,13 @@ use log::LevelFilter;
 use crate::Error;
 
 #[derive(Parser, Debug)]
-#[clap(name = "keryx-miner", version, about = "A Keryx high performance GPU miner with OPoI inference\n\nUncensored H5 model tiers — one model per tier (default: GLM-4-9B-0414):\n  --very-light Qwen3-8B-abliterated (Q4_K_S) — 6GB+ VRAM, smallest tier\n  --light      Mistral-7B-v0.3 (Q6_K) — 8GB+ VRAM\n  (default)    GLM-4-9B-0414 (Q6_K) — 12GB+ VRAM\n  --high       Qwen3.6-27B (Q4_K_M) — 24GB+ VRAM\n  --very-high  Kimi-Linear-48B (Q4_K_M) — 32GB+ VRAM", term_width = 0)]
+#[clap(name = "keryx-miner", version, about = "A Keryx high performance GPU miner with OPoI inference\n\nH6 model tiers — one model per tier (default: gemma-4-12B-it-abliterated):\n  --very-light Qwen3.5-9B-abliterated (Q5_K_M) — 8GB+ VRAM, smallest tier\n  --light      GLM-4-9B-0414 (Q6_K) — 12GB+ VRAM\n  (default)    gemma-4-12B-it-abliterated (Q6_K) — 16GB+ VRAM\n  --high       Qwen3.6-27B (Q4_K_M) — 24GB+ VRAM\n  --very-high  Kimi-Linear-48B (Q4_K_M) — 30GB+ VRAM", term_width = 0)]
 pub struct Opt {
     // ── OPoI / Inference ─────────────────────────────────────────────────────
 
     #[clap(
         long = "very-light",
-        help = "Model tier: Qwen3-8B-abliterated (Q4_K_S) — 6GB+ VRAM, smallest tier",
+        help = "Model tier: Qwen3.5-9B-abliterated (Q5_K_M) — 8GB+ VRAM, smallest tier",
         help_heading = "OPoI / Inference",
         conflicts_with_all = &["light", "high", "very-high"]
     )]
@@ -18,7 +18,7 @@ pub struct Opt {
 
     #[clap(
         long = "light",
-        help = "Model tier: Mistral-7B-v0.3 (Q6_K) — 8GB+ VRAM",
+        help = "Model tier: GLM-4-9B-0414 (Q6_K) — 12GB+ VRAM",
         help_heading = "OPoI / Inference",
         conflicts_with_all = &["very-light", "high", "very-high"]
     )]
@@ -34,7 +34,7 @@ pub struct Opt {
 
     #[clap(
         long = "very-high",
-        help = "Model tier: Kimi-Linear-48B (Q4_K_M) — 32GB+ VRAM",
+        help = "Model tier: Kimi-Linear-48B (Q4_K_M) — 30GB+ VRAM",
         help_heading = "OPoI / Inference",
         conflicts_with_all = &["very-light", "light", "high"]
     )]
@@ -62,6 +62,21 @@ pub struct Opt {
         default_value = "escrow.key"
     )]
     pub escrow_key_file: String,
+
+    #[clap(
+        long = "escrow-cert",
+        help = "Escrow delegation cert as 128 hex chars, for setups that cannot drop a file (HiveOS). Wins over --escrow-cert-file",
+        help_heading = "OPoI / Inference"
+    )]
+    pub escrow_cert: Option<String>,
+
+    #[clap(
+        long = "escrow-cert-file",
+        help = "Path to the escrow delegation cert signed by the payout address's wallet (required for solo mining from H6)",
+        help_heading = "OPoI / Inference",
+        default_value = "escrow.cert"
+    )]
+    pub escrow_cert_file: String,
 
     #[clap(
         long = "escrow-state-file",

@@ -393,18 +393,31 @@ impl MinerManager {
                             }
                             keryx_miner::pom_gpu::ensure_installed(daa, pom_device);
                         }
-                        let h3 = daa >= keryx_miner::pom::pom_level_activation_daa();
-                        // H5 / H5.1 / H5.2 eras — MUST be derived from this block's own DAA and MUST
-                        // match what `State::generate_block_if_pom` uses when it rebuilds the walk.
-                        let walk_v2 = daa >= keryx_miner::pom::h5_activation_daa();
-                        let h5_1 = daa >= keryx_miner::pom::h5_1_activation_daa();
-                        let h5_2 = daa >= keryx_miner::pom::h5_2_activation_daa();
-                        let found = keryx_miner::pom_gpu::mine(
-                            pom_device, &pph, time, &target_le, pom_nonce, POM_BATCH, h3, walk_v2, h5_1, h5_2,
-                        );
-                        pom_nonce = pom_nonce.wrapping_add(POM_BATCH);
-                        hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
-                        worker_hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
+                        // Era dispatch on THIS block's own DAA — the same gates
+                        // `State::generate_block_if_pom` uses when it re-walks the winner on the host.
+                        let v4 = daa >= keryx_miner::pom::pom_v4_activation_daa();
+                        let v3 = daa >= keryx_miner::pom::pom_v3_activation_daa();
+                        if v3 && !v4 {
+                            // The H6 v3 window is history on every network; never mined here.
+                            warn!("PoM: template DAA {} is in the retired v3 era — not mining it", daa);
+                            state = None;
+                            continue;
+                        }
+                        let batch = if v4 { keryx_miner::pom_gpu::v4_batch() } else { POM_BATCH };
+                        let found = if v4 {
+                            keryx_miner::pom_gpu::mine_v4(pom_device, &pph, time, &target_le, pom_nonce, batch, daa)
+                        } else {
+                            let h3 = daa >= keryx_miner::pom::pom_level_activation_daa();
+                            let walk_v2 = daa >= keryx_miner::pom::h5_activation_daa();
+                            let h5_1 = daa >= keryx_miner::pom::h5_1_activation_daa();
+                            let h5_2 = daa >= keryx_miner::pom::h5_2_activation_daa();
+                            keryx_miner::pom_gpu::mine(
+                                pom_device, &pph, time, &target_le, pom_nonce, batch, h3, walk_v2, h5_1, h5_2,
+                            )
+                        };
+                        pom_nonce = pom_nonce.wrapping_add(batch);
+                        hashes_tried.fetch_add(batch, Ordering::AcqRel);
+                        worker_hashes_tried.fetch_add(batch, Ordering::AcqRel);
                         if let Some(nonce) = found {
                             // Emit the tier for THIS block's DAA (not the frozen build-time tier) so the
                             // index reindexing at H2 is applied at the exact boundary — else the node
@@ -422,6 +435,11 @@ impl MinerManager {
                                 if let BlockSeed::FullBlock(_) = block_seed {
                                     state = None;
                                 }
+                            } else {
+                                // The host re-walk did not confirm the GPU's winner (or no tier/index
+                                // is resident): never submitted, but a recurring one means the
+                                // kernel and the consensus walk disagree.
+                                warn!("PoM: GPU winner nonce {:#018x} was not confirmed by the host walk — discarded", nonce);
                             }
                         } else if let Some(cmd) = block_channel.get_changed()? {
                             state = match cmd {

@@ -2,22 +2,26 @@
 //
 // After each block, scans for coinbase outputs matching this miner's escrow script.
 // When the CSV window (36 000 blocks) expires, builds a Schnorr-signed claim TX and
-// broadcasts it via gRPC.  State is persisted to `escrow_state.json` so claims survive
-// miner restarts.
+// broadcasts it via gRPC.  State is persisted as a snapshot (`escrow_state.json`) plus an
+// append-only journal (`escrow_state.journal`) so claims survive miner restarts.
 
 use blake2b_simd::Params as Blake2bParams;
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use std::{fs, io};
+use tempfile::NamedTempFile;
 
-use crate::proto::{
-    RpcOutpoint, RpcScriptPublicKey, RpcTransaction, RpcTransactionInput, RpcTransactionOutput,
-};
+use crate::proto::{RpcOutpoint, RpcScriptPublicKey, RpcTransaction, RpcTransactionInput, RpcTransactionOutput};
 
 const CHALLENGE_WINDOW_BLOCKS: u64 = 36_000;
+/// CSV lock the node applies to coinbase escrow outputs from the H6 gate on. MUST equal the
+/// node's `SERVICE_BOND_CSV_WINDOW_BLOCKS` — the script, and so the output this miner recognizes
+/// and can spend, is derived from it.
+const SERVICE_BOND_CSV_WINDOW_BLOCKS: u64 = 792_000;
 const CLAIM_FEE_SOMPI: u64 = 30_000_000;
 const NATIVE_SUBNETWORK: &str = "0000000000000000000000000000000000000000";
 
@@ -28,10 +32,12 @@ const SIG_HASH_ALL: u8 = 0x01;
 /// Drop done (claimed / terminally-slashed) entries every N processed blocks so the
 /// in-memory vector and the on-disk state stay bounded under a high block rate.
 const COMPACT_EVERY_BLOCKS: u32 = 2_000;
-/// Minimum wall-clock interval between state-file writes. Without this debounce the
-/// watcher rewrites the entire (multi-thousand-entry) state file on every block, which
-/// saturates the async client loop and starves block-template delivery → mining stalls.
+/// Minimum wall-clock interval between journal writes (one fsync per batch of lines).
 const STATE_SAVE_INTERVAL: Duration = Duration::from_secs(2);
+/// Wall-clock interval between full snapshots while the journal keeps growing.
+const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(600);
+/// Journal size that forces a snapshot before the interval elapses.
+const JOURNAL_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct EscrowEntry {
@@ -76,15 +82,151 @@ pub struct EscrowEntry {
     /// Red-set slashing is skipped for these since non-coinbase TXs can be re-included.
     #[serde(default)]
     pub is_inference: bool,
+    /// CSV lock of this output, in blocks. Coinbase escrows switch to the service-bond
+    /// window at the H6 gate; inference escrows keep the legacy one. Entries written by
+    /// earlier versions predate the gate and default to legacy.
+    #[serde(default = "default_csv_window")]
+    pub csv_window: u64,
+}
+
+fn default_csv_window() -> u64 {
+    CHALLENGE_WINDOW_BLOCKS
+}
+
+/// CSV lock the node applies to a coinbase escrow output created at `daa`.
+pub fn csv_window_for_daa(daa: u64) -> u64 {
+    if daa >= keryx_miner::pom::pom_v3_activation_daa() {
+        SERVICE_BOND_CSV_WINDOW_BLOCKS
+    } else {
+        CHALLENGE_WINDOW_BLOCKS
+    }
 }
 
 fn default_output_index() -> u32 {
     1
 }
 
+/// Pick the next claim batch, returned as indices into `entries` (empty = nothing to ship).
+///
+/// +10 margin on maturity: OP_CSV validation can lag the virtual-state DAA score by several
+/// blocks in the BlockDAG. A single +1 margin is often not enough, causing seq-lock
+/// rejections that get retried every block. Per-entry cooldowns are checked individually so
+/// they don't block other claims.
+///
+/// Selection runs in priority passes; each candidate builds its own batch and the first
+/// RELEASABLE one wins, so a held-back pass never starves the ones below:
+///   0 — nominal: uncapped live entries, inference first within the batch (they carry
+///       user fees and must not be starved by the coinbase queue). A batch never mixes
+///       CSV windows — one sequence and one escrow script are signed for the whole TX —
+///       so each window present gets its own candidate, current-era first. Releasable
+///       ONLY as a full MAX_CLAIM_BATCH batch — the flat claim fee is amortized across
+///       the whole TX and partial batches never ship. Nominal goes FIRST so full batches
+///       are never delayed behind repair grinding;
+///   1 — repair: live entries carrying a bisection cap (survivors of a rejected batch).
+///       They regroup among themselves — never with uncapped entries, which would bleed
+///       fresh outputs into small immediate batches — and flow at any size (in the gaps
+///       between full batches) so dead inputs get isolated;
+///   2 — drain: live entries whose CSV window no longer matches the one coinbases mint.
+///       Their pool can no longer grow to a full nominal batch, so they flow at any size;
+///   3 — the known-dead pool (solo-orphaned at least once), ground down whenever nothing
+///       fresher is claimable.
+/// A batch never mixes passes: batching live entries with known-dead ones would let one
+/// dead input orphan the whole TX and stall the live entries.
+fn select_claim_batch(entries: &[EscrowEntry], daa_score: u64, in_flight_outpoints: &HashSet<String>) -> Vec<usize> {
+    let current_window = csv_window_for_daa(daa_score);
+    let mut windows: Vec<u64> = entries.iter().map(|e| e.csv_window).collect();
+    windows.sort_unstable_by_key(|&w| (w != current_window, w));
+    windows.dedup();
+
+    let mut candidates: Vec<(u8, Option<u64>)> = windows.into_iter().map(|w| (0u8, Some(w))).collect();
+    candidates.extend([(1, None), (2, None), (3, None)]);
+
+    let mut batch: Vec<usize> = Vec::new();
+    for (pass, forced_window) in candidates {
+        batch.clear();
+        let mut limit = MAX_CLAIM_BATCH;
+        let mut batch_window: Option<u64> = forced_window;
+        // Nominal pass: iterate inference entries first so they get batch priority;
+        // the sort is stable, so queue order is preserved within each kind.
+        let mut indices: Vec<usize> = (0..entries.len()).collect();
+        if pass == 0 {
+            indices.sort_by_key(|&i| !entries[i].is_inference);
+        }
+        for &i in &indices {
+            let e = &entries[i];
+            // Only the (transient, forgivable) flag decides the dead pool; the
+            // orphan_retries counter is the cumulative memory driving the permanent
+            // slash and must not keep an entry in the dead pool forever on its own.
+            let proven_dead = e.orphan_slashed;
+            let in_pass = match pass {
+                0 => e.batch_cap == 0 && !proven_dead,
+                1 => e.batch_cap != 0 && !proven_dead,
+                2 => e.batch_cap == 0 && !proven_dead && e.csv_window != current_window,
+                _ => proven_dead,
+            };
+            if !in_pass {
+                continue;
+            }
+            let eligible = !e.claimed
+                && !e.slashed
+                && daa_score >= e.confirm_daa + e.csv_window + 10
+                && e.orphan_retry_after_daa.map_or(true, |retry_daa| daa_score >= retry_daa)
+                && !in_flight_outpoints.contains(&format!("{}:{}", e.coinbase_txid, e.output_index));
+            if !eligible {
+                continue;
+            }
+            if batch_window.map_or(false, |w| w != e.csv_window) {
+                continue;
+            }
+            let cap = if e.batch_cap == 0 { MAX_CLAIM_BATCH } else { (e.batch_cap as usize).min(MAX_CLAIM_BATCH) };
+            if cap.min(limit) < batch.len() + 1 {
+                continue; // joining would violate this entry's cap (or shrink below current size)
+            }
+            limit = limit.min(cap);
+            batch_window = Some(e.csv_window);
+            batch.push(i);
+            if batch.len() >= limit {
+                break; // batch is full for this candidate
+            }
+        }
+        let releasable = match pass {
+            // Nominal batches ship full or not at all (fee amortization).
+            0 => batch.len() >= MIN_CLAIM_BATCH,
+            // Repair, drain and dead-pool batches flow at any size.
+            _ => !batch.is_empty(),
+        };
+        if releasable {
+            return batch;
+        }
+    }
+    Vec::new()
+}
+
 #[derive(Serialize, Deserialize, Default, Debug)]
 pub struct EscrowState {
     pub entries: Vec<EscrowEntry>,
+    /// Sequence of the last journal line folded into this snapshot; older lines are stale.
+    #[serde(default)]
+    pub journal_seq: u64,
+}
+
+/// One journal line: the full entry after a change, keyed by its outpoint on replay.
+#[derive(Serialize, Deserialize)]
+struct JournalLine {
+    s: u64,
+    e: EscrowEntry,
+}
+
+fn journal_path_for(state_path: &Path) -> PathBuf {
+    state_path.with_extension("journal")
+}
+
+fn append_journal_line(pending: &mut Vec<u8>, seq: &mut u64, entry: &EscrowEntry) {
+    *seq += 1;
+    if let Ok(mut line) = serde_json::to_vec(&JournalLine { s: *seq, e: entry.clone() }) {
+        line.push(b'\n');
+        pending.extend_from_slice(&line);
+    }
 }
 
 /// Max escrow outputs per claim TX. Compute mass is `506 + 1118 * inputs` grams (1,000 per
@@ -152,8 +294,9 @@ pub struct EscrowWatcher {
     secp: secp256k1::Secp256k1<secp256k1::All>,
     secret_key: secp256k1::SecretKey,
     pubkey_bytes: [u8; 32],
-    escrow_script: Vec<u8>,
     escrow_script_hex: String,
+    /// Service-bond variant of the escrow script, paid by coinbases from the H6 gate on.
+    escrow_script_bonded_hex: String,
     payout_spk_version: u16,
     payout_spk_script: Vec<u8>,
     payout_spk_script_hex: String,
@@ -176,9 +319,14 @@ pub struct EscrowWatcher {
     /// block_hash -> indices into `state.entries`, for O(reds) red-set slashing instead of
     /// scanning every entry per red hash. Rebuilt on load/compaction; appended on track.
     block_index: HashMap<String, Vec<usize>>,
-    /// Debounced persistence: pending unsaved changes + last write time.
-    dirty: bool,
-    last_save: Instant,
+    /// Journal lines not yet written to disk, and the sequence of the last line produced.
+    journal_pending: Vec<u8>,
+    journal_seq: u64,
+    journal_bytes_since_snapshot: usize,
+    last_journal_write: Instant,
+    /// A compaction removed entries: only a snapshot can persist that.
+    snapshot_due: bool,
+    last_snapshot: Instant,
     /// handle_block call counter, used to trigger periodic compaction.
     blocks_since_compact: u32,
     /// handle_block call counter for the periodic INFO status line.
@@ -190,6 +338,9 @@ pub struct EscrowWatcher {
     validation_pending: HashSet<String>,
     /// Entries purged by boot-time validation, for the completion log line.
     validation_purged: u64,
+    /// Blocks the node could not return during boot-time validation (pruned or not yet
+    /// synced): their entries are kept, the claim path decides.
+    validation_unknown: u64,
 }
 
 /// A claim TX submitted to the node, awaiting its SubmitTransactionResponse.
@@ -202,27 +353,27 @@ struct InFlightClaim {
 
 impl EscrowWatcher {
     pub fn new(privkey_hex: &str, mining_address: &str, state_path: PathBuf) -> Result<Self, String> {
-        let privkey_bytes = hex::decode(privkey_hex)
-            .map_err(|e| format!("Invalid --mining-privkey hex: {}", e))?;
+        let privkey_bytes = hex::decode(privkey_hex).map_err(|e| format!("Invalid --mining-privkey hex: {}", e))?;
         if privkey_bytes.len() != 32 {
             return Err(format!("--mining-privkey must be 32 bytes (64 hex chars), got {}", privkey_bytes.len()));
         }
 
         let secp = secp256k1::Secp256k1::new();
-        let secret_key = secp256k1::SecretKey::from_slice(&privkey_bytes)
-            .map_err(|e| format!("Invalid private key: {}", e))?;
+        let secret_key =
+            secp256k1::SecretKey::from_slice(&privkey_bytes).map_err(|e| format!("Invalid private key: {}", e))?;
         let keypair = secp256k1::Keypair::from_secret_key(&secp, &secret_key);
         let (xonly, _parity) = keypair.x_only_public_key();
         let pubkey_bytes: [u8; 32] = xonly.serialize();
 
-        let escrow_script = build_escrow_script(&pubkey_bytes);
-        let escrow_script_hex = hex::encode(&escrow_script);
+        let escrow_script_hex = hex::encode(build_escrow_script(&pubkey_bytes, CHALLENGE_WINDOW_BLOCKS));
+        let escrow_script_bonded_hex = hex::encode(build_escrow_script(&pubkey_bytes, SERVICE_BOND_CSV_WINDOW_BLOCKS));
 
         let (payout_spk_version, payout_spk_bytes) = decode_address(mining_address)?;
         let payout_spk_script = build_p2pk_script(&payout_spk_bytes);
         let payout_spk_script_hex = hex::encode(&payout_spk_script);
 
-        let state = load_state(&state_path);
+        let state = load_state(&state_path)?;
+        let state_seq = state.journal_seq;
 
         info!("EscrowWatcher ready: pubkey={}", hex::encode(pubkey_bytes));
 
@@ -230,8 +381,8 @@ impl EscrowWatcher {
             secp,
             secret_key,
             pubkey_bytes,
-            escrow_script,
             escrow_script_hex,
+            escrow_script_bonded_hex,
             payout_spk_version,
             payout_spk_script,
             payout_spk_script_hex,
@@ -242,12 +393,17 @@ impl EscrowWatcher {
             last_daa_score: 0,
             outpoint_set: HashSet::new(),
             block_index: HashMap::new(),
-            dirty: false,
-            last_save: Instant::now(),
+            journal_pending: Vec::new(),
+            journal_seq: state_seq,
+            journal_bytes_since_snapshot: 0,
+            last_journal_write: Instant::now(),
+            snapshot_due: false,
+            last_snapshot: Instant::now(),
             blocks_since_compact: 0,
             blocks_since_status: 0,
             validation_pending: HashSet::new(),
             validation_purged: 0,
+            validation_unknown: 0,
         };
         watcher.rebuild_indexes();
         Ok(watcher)
@@ -272,29 +428,78 @@ impl EscrowWatcher {
         self.state.entries.retain(|e| !e.claimed && !e.slashed);
         if self.state.entries.len() != before {
             self.rebuild_indexes();
-            self.mark_dirty();
+            self.snapshot_due = true;
         }
     }
 
-    #[inline]
-    fn mark_dirty(&mut self) {
-        self.dirty = true;
-    }
-
-    /// Persist state at most once per `STATE_SAVE_INTERVAL` to keep disk I/O off the
-    /// per-block hot path. Worst case on crash we lose a couple of seconds of tracking,
-    /// which is re-derived from the chain on the next blocks.
+    /// Persist off the per-block hot path: journal lines are appended at most once per
+    /// `STATE_SAVE_INTERVAL`; the full snapshot is rewritten on compaction, every
+    /// `SNAPSHOT_INTERVAL`, or once the journal outgrows `JOURNAL_SNAPSHOT_BYTES`.
     fn maybe_flush(&mut self) {
-        if self.dirty && self.last_save.elapsed() >= STATE_SAVE_INTERVAL {
-            self.save_state();
-            self.dirty = false;
-            self.last_save = Instant::now();
+        let journal_grown = self.journal_bytes_since_snapshot + self.journal_pending.len();
+        if self.snapshot_due
+            || journal_grown >= JOURNAL_SNAPSHOT_BYTES
+            || (journal_grown > 0 && self.last_snapshot.elapsed() >= SNAPSHOT_INTERVAL)
+        {
+            if let Err(e) = self.write_snapshot() {
+                warn!("EscrowWatcher: failed to save state: {}", e);
+            }
+            return;
         }
+        if !self.journal_pending.is_empty() && self.last_journal_write.elapsed() >= STATE_SAVE_INTERVAL {
+            if let Err(e) = self.write_journal() {
+                warn!("EscrowWatcher: failed to append the state journal: {}", e);
+            }
+        }
+    }
+
+    /// Append the pending journal lines and sync them.
+    fn write_journal(&mut self) -> Result<(), String> {
+        self.last_journal_write = Instant::now();
+        if self.journal_pending.is_empty() {
+            return Ok(());
+        }
+        let path = journal_path_for(&self.state_path);
+        let write = || -> io::Result<()> {
+            ensure_parent(&path)?;
+            let mut file = fs::OpenOptions::new().create(true).append(true).open(&path)?;
+            file.write_all(&self.journal_pending)?;
+            file.sync_data()
+        };
+        write().map_err(|e| format!("Failed to append escrow journal '{}': {}", path.display(), e))?;
+        self.journal_bytes_since_snapshot += self.journal_pending.len();
+        self.journal_pending.clear();
+        Ok(())
+    }
+
+    /// Rewrite the full snapshot; the journal is emptied with it.
+    fn write_snapshot(&mut self) -> Result<(), String> {
+        self.state.journal_seq = self.journal_seq;
+        self.save_state()?;
+        self.journal_pending.clear();
+        self.journal_bytes_since_snapshot = 0;
+        self.snapshot_due = false;
+        self.last_snapshot = Instant::now();
+        self.last_journal_write = self.last_snapshot;
+        Ok(())
     }
 
     /// Return the 64-char hex x-only public key of the mining key.
     pub fn pubkey_hex(&self) -> String {
         hex::encode(self.pubkey_bytes)
+    }
+
+    /// V2 responder identity for an AiResponse: schnorr signature with the escrow key over the
+    /// domain-hashed v1 payload bytes — MUST match the node's `verified_responder`
+    /// (blake2b-256("KeryxServiceResponderV1" || signed_bytes)).
+    pub fn sign_responder(&self, signed_bytes: &[u8]) -> keryx_inference::AiResponder {
+        let mut hasher = blake2b_simd::Params::new().hash_length(32).to_state();
+        hasher.update(b"KeryxServiceResponderV1");
+        hasher.update(signed_bytes);
+        let msg = secp256k1::Message::from_digest_slice(hasher.finalize().as_bytes()).unwrap();
+        let keypair = secp256k1::Keypair::from_secret_key(&self.secp, &self.secret_key);
+        let sig = self.secp.sign_schnorr_no_aux_rand(&msg, &keypair);
+        keryx_inference::AiResponder { escrow_pubkey: self.pubkey_bytes, signature: *sig.as_ref() }
     }
 
     /// Scan a confirmed block for the miner's escrow output and check for mature claims.
@@ -322,7 +527,7 @@ impl EscrowWatcher {
                 .state
                 .entries
                 .iter()
-                .filter(|e| !e.claimed && !e.slashed && daa_score >= e.confirm_daa + CHALLENGE_WINDOW_BLOCKS + 10)
+                .filter(|e| !e.claimed && !e.slashed && daa_score >= e.confirm_daa + e.csv_window + 10)
                 .count();
             if mature > 0 || !self.in_flight.is_empty() {
                 debug!(
@@ -352,7 +557,7 @@ impl EscrowWatcher {
                                 &entry.coinbase_txid[..16.min(entry.coinbase_txid.len())]
                             );
                             entry.slashed = true;
-                            self.mark_dirty();
+                            append_journal_line(&mut self.journal_pending, &mut self.journal_seq, entry);
                         }
                     }
                 }
@@ -392,9 +597,15 @@ impl EscrowWatcher {
         for (out_idx, output) in coinbase.outputs.iter().enumerate() {
             if let Some(spk) = &output.script_public_key {
                 let key = format!("{}:{}", coinbase_txid, out_idx);
-                if spk.script_public_key.to_lowercase() == self.escrow_script_hex
-                    && spk.version == 0
-                    && !self.outpoint_set.contains(&key)
+                let script = spk.script_public_key.to_lowercase();
+                let csv_window = if script == self.escrow_script_hex {
+                    Some(CHALLENGE_WINDOW_BLOCKS)
+                } else if script == self.escrow_script_bonded_hex {
+                    Some(SERVICE_BOND_CSV_WINDOW_BLOCKS)
+                } else {
+                    None
+                };
+                if let Some(csv_window) = csv_window.filter(|_| spk.version == 0 && !self.outpoint_set.contains(&key))
                 {
                     debug!(
                         "EscrowWatcher: tracked escrow coinbase={}…[{}] daa={} amount={}",
@@ -419,12 +630,13 @@ impl EscrowWatcher {
                         batch_cap: 0,
                         cap_set_daa: 0,
                         is_inference: false,
+                        csv_window,
                     });
                     self.outpoint_set.insert(key);
                     if !block_hash.is_empty() {
                         self.block_index.entry(block_hash.to_string()).or_default().push(idx);
                     }
-                    self.mark_dirty();
+                    append_journal_line(&mut self.journal_pending, &mut self.journal_seq, &self.state.entries[idx]);
                 }
             }
         }
@@ -484,6 +696,7 @@ impl EscrowWatcher {
         }
         self.validation_pending = hashes.clone();
         self.validation_purged = 0;
+        self.validation_unknown = 0;
         if !self.validation_pending.is_empty() {
             info!(
                 "EscrowWatcher: validating {} block(s) against the node before claiming — ghost entries will be purged",
@@ -507,19 +720,48 @@ impl EscrowWatcher {
                     if !e.claimed && !e.slashed {
                         e.slashed = true;
                         self.validation_purged += 1;
+                        append_journal_line(&mut self.journal_pending, &mut self.journal_seq, e);
                     }
                 }
             }
-            self.mark_dirty();
         }
-        if self.validation_pending.is_empty() {
-            info!(
-                "EscrowWatcher: state validation complete — {} ghost entr{} purged, claiming enabled",
-                self.validation_purged,
-                if self.validation_purged == 1 { "y" } else { "ies" }
-            );
+        self.finish_validation_if_done();
+    }
+
+    /// Purge the entries of chain blocks the node just reorged out: their coinbase never
+    /// materialised. Their outpoints are released so a block re-added later is tracked afresh.
+    pub fn on_chain_blocks_removed(&mut self, hashes: &[String]) {
+        let mut purged = 0u64;
+        for hash in hashes {
+            let Some(indices) = self.block_index.remove(hash) else { continue };
+            for i in indices {
+                let e = &mut self.state.entries[i];
+                if e.claimed || e.slashed {
+                    continue;
+                }
+                e.slashed = true;
+                purged += 1;
+                self.outpoint_set.remove(&format!("{}:{}", e.coinbase_txid, e.output_index));
+                append_journal_line(&mut self.journal_pending, &mut self.journal_seq, e);
+            }
+        }
+        if purged > 0 {
+            debug!("EscrowWatcher: {} escrow entr{} purged — their block left the selected chain", purged, if purged == 1 { "y" } else { "ies" });
             self.maybe_flush();
         }
+    }
+
+    fn finish_validation_if_done(&mut self) {
+        if !self.validation_pending.is_empty() {
+            return;
+        }
+        info!(
+            "EscrowWatcher: state validation complete — {} ghost entr{} purged, {} block(s) unknown to the node (entries kept), claiming enabled",
+            self.validation_purged,
+            if self.validation_purged == 1 { "y" } else { "ies" },
+            self.validation_unknown
+        );
+        self.maybe_flush();
     }
 
     /// True while boot-time validation is still awaiting node answers.
@@ -528,14 +770,17 @@ impl EscrowWatcher {
     }
 
     /// Match a GetBlock error message against the pending validation set (the node's
-    /// "cannot find header <hash>" text embeds the hash). Returns true when consumed:
-    /// the block does not exist on this chain, its entries are ghosts and get purged.
+    /// "cannot find header <hash>" text embeds the hash). Returns true when consumed. A block
+    /// the node cannot return is unknown, not a ghost: its entries stay.
     pub fn on_block_validation_error(&mut self, message: &str) -> bool {
         let hash = match self.validation_pending.iter().find(|h| message.contains(h.as_str())) {
             Some(h) => h.clone(),
             None => return false,
         };
-        self.on_block_validated(&hash, false);
+        self.validation_pending.remove(&hash);
+        self.validation_unknown += 1;
+        debug!("EscrowWatcher: block {} unknown to the node at boot — entries kept", hash);
+        self.finish_validation_if_done();
         true
     }
 
@@ -575,8 +820,8 @@ impl EscrowWatcher {
         // Forgiveness is safe because orphan_retries is NOT reset: a genuinely dead
         // entry re-fails its full batch, re-bisects to a solo rejection, increments the
         // counter and still converges to the permanent slash at MAX_ORPHAN_RETRIES.
-        let mut healed = false;
         for e in self.state.entries.iter_mut() {
+            let mut healed = false;
             if e.batch_cap != 0 && daa_score >= e.cap_set_daa + CAP_EXPIRY_DAA {
                 e.batch_cap = 0;
                 healed = true;
@@ -594,86 +839,13 @@ impl EscrowWatcher {
                     healed = true;
                 }
             }
-        }
-        if healed {
-            self.mark_dirty();
+            if healed {
+                append_journal_line(&mut self.journal_pending, &mut self.journal_seq, e);
+            }
         }
 
-        // +10 margin: OP_CSV validation uses the selected-chain blue score, which can lag the
-        // virtual-state DAA score by several blocks in the BlockDAG.  A single +1 margin is
-        // often not enough, causing seq-lock rejections that get retried every block.
-        // Per-entry cooldowns are checked individually so they don't block other claims.
-        //
-        // Selection runs in priority passes; each pass builds its own candidate batch and
-        // the first RELEASABLE one wins, so a held-back pass never starves the ones below:
-        //   0 — nominal: uncapped live entries, inference first within the batch (they
-        //       carry user fees and must not be starved by the coinbase queue). Releasable
-        //       ONLY as a full MAX_CLAIM_BATCH batch — the flat claim fee is amortized
-        //       across the whole TX and partial batches never ship. Nominal goes FIRST so
-        //       full batches are never delayed behind repair grinding;
-        //   1 — repair: live entries carrying a bisection cap (survivors of a rejected
-        //       batch). They regroup among themselves — never with uncapped entries, which
-        //       would bleed fresh outputs into small immediate batches — and flow at any
-        //       size (in the gaps between full batches) so dead inputs get isolated;
-        //   2 — the known-dead pool (solo-orphaned at least once), ground down whenever
-        //       nothing fresher is claimable.
-        // A batch never mixes passes: batching live entries with known-dead ones would let
-        // one dead input orphan the whole TX and stall the live entries.
-        let mut batch: Vec<usize> = Vec::new();
-        let mut selected = false;
-        for pass in 0..3u8 {
-            batch.clear();
-            let mut limit = MAX_CLAIM_BATCH;
-            // Nominal pass: iterate inference entries first so they get batch priority;
-            // the sort is stable, so queue order is preserved within each kind.
-            let mut indices: Vec<usize> = (0..self.state.entries.len()).collect();
-            if pass == 0 {
-                indices.sort_by_key(|&i| !self.state.entries[i].is_inference);
-            }
-            for &i in &indices {
-                let e = &self.state.entries[i];
-                // Only the (transient, forgivable) flag decides the dead pool; the
-                // orphan_retries counter is the cumulative memory driving the permanent
-                // slash and must not keep an entry in the dead pool forever on its own.
-                let proven_dead = e.orphan_slashed;
-                let in_pass = match pass {
-                    0 => e.batch_cap == 0 && !proven_dead,
-                    1 => e.batch_cap != 0 && !proven_dead,
-                    _ => proven_dead,
-                };
-                if !in_pass {
-                    continue;
-                }
-                let eligible = !e.claimed
-                    && !e.slashed
-                    && daa_score >= e.confirm_daa + CHALLENGE_WINDOW_BLOCKS + 10
-                    && e.orphan_retry_after_daa.map_or(true, |retry_daa| daa_score >= retry_daa)
-                    && !self.in_flight_outpoints.contains(&format!("{}:{}", e.coinbase_txid, e.output_index));
-                if !eligible {
-                    continue;
-                }
-                let cap = if e.batch_cap == 0 { MAX_CLAIM_BATCH } else { (e.batch_cap as usize).min(MAX_CLAIM_BATCH) };
-                if cap.min(limit) < batch.len() + 1 {
-                    continue; // joining would violate this entry's cap (or shrink below current size)
-                }
-                limit = limit.min(cap);
-                batch.push(i);
-                if batch.len() >= limit {
-                    break; // batch is full for this pass
-                }
-            }
-            let releasable = match pass {
-                // Nominal batches ship full or not at all (fee amortization).
-                0 => batch.len() >= MIN_CLAIM_BATCH,
-                // Repair and dead-pool batches flow at any size.
-                _ => !batch.is_empty(),
-            };
-            if releasable {
-                selected = true;
-                break;
-            }
-        }
-        if !selected {
+        let batch = select_claim_batch(&self.state.entries, daa_score, &self.in_flight_outpoints);
+        if batch.is_empty() {
             return None;
         }
         let entries: Vec<EscrowEntry> = batch.iter().map(|&i| self.state.entries[i].clone()).collect();
@@ -750,6 +922,22 @@ impl EscrowWatcher {
                 // situations where the source block is off the selected chain.
                 let is_orphan = msg.contains("orphan");
                 let is_seq_lock = msg.contains("sequence lock");
+                // SpendOfBurnedEscrow (node `TxRuleError`): the outpoint is unspendable forever.
+                let is_burned = msg.contains("burned escrow outpoint");
+                // The node names every burned outpoint in the batch ("...outpoints: txid:idx txid:idx").
+                // Parsing it lets us slash exactly those and re-batch the rest — no bisection. An older
+                // node sends no list; `burned_set` stays empty and we fall back to bisection below.
+                let burned_set: std::collections::HashSet<(String, u32)> = msg
+                    .rsplit_once("burned escrow outpoints: ")
+                    .map(|(_, list)| {
+                        list.split_whitespace()
+                            .filter_map(|tok| {
+                                let (tx, idx) = tok.split_once(':')?;
+                                Some((tx.to_ascii_lowercase(), idx.parse().ok()?))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 let batch_rejected = n_outputs > 1;
                 let last_daa = self.last_daa_score;
                 // Bisection step: one dead input orphans the whole batch, but most members
@@ -758,11 +946,7 @@ impl EscrowWatcher {
                 // dead ones converge to solo claims and get slashed there.
                 let halved_cap = ((n_outputs / 2).max(1)).min(u8::MAX as usize) as u8;
                 for (t, i) in &claim.outpoints {
-                    let e = match self
-                        .state
-                        .entries
-                        .iter_mut()
-                        .find(|e| e.coinbase_txid == *t && e.output_index == *i)
+                    let e = match self.state.entries.iter_mut().find(|e| e.coinbase_txid == *t && e.output_index == *i)
                     {
                         Some(e) => e,
                         None => continue,
@@ -793,6 +977,23 @@ impl EscrowWatcher {
                     } else if is_seq_lock {
                         // The OP_CSV blue-score check may lag DAA score by a few blocks.
                         e.orphan_retry_after_daa = Some(last_daa + SEQ_LOCK_RETRY_COOLDOWN_BLOCKS);
+                    } else if is_burned {
+                        // Burn is permanent by consensus. When the node named the burned outpoints,
+                        // slash exactly the ones it listed and leave the rest untouched — they
+                        // re-batch next round, no bisection. Fall back to bisection only when no list
+                        // was parsed (older node): batch → halve to isolate, solo → slash. The exact
+                        // node message keeps this off the "irreversible state from an error string"
+                        // trap that applies to every OTHER rejection.
+                        if !burned_set.is_empty() {
+                            if burned_set.contains(&(t.to_ascii_lowercase(), *i)) {
+                                e.slashed = true;
+                            }
+                        } else if batch_rejected {
+                            e.batch_cap = halved_cap;
+                            e.cap_set_daa = last_daa;
+                        } else {
+                            e.slashed = true;
+                        }
                     } else {
                         // Unrecognized rejection: bisect too (a size-related rejection heals
                         // that way) with exponential backoff, never a permanent slash — an
@@ -808,19 +1009,31 @@ impl EscrowWatcher {
                             .min(UNKNOWN_RETRY_MAX_COOLDOWN_DAA);
                         e.orphan_retry_after_daa = Some(last_daa + cooldown);
                     }
+                    append_journal_line(&mut self.journal_pending, &mut self.journal_seq, e);
                 }
-                // Debug level: with boot-time state validation in place, rejections are
-                // rare and transient (bisection repair) — not worth operator noise.
-                debug!(
-                    "EscrowWatcher: claim {} rejected ({} output(s) released{}): {}",
-                    claim_txid,
-                    n_outputs,
-                    if batch_rejected { ", batch cap halved" } else { "" },
-                    msg
-                );
+                // Burns are terminal and operator-relevant (the miner is being penalised) — surface
+                // them once at WARN. Everything else is transient bisection repair, kept at DEBUG.
+                if is_burned && !burned_set.is_empty() {
+                    warn!(
+                        "EscrowWatcher: {} escrow outpoint(s) burned by service-bond — slashed permanently, re-batching the rest.",
+                        burned_set.len()
+                    );
+                } else if is_burned && !batch_rejected {
+                    warn!(
+                        "EscrowWatcher: escrow outpoint burned by service-bond — abandoning claim {} permanently: {}",
+                        claim_txid, msg
+                    );
+                } else {
+                    debug!(
+                        "EscrowWatcher: claim {} rejected ({} output(s) released{}): {}",
+                        claim_txid,
+                        n_outputs,
+                        if batch_rejected { ", batch cap halved" } else { "" },
+                        msg
+                    );
+                }
             }
         }
-        self.mark_dirty();
         self.maybe_flush();
         outcome
     }
@@ -830,16 +1043,12 @@ impl EscrowWatcher {
     fn mark_entries_claimed(&mut self, outpoints: &[(String, u32)]) -> u64 {
         let mut total_sompi = 0u64;
         for (t, i) in outpoints {
-            if let Some(e) = self
-                .state
-                .entries
-                .iter_mut()
-                .find(|e| e.coinbase_txid == *t && e.output_index == *i)
-            {
+            if let Some(e) = self.state.entries.iter_mut().find(|e| e.coinbase_txid == *t && e.output_index == *i) {
                 if !e.claimed {
                     total_sompi += e.amount_sompi;
                 }
                 e.claimed = true;
+                append_journal_line(&mut self.journal_pending, &mut self.journal_seq, e);
             }
         }
         total_sompi
@@ -853,6 +1062,12 @@ impl EscrowWatcher {
         if entries.is_empty() {
             return Err("empty claim batch".into());
         }
+        // Guaranteed single-valued by the batch selection; the whole TX signs one sequence.
+        let csv_window = entries[0].csv_window;
+        if entries.iter().any(|e| e.csv_window != csv_window) {
+            return Err("claim batch mixes CSV windows".into());
+        }
+        let escrow_script = build_escrow_script(&self.pubkey_bytes, csv_window);
         let total_in: u64 = entries.iter().map(|e| e.amount_sompi).sum();
         let amount_out = total_in
             .checked_sub(CLAIM_FEE_SOMPI)
@@ -873,12 +1088,13 @@ impl EscrowWatcher {
             amount_out,
             self.payout_spk_version,
             &self.payout_spk_script,
+            csv_window,
         );
         let keypair = secp256k1::Keypair::from_secret_key(&self.secp, &self.secret_key);
 
         let mut inputs: Vec<RpcTransactionInput> = Vec::with_capacity(entries.len());
         for (entry, meta) in entries.iter().zip(&inputs_meta) {
-            let sighash = compute_sighash(meta, &self.escrow_script, &reused);
+            let sighash = compute_sighash(meta, &escrow_script, &reused, csv_window);
             let msg = secp256k1::Message::from_digest_slice(&sighash)
                 .map_err(|e| format!("sighash message error: {}", e))?;
             let sig = self.secp.sign_schnorr_no_aux_rand(&msg, &keypair);
@@ -895,7 +1111,7 @@ impl EscrowWatcher {
                     index: entry.output_index,
                 }),
                 signature_script: hex::encode(&sig_script),
-                sequence: CHALLENGE_WINDOW_BLOCKS,
+                sequence: csv_window,
                 sig_op_count: 1,
                 verbose_data: None,
             });
@@ -906,6 +1122,7 @@ impl EscrowWatcher {
             amount_out,
             self.payout_spk_version,
             &self.payout_spk_script,
+            csv_window,
         );
 
         Ok((
@@ -962,22 +1179,170 @@ impl EscrowWatcher {
             batch_cap: 0,
             cap_set_daa: 0,
             is_inference: true,
+            // Built by the requester's wallet, which locks the legacy window on both eras.
+            csv_window: CHALLENGE_WINDOW_BLOCKS,
         });
         self.outpoint_set.insert(key);
-        self.mark_dirty();
+        let idx = self.state.entries.len() - 1;
+        append_journal_line(&mut self.journal_pending, &mut self.journal_seq, &self.state.entries[idx]);
         self.maybe_flush();
     }
 
-    fn save_state(&self) {
-        match serde_json::to_string_pretty(&self.state) {
-            Ok(json) => {
-                if let Err(e) = fs::write(&self.state_path, &json) {
-                    warn!("EscrowWatcher: failed to save state: {}", e);
-                }
-            }
-            Err(e) => warn!("EscrowWatcher: failed to serialize state: {}", e),
+    fn save_state(&self) -> Result<(), String> {
+        save_state_atomic(&self.state_path, &self.state)
+    }
+
+    pub fn flush_state(&mut self) -> Result<(), String> {
+        if self.snapshot_due || self.journal_bytes_since_snapshot > 0 || !self.journal_pending.is_empty() {
+            self.write_snapshot()?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for EscrowWatcher {
+    fn drop(&mut self) {
+        if let Err(e) = self.flush_state() {
+            warn!("EscrowWatcher: final state flush failed: {}", e);
         }
     }
+}
+
+fn ensure_parent(path: &Path) -> io::Result<&Path> {
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    create_parent_dirs(parent)?;
+    Ok(parent)
+}
+
+#[cfg(unix)]
+fn create_parent_dirs(parent: &Path) -> io::Result<()> {
+    let mut missing = Vec::new();
+    let mut cursor = parent;
+    while !cursor.exists() {
+        missing.push(cursor.to_path_buf());
+        cursor = cursor.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    }
+    if !cursor.is_dir() {
+        return Err(io::Error::new(io::ErrorKind::NotADirectory, format!("'{}' is not a directory", cursor.display())));
+    }
+    for directory in missing.into_iter().rev() {
+        match fs::create_dir(&directory) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && directory.is_dir() => {}
+            Err(e) => return Err(e),
+        }
+        sync_parent(directory.parent().unwrap_or_else(|| Path::new(".")))?;
+        sync_parent(&directory)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_parent_dirs(parent: &Path) -> io::Result<()> {
+    fs::create_dir_all(parent)
+}
+
+#[cfg(unix)]
+fn sync_parent(parent: &Path) -> io::Result<()> {
+    fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent(_parent: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn harden_key_permissions(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = fs::metadata(path)?.permissions();
+    if permissions.mode() & 0o077 != 0 {
+        permissions.set_mode(0o600);
+        fs::set_permissions(path, permissions)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn harden_key_permissions(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static ATOMIC_REPLACE_FAILURE_STAGE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn inject_atomic_replace_failure(stage: u8) -> io::Result<()> {
+    ATOMIC_REPLACE_FAILURE_STAGE.with(|configured| {
+        if configured.get() == stage {
+            Err(io::Error::new(io::ErrorKind::Other, format!("injected atomic replacement failure at stage {stage}")))
+        } else {
+            Ok(())
+        }
+    })
+}
+
+#[cfg(windows)]
+fn move_file_write_through(source: &Path, destination: &Path, replace: bool) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination.as_os_str().encode_wide().chain(Some(0)).collect();
+    let flags = MOVEFILE_WRITE_THROUGH | if replace { MOVEFILE_REPLACE_EXISTING } else { 0 };
+    if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), flags) } == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn install_temp_noclobber(temporary: NamedTempFile, path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        move_file_write_through(temporary.path(), path, false)
+    }
+    #[cfg(not(windows))]
+    {
+        temporary.persist_noclobber(path).map(|_| ()).map_err(|e| e.error)
+    }
+}
+
+fn atomic_replace(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let parent = ensure_parent(path)?;
+    let mut temporary = NamedTempFile::new_in(parent)?;
+    #[cfg(test)]
+    inject_atomic_replace_failure(1)?;
+    temporary.write_all(contents)?;
+    #[cfg(test)]
+    inject_atomic_replace_failure(2)?;
+    temporary.as_file().sync_all()?;
+    #[cfg(test)]
+    inject_atomic_replace_failure(3)?;
+    #[cfg(windows)]
+    move_file_write_through(temporary.path(), path, true)?;
+    #[cfg(not(windows))]
+    temporary.persist(path).map_err(|e| e.error)?;
+    #[cfg(test)]
+    inject_atomic_replace_failure(4)?;
+    sync_parent(parent)
+}
+
+/// Persist escrow state without exposing a partially-written JSON file, then empty the
+/// journal: every line it held is folded into this snapshot.
+pub fn save_state_atomic(path: &Path, state: &EscrowState) -> Result<(), String> {
+    let json = serde_json::to_vec(state).map_err(|e| format!("Failed to serialize escrow state: {}", e))?;
+    atomic_replace(path, &json)
+        .map_err(|e| format!("Failed to atomically write escrow state '{}': {}", path.display(), e))?;
+    let journal = journal_path_for(path);
+    if journal.exists() {
+        fs::write(&journal, b"")
+            .map_err(|e| format!("Failed to empty escrow journal '{}': {}", journal.display(), e))?;
+    }
+    Ok(())
 }
 
 /// Load the OPoI escrow private key from `path`. Fails if the file does not exist.
@@ -990,14 +1355,15 @@ pub fn load_key(path: &str) -> Result<String, String> {
             path
         ));
     }
-    let s = fs::read_to_string(p)
-        .map_err(|e| format!("Failed to read escrow key file '{}': {}", path, e))?;
+    // Best effort: a filesystem without Unix permissions (removable media, some network mounts)
+    // must not stop a miner whose key is perfectly readable.
+    if let Err(e) = harden_key_permissions(p) {
+        warn!("Could not restrict permissions on escrow key file '{}': {}", path, e);
+    }
+    let s = fs::read_to_string(p).map_err(|e| format!("Failed to read escrow key file '{}': {}", path, e))?;
     let privkey = s.trim().to_string();
     if privkey.len() != 64 || !privkey.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(format!(
-            "Escrow key file '{}' must contain exactly 64 hex chars",
-            path
-        ));
+        return Err(format!("Escrow key file '{}' must contain exactly 64 hex chars", path));
     }
     Ok(privkey)
 }
@@ -1008,16 +1374,8 @@ pub fn load_or_generate_key(path: &str) -> Result<String, String> {
     use rand::RngCore;
     let p = std::path::Path::new(path);
     if p.exists() {
-        let s = fs::read_to_string(p)
-            .map_err(|e| format!("Failed to read escrow key file '{}': {}", path, e))?;
-        let privkey = s.trim().to_string();
-        if privkey.len() != 64 || !privkey.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(format!(
-                "Escrow key file '{}' must contain exactly 64 hex chars — delete it to regenerate",
-                path
-            ));
-        }
-        return Ok(privkey);
+        return load_key(path)
+            .map_err(|e| format!("{}. Restore the correct key; do not delete a key that may control rewards.", e));
     }
 
     let mut privkey_bytes = [0u8; 32];
@@ -1035,8 +1393,21 @@ pub fn load_or_generate_key(path: &str) -> Result<String, String> {
     let (xonly, _) = kp.x_only_public_key();
     let pubkey_hex = hex::encode(xonly.serialize());
 
-    fs::write(p, &privkey_hex)
+    let parent =
+        ensure_parent(p).map_err(|e| format!("Failed to create escrow key directory for '{}': {}", path, e))?;
+    let mut temporary = NamedTempFile::new_in(parent)
+        .map_err(|e| format!("Failed to create temporary escrow key file for '{}': {}", path, e))?;
+    temporary
+        .write_all(privkey_hex.as_bytes())
+        .and_then(|_| temporary.as_file().sync_all())
         .map_err(|e| format!("Failed to write escrow key file '{}': {}", path, e))?;
+
+    match install_temp_noclobber(temporary, p) {
+        Ok(()) => sync_parent(parent)
+            .map_err(|e| format!("Failed to sync escrow key directory '{}': {}", parent.display(), e))?,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return load_key(path),
+        Err(e) => return Err(format!("Failed to install escrow key file '{}': {}", path, e)),
+    }
 
     info!("OPoI escrow keypair generated — saved to '{}'", path);
     info!("  Escrow pubkey : {}", pubkey_hex);
@@ -1046,30 +1417,65 @@ pub fn load_or_generate_key(path: &str) -> Result<String, String> {
 
 /// Derive the x-only public key hex (64 hex chars) from a hex-encoded private key.
 pub fn pubkey_hex_from_privkey(privkey_hex: &str) -> Result<String, String> {
-    let privkey_bytes = hex::decode(privkey_hex)
-        .map_err(|e| format!("Invalid privkey hex: {}", e))?;
+    let privkey_bytes = hex::decode(privkey_hex).map_err(|e| format!("Invalid privkey hex: {}", e))?;
     let secp = secp256k1::Secp256k1::new();
-    let sk = secp256k1::SecretKey::from_slice(&privkey_bytes)
-        .map_err(|e| format!("Invalid private key: {}", e))?;
+    let sk = secp256k1::SecretKey::from_slice(&privkey_bytes).map_err(|e| format!("Invalid private key: {}", e))?;
     let kp = secp256k1::Keypair::from_secret_key(&secp, &sk);
     let (xonly, _) = kp.x_only_public_key();
     Ok(hex::encode(xonly.serialize()))
 }
 
-fn load_state(path: &PathBuf) -> EscrowState {
-    let state = match fs::read_to_string(path) {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
-            warn!("EscrowWatcher: could not parse {}: {} — starting fresh", path.display(), e);
-            EscrowState::default()
-        }),
+fn load_state(path: &Path) -> Result<EscrowState, String> {
+    let mut state: EscrowState = match fs::read_to_string(path) {
+        Ok(s) => serde_json::from_str(&s).map_err(|e| {
+            format!("Escrow state '{}' is corrupt: {}. Restore it or run --recover-escrow.", path.display(), e)
+        })?,
         Err(e) if e.kind() == io::ErrorKind::NotFound => EscrowState::default(),
-        Err(e) => {
-            warn!("EscrowWatcher: could not read {}: {} — starting fresh", path.display(), e);
-            EscrowState::default()
-        }
+        Err(e) => return Err(format!("Failed to read escrow state '{}': {}", path.display(), e)),
     };
+    replay_journal(&journal_path_for(path), &mut state)?;
+    Ok(state)
+}
 
-    state
+/// Fold the journal lines newer than the snapshot into `state`; each line upserts the entry
+/// with its outpoint. A line that does not parse (a write cut short) is skipped.
+fn replay_journal(path: &Path, state: &mut EscrowState) -> Result<(), String> {
+    let file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("Failed to read escrow journal '{}': {}", path.display(), e)),
+    };
+    let mut index: HashMap<String, usize> =
+        state.entries.iter().enumerate().map(|(i, e)| (format!("{}:{}", e.coinbase_txid, e.output_index), i)).collect();
+    let (mut applied, mut skipped, mut stale) = (0u64, 0u64, 0u64);
+    for line in io::BufReader::new(file).lines() {
+        let line = line.map_err(|e| format!("Failed to read escrow journal '{}': {}", path.display(), e))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(JournalLine { s, e }) = serde_json::from_str::<JournalLine>(&line) else {
+            skipped += 1;
+            continue;
+        };
+        if s <= state.journal_seq {
+            stale += 1;
+            continue;
+        }
+        state.journal_seq = s;
+        let key = format!("{}:{}", e.coinbase_txid, e.output_index);
+        match index.get(&key) {
+            Some(&i) => state.entries[i] = e,
+            None => {
+                index.insert(key, state.entries.len());
+                state.entries.push(e);
+            }
+        }
+        applied += 1;
+    }
+    if applied > 0 || skipped > 0 {
+        info!("EscrowWatcher: journal replayed — {} line(s) applied, {} stale, {} unreadable", applied, stale, skipped);
+    }
+    Ok(())
 }
 
 // ── Script builders ───────────────────────────────────────────────────────────
@@ -1079,9 +1485,9 @@ fn load_state(path: &PathBuf) -> EscrowState {
 /// `<CHALLENGE_WINDOW_BLOCKS_LE> OP_CSV OP_DATA_32 <pubkey_32> OP_CHECKSIG`
 ///
 /// Keryx's OP_CSV pops its argument, so no OP_DROP is needed after it.
-fn build_escrow_script(pubkey: &[u8; 32]) -> Vec<u8> {
-    // 36 000 = 0x8CA0 — trim trailing zero bytes for minimal encoding
-    let le = CHALLENGE_WINDOW_BLOCKS.to_le_bytes();
+fn build_escrow_script(pubkey: &[u8; 32], csv_window: u64) -> Vec<u8> {
+    // trim trailing zero bytes for minimal encoding
+    let le = csv_window.to_le_bytes();
     let trimmed_len = 8 - le.iter().rev().position(|&b| b != 0).unwrap_or(8);
     let seq_bytes = &le[..trimmed_len];
 
@@ -1133,6 +1539,7 @@ impl SighashReused {
         payout_amount: u64,
         payout_spk_version: u16,
         payout_spk_script: &[u8],
+        csv_window: u64,
     ) -> Self {
         // previous_outputs_hash: Blake2b(txid_32 | index_u32_LE, per input)
         let mut h = sighash_hasher();
@@ -1145,7 +1552,7 @@ impl SighashReused {
         // sequences_hash: Blake2b(sequence_u64_LE, per input)
         let mut h = sighash_hasher();
         for _ in inputs {
-            h.update(&CHALLENGE_WINDOW_BLOCKS.to_le_bytes());
+            h.update(&csv_window.to_le_bytes());
         }
         let seqs_hash = finalize32(h);
 
@@ -1172,7 +1579,12 @@ impl SighashReused {
 ///
 /// Mirrors `calc_schnorr_signature_hash` in consensus/core/src/hashing/sighash.rs.
 /// Byte-identical to the historical single-input version when the batch has one entry.
-fn compute_sighash(input: &([u8; 32], u32, u64), escrow_script: &[u8], reused: &SighashReused) -> [u8; 32] {
+fn compute_sighash(
+    input: &([u8; 32], u32, u64),
+    escrow_script: &[u8],
+    reused: &SighashReused,
+    csv_window: u64,
+) -> [u8; 32] {
     let (txid, index, amount) = input;
     let mut h = sighash_hasher();
     h.update(&0u16.to_le_bytes()); // tx.version
@@ -1186,7 +1598,7 @@ fn compute_sighash(input: &([u8; 32], u32, u64), escrow_script: &[u8], reused: &
     h.update(&(escrow_script.len() as u64).to_le_bytes()); // write_var_bytes len
     h.update(escrow_script); // write_var_bytes data
     h.update(&amount.to_le_bytes()); // utxo.amount
-    h.update(&CHALLENGE_WINDOW_BLOCKS.to_le_bytes()); // input.sequence
+    h.update(&csv_window.to_le_bytes()); // input.sequence
     h.update(&[1u8]); // input.sig_op_count
     h.update(&reused.outs_hash);
     h.update(&0u64.to_le_bytes()); // tx.lock_time
@@ -1210,6 +1622,7 @@ fn compute_claim_txid(
     payout_amount: u64,
     payout_spk_version: u16,
     payout_spk_script: &[u8],
+    csv_window: u64,
 ) -> String {
     let mut h = Blake2bParams::new().hash_length(32).key(b"TransactionID").to_state();
     h.update(&0u16.to_le_bytes()); // tx.version
@@ -1218,7 +1631,7 @@ fn compute_claim_txid(
         h.update(txid); // outpoint.transaction_id
         h.update(&index.to_le_bytes()); // outpoint.index
         h.update(&0u64.to_le_bytes()); // write_var_bytes(&[]) — sig script excluded
-        h.update(&CHALLENGE_WINDOW_BLOCKS.to_le_bytes()); // sequence
+        h.update(&csv_window.to_le_bytes()); // sequence
     }
     h.update(&1u64.to_le_bytes()); // write_len(outputs)
     h.update(&payout_amount.to_le_bytes()); // output.value
@@ -1277,4 +1690,639 @@ fn decode_address(addr: &str) -> Result<(u16, [u8; 32]), String> {
     let mut spk = [0u8; 32];
     spk.copy_from_slice(&bytes[1..33]);
     Ok((version, spk))
+}
+
+// ── Escrow delegation cert ────────────────────────────────────────────────────
+
+/// Mirror of the node's `ESCROW_DELEGATION_DOMAIN`.
+const ESCROW_DELEGATION_DOMAIN: &[u8] = b"KeryxEscrowDelegationV1";
+
+fn escrow_delegation_message(escrow_pubkey: &[u8; 32]) -> [u8; 32] {
+    let mut h = Blake2bParams::new().hash_length(32).to_state();
+    h.update(ESCROW_DELEGATION_DOMAIN);
+    h.update(escrow_pubkey);
+    finalize32(h)
+}
+
+/// Service-ledger identity of a payout address — mirror of the node's `miner_key(spk)`:
+/// blake2b-256 keyed "TransactionHash" over `[version_le(2), p2pk_script]`. This is what the
+/// node reports strikes, burns and suspensions against; the escrow key is only the hot key.
+pub fn service_identity_hex(payout_address: &str) -> Result<String, String> {
+    let (version, payout_key) = decode_address(payout_address)?;
+    if version != 0 {
+        return Err(format!("Payout address version {} has no service identity (schnorr P2PK only)", version));
+    }
+    let mut h = Blake2bParams::new().hash_length(32).key(b"TransactionHash").to_state();
+    h.update(&version.to_le_bytes());
+    h.update(&build_p2pk_script(&payout_key));
+    Ok(hex::encode(finalize32(h)))
+}
+
+/// Verifies a delegation cert exactly the way the node does before accepting a block: schnorr
+/// over the domain-hashed escrow key, by the x-only key of the payout address.
+pub fn verify_escrow_cert(payout_address: &str, escrow_pubkey_hex: &str, cert_hex: &str) -> Result<(), String> {
+    let (version, payout_key) = decode_address(payout_address)?;
+    if version != 0 {
+        return Err(format!("Payout address version {} cannot carry a delegation (schnorr P2PK only)", version));
+    }
+    let mut escrow_pubkey = [0u8; 32];
+    hex::decode_to_slice(escrow_pubkey_hex, &mut escrow_pubkey)
+        .map_err(|e| format!("Invalid escrow pubkey hex: {}", e))?;
+    let mut sig_bytes = [0u8; 64];
+    hex::decode_to_slice(cert_hex, &mut sig_bytes).map_err(|e| format!("Invalid cert hex: {}", e))?;
+
+    let payout_key =
+        secp256k1::XOnlyPublicKey::from_slice(&payout_key).map_err(|e| format!("Invalid payout address key: {}", e))?;
+    let sig =
+        secp256k1::schnorr::Signature::from_slice(&sig_bytes).map_err(|e| format!("Invalid cert signature: {}", e))?;
+    let msg = secp256k1::Message::from_digest_slice(&escrow_delegation_message(&escrow_pubkey)).unwrap();
+    secp256k1::Secp256k1::verification_only()
+        .verify_schnorr(&sig, &msg, &payout_key)
+        .map_err(|_| "Cert does not match this payout address and escrow key".to_string())
+}
+
+/// Signs the delegation cert when the payout address IS this escrow key's own address — the only
+/// case where the payout key is on this machine. `None` otherwise: a cold payout address must be
+/// signed by the wallet that holds it.
+pub fn self_sign_cert(privkey_hex: &str, payout_address: &str) -> Option<String> {
+    let (version, payout_key) = decode_address(payout_address).ok()?;
+    let privkey_bytes = hex::decode(privkey_hex).ok()?;
+    let secp = secp256k1::Secp256k1::new();
+    let sk = secp256k1::SecretKey::from_slice(&privkey_bytes).ok()?;
+    let kp = secp256k1::Keypair::from_secret_key(&secp, &sk);
+    let (xonly, _) = kp.x_only_public_key();
+    let pubkey: [u8; 32] = xonly.serialize();
+    if version != 0 || payout_key != pubkey {
+        return None;
+    }
+    let msg = secp256k1::Message::from_digest_slice(&escrow_delegation_message(&pubkey)).ok()?;
+    Some(hex::encode(secp.sign_schnorr_no_aux_rand(&msg, &kp).as_ref()))
+}
+
+/// Loads the delegation cert and verifies it against the payout address and escrow key before
+/// returning it. Never hands back a cert the node would reject.
+pub fn load_cert(path: &str, payout_address: &str, escrow_pubkey_hex: &str) -> Result<String, String> {
+    let raw = fs::read_to_string(path).map_err(|e| format!("Cannot read escrow delegation cert '{}': {}", path, e))?;
+    let cert = raw.trim().to_ascii_lowercase();
+    if cert.len() != 128 {
+        return Err(format!("Escrow delegation cert '{}' must be 128 hex chars, found {}", path, cert.len()));
+    }
+    verify_escrow_cert(payout_address, escrow_pubkey_hex, &cert)?;
+    Ok(cert)
+}
+
+/// Persist a verified delegation cert to `path` so later starts load it without `--escrow-cert`.
+/// Idempotent: writes only when the file is missing or holds a different value. Returns whether it
+/// wrote. The cert is public (a signature over pubkey↔address), so the file needs no special mode.
+pub fn save_cert(path: &str, cert_hex: &str) -> std::io::Result<bool> {
+    if let Ok(existing) = fs::read_to_string(path) {
+        if existing.trim().eq_ignore_ascii_case(cert_hex) {
+            return Ok(false);
+        }
+    }
+    fs::write(path, cert_hex)?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Payout address of the private key `0x11..11`, used as a payout key below.
+    const TEST_PAYOUT_ADDRESS: &str = "keryx:qp8n2k7uklxq4aegau7vawtptkgxsja4kt99lpv6krctwpq8tpc65uyeddvzr";
+
+    /// The service identity must equal the node's `miner_key(spk)`. The expected value is derived
+    /// independently of this code: blake2b-256 keyed "TransactionHash" over
+    /// `[version_le(2), 0x20 || key || 0xac]`.
+    #[test]
+    fn service_identity_matches_the_node_miner_key() {
+        assert_eq!(
+            service_identity_hex("keryx:qrxpcusyrxjxghfdumcxm2rqw4dhe3n9hyqpvgn2wfyldltf99w2xhnajuhte").unwrap(),
+            "cb79bef02d429e0fc8bb2335bf43d9d0df4f5bd6a25a39747d700b173e766e20"
+        );
+        assert!(service_identity_hex("not-an-address").is_err());
+    }
+
+    /// Cross-implementation vector. This cert was produced by the web wallet (noble schnorr over
+    /// noble blake2b) for escrow key `0x22..22` and the address of private key `0x11..11`. The
+    /// consensus rule must accept it: the two implementations have to agree on the domain string,
+    /// the digest and the curve, and nothing else pins that agreement.
+    #[test]
+    fn web_wallet_cert_verifies_against_the_consensus_rule() {
+        let cert = "f3cf9bfc6a29ba5608ebe777ff9e1f87d5bc3f80ab58e3040995631bfc16ab21\
+                    8b388c9b2d44140fc9448e639dc81c51ba475a780d1eaecc443c613e6d787c9e";
+        assert!(verify_escrow_cert(TEST_PAYOUT_ADDRESS, &"22".repeat(32), cert).is_ok());
+        // Same signature against another escrow key must fail, or the test proves nothing.
+        assert!(verify_escrow_cert(TEST_PAYOUT_ADDRESS, &"33".repeat(32), cert).is_err());
+    }
+
+    /// The miner signs its own delegation only when the payout address is its escrow key's.
+    #[test]
+    fn self_signing_is_limited_to_the_escrow_key_address() {
+        let privkey = "1111111111111111111111111111111111111111111111111111111111111111";
+        let own = TEST_PAYOUT_ADDRESS;
+        let cert = self_sign_cert(privkey, own).expect("own address must self-sign");
+        let escrow_pubkey = pubkey_hex_from_privkey(privkey).unwrap();
+        assert!(verify_escrow_cert(own, &escrow_pubkey, &cert).is_ok());
+
+        // Any other payout address: the miner does not hold that key, so it must refuse.
+        assert!(self_sign_cert(
+            privkey,
+            "keryx:qrxpcusyrxjxghfdumcxm2rqw4dhe3n9hyqpvgn2wfyldltf99w2xhnajuhte"
+        )
+        .is_none());
+    }
+
+    /// A cert only verifies against the exact payout address and escrow key it was signed for.
+    #[test]
+    fn escrow_cert_binds_payout_address_and_escrow_key() {
+        let secp = secp256k1::Secp256k1::new();
+        let sk = secp256k1::SecretKey::from_slice(&[0x11u8; 32]).unwrap();
+        let kp = secp256k1::Keypair::from_secret_key(&secp, &sk);
+        let escrow_pubkey = [0x22u8; 32];
+        let msg = secp256k1::Message::from_digest_slice(&escrow_delegation_message(&escrow_pubkey)).unwrap();
+        let cert = hex::encode(secp.sign_schnorr_no_aux_rand(&msg, &kp).as_ref());
+
+        assert!(verify_escrow_cert(TEST_PAYOUT_ADDRESS, &hex::encode(escrow_pubkey), &cert).is_ok());
+        // Another escrow key: the delegation message differs.
+        assert!(verify_escrow_cert(TEST_PAYOUT_ADDRESS, &hex::encode([0x33u8; 32]), &cert).is_err());
+        // Another payout address: not the signer.
+        assert!(verify_escrow_cert(
+            "keryx:qrxpcusyrxjxghfdumcxm2rqw4dhe3n9hyqpvgn2wfyldltf99w2xhnajuhte",
+            &hex::encode(escrow_pubkey),
+            &cert
+        )
+        .is_err());
+        assert!(verify_escrow_cert(TEST_PAYOUT_ADDRESS, &hex::encode(escrow_pubkey), "dead").is_err());
+    }
+
+    /// The responder signature must verify exactly the way the node's `verified_responder`
+    /// does: schnorr over blake2b-256("KeryxServiceResponderV1" || v1 payload bytes) with the
+    /// x-only escrow pubkey.
+    #[test]
+    fn responder_signature_verifies_like_the_node() {
+        let dir = std::env::temp_dir().join(format!("keryx-escrow-test-{}", std::process::id()));
+        let privkey = "1111111111111111111111111111111111111111111111111111111111111111";
+        let w = EscrowWatcher::new(
+            privkey,
+            "keryx:qrxpcusyrxjxghfdumcxm2rqw4dhe3n9hyqpvgn2wfyldltf99w2xhnajuhte",
+            dir,
+        )
+        .unwrap();
+
+        let resp = keryx_inference::AiResponsePayload::new([9u8; 32], 123, [7u8; 34], 5);
+        let signed_bytes = resp.signed_bytes();
+        let r = w.sign_responder(&signed_bytes);
+        assert_eq!(r.escrow_pubkey, w.pubkey_bytes);
+
+        // Node-side verification, replicated bit-for-bit.
+        let mut hasher = blake2b_simd::Params::new().hash_length(32).to_state();
+        hasher.update(b"KeryxServiceResponderV1");
+        hasher.update(&signed_bytes);
+        let msg = secp256k1::Message::from_digest_slice(hasher.finalize().as_bytes()).unwrap();
+        let pk = secp256k1::XOnlyPublicKey::from_slice(&r.escrow_pubkey).unwrap();
+        let sig = secp256k1::schnorr::Signature::from_slice(&r.signature).unwrap();
+        assert!(secp256k1::SECP256K1.verify_schnorr(&sig, &msg, &pk).is_ok());
+
+        // A tampered payload byte must fail verification.
+        let mut bad = signed_bytes.clone();
+        bad[0] ^= 1;
+        let mut hasher = blake2b_simd::Params::new().hash_length(32).to_state();
+        hasher.update(b"KeryxServiceResponderV1");
+        hasher.update(&bad);
+        let bad_msg = secp256k1::Message::from_digest_slice(hasher.finalize().as_bytes()).unwrap();
+        assert!(secp256k1::SECP256K1.verify_schnorr(&sig, &bad_msg, &pk).is_err());
+    }
+
+    /// Both escrow scripts must match what the node's `ScriptBuilder::add_sequence` emits:
+    /// the sequence little-endian with trailing zero bytes trimmed, pushed by an OpData
+    /// opcode equal to its length. The legacy bytes are pinned so the pre-H6 script — and
+    /// every signature over it — stays unchanged.
+    #[test]
+    fn escrow_scripts_mirror_the_node_for_both_windows() {
+        let pk = [0x11u8; 32];
+        let legacy = build_escrow_script(&pk, CHALLENGE_WINDOW_BLOCKS);
+        let bonded = build_escrow_script(&pk, SERVICE_BOND_CSV_WINDOW_BLOCKS);
+
+        assert_eq!(&legacy[..3], &[0x02, 0xa0, 0x8c]); // 36_000 = 0x8ca0
+        assert_eq!(&bonded[..4], &[0x03, 0xc0, 0x15, 0x0c]); // 792_000 = 0x0c15c0
+
+        assert_eq!(legacy[3], OP_CSV);
+        assert_eq!(bonded[4], OP_CSV);
+        assert_eq!(legacy[4], 0x20);
+        assert_eq!(bonded[5], 0x20);
+        assert_eq!(&legacy[5..37], &pk);
+        assert_eq!(&bonded[6..38], &pk);
+        assert_eq!(*legacy.last().unwrap(), OP_CHECKSIG);
+        assert_eq!(*bonded.last().unwrap(), OP_CHECKSIG);
+        assert_eq!(legacy.len(), 38);
+        assert_eq!(bonded.len(), 39);
+    }
+
+    /// The window is derived from the creating block's DAA, so entries minted on either
+    /// side of the gate keep their own lock.
+    #[test]
+    fn csv_window_follows_the_gate() {
+        let gate = keryx_miner::pom::pom_v3_activation_daa();
+        if gate > 0 && gate < u64::MAX {
+            assert_eq!(csv_window_for_daa(gate - 1), CHALLENGE_WINDOW_BLOCKS);
+        }
+        assert_eq!(csv_window_for_daa(gate), SERVICE_BOND_CSV_WINDOW_BLOCKS);
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+
+    fn state(confirm_daa: u64) -> EscrowState {
+        EscrowState {
+            entries: vec![EscrowEntry {
+                coinbase_txid: "01".repeat(32),
+                block_hash: "02".repeat(32),
+                confirm_daa,
+                amount_sompi: 100,
+                output_index: 1,
+                claimed: false,
+                slashed: false,
+                orphan_slashed: false,
+                orphan_retries: 0,
+                orphan_retry_after_daa: None,
+                submit_retries: 0,
+                batch_cap: 0,
+                cap_set_daa: 0,
+                is_inference: false,
+                csv_window: csv_window_for_daa(confirm_daa),
+            }],
+            journal_seq: 0,
+        }
+    }
+
+    fn fail_at(stage: u8) {
+        ATOMIC_REPLACE_FAILURE_STAGE.with(|configured| configured.set(stage));
+    }
+
+    fn entry(idx: usize, confirm_daa: u64, csv_window: u64) -> EscrowEntry {
+        EscrowEntry {
+            coinbase_txid: format!("{idx:064x}"),
+            block_hash: "02".repeat(32),
+            confirm_daa,
+            amount_sompi: 100,
+            output_index: 1,
+            claimed: false,
+            slashed: false,
+            orphan_slashed: false,
+            orphan_retries: 0,
+            orphan_retry_after_daa: None,
+            submit_retries: 0,
+            batch_cap: 0,
+            cap_set_daa: 0,
+            is_inference: false,
+            csv_window,
+        }
+    }
+
+    /// A sub-full remainder of legacy-window entries at the head of the queue must not
+    /// keep a full current-window batch from shipping.
+    #[test]
+    fn full_current_window_batch_ships_past_legacy_remainder() {
+        let gate = keryx_miner::pom::pom_v3_activation_daa();
+        let daa = gate + SERVICE_BOND_CSV_WINDOW_BLOCKS + 100_000;
+        let mut entries: Vec<EscrowEntry> =
+            (0..40).map(|i| entry(i, gate.saturating_sub(50_000), CHALLENGE_WINDOW_BLOCKS)).collect();
+        entries.extend((40..40 + MAX_CLAIM_BATCH).map(|i| entry(i, gate + 10, SERVICE_BOND_CSV_WINDOW_BLOCKS)));
+
+        let batch = select_claim_batch(&entries, daa, &HashSet::new());
+        assert_eq!(batch.len(), MAX_CLAIM_BATCH);
+        assert!(batch.iter().all(|&i| entries[i].csv_window == SERVICE_BOND_CSV_WINDOW_BLOCKS));
+    }
+
+    /// Legacy-window entries can no longer grow to a full batch once coinbases mint the
+    /// bonded window: they must drain at any size instead of waiting forever.
+    #[test]
+    fn stranded_legacy_window_drains_at_any_size() {
+        let gate = keryx_miner::pom::pom_v3_activation_daa();
+        if gate == 0 {
+            return; // testnet build: no legacy era exists
+        }
+        let daa = gate + SERVICE_BOND_CSV_WINDOW_BLOCKS + 100_000;
+        let mut entries: Vec<EscrowEntry> =
+            (0..40).map(|i| entry(i, gate.saturating_sub(50_000), CHALLENGE_WINDOW_BLOCKS)).collect();
+        // Current-window entries below a full batch: nominal must hold them back.
+        entries.extend((40..90).map(|i| entry(i, gate + 10, SERVICE_BOND_CSV_WINDOW_BLOCKS)));
+
+        let batch = select_claim_batch(&entries, daa, &HashSet::new());
+        assert_eq!(batch.len(), 40);
+        assert!(batch.iter().all(|&i| entries[i].csv_window == CHALLENGE_WINDOW_BLOCKS));
+    }
+
+    #[test]
+    fn state_replacement_is_complete_and_parseable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("escrow_state.json");
+        save_state_atomic(&path, &EscrowState::default()).unwrap();
+        save_state_atomic(&path, &state(42)).unwrap();
+
+        let loaded: EscrowState = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(loaded.entries[0].confirm_daa, 42);
+    }
+
+    #[test]
+    fn failures_before_replace_preserve_previous_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("escrow_state.json");
+        save_state_atomic(&path, &state(1)).unwrap();
+        let original = fs::read(&path).unwrap();
+
+        for stage in 1..=3 {
+            fail_at(stage);
+            assert!(save_state_atomic(&path, &state(2)).is_err());
+            fail_at(0);
+            assert_eq!(fs::read(&path).unwrap(), original, "failure stage {stage}");
+        }
+    }
+
+    #[test]
+    fn failure_after_replace_leaves_complete_state_and_allows_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("escrow_state.json");
+        save_state_atomic(&path, &state(1)).unwrap();
+
+        fail_at(4);
+        assert!(save_state_atomic(&path, &state(2)).is_err());
+        fail_at(0);
+        let loaded: EscrowState = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(loaded.entries[0].confirm_daa, 2);
+
+        save_state_atomic(&path, &state(3)).unwrap();
+        let retried: EscrowState = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(retried.entries[0].confirm_daa, 3);
+    }
+
+    #[test]
+    fn concurrent_key_creation_returns_one_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Arc::new(dir.path().join("escrow.key"));
+        let barrier = Arc::new(Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let path = Arc::clone(&path);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    load_or_generate_key(path.to_str().unwrap()).unwrap()
+                })
+            })
+            .collect();
+        let keys: Vec<_> = handles.into_iter().map(|handle| handle.join().unwrap()).collect();
+
+        assert!(keys.iter().all(|key| key == &keys[0]));
+        assert_eq!(fs::read_to_string(path.as_ref()).unwrap(), keys[0]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_key_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("escrow.key");
+        load_or_generate_key(path.to_str().unwrap()).unwrap();
+        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_key_permissions_are_hardened() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("escrow.key");
+        fs::write(&path, "11".repeat(32)).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        load_or_generate_key(path.to_str().unwrap()).unwrap();
+
+        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn invalid_key_fails_without_changing_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("escrow.key");
+        let invalid = b"not-a-private-key";
+        fs::write(&path, invalid).unwrap();
+
+        assert!(load_or_generate_key(path.to_str().unwrap()).is_err());
+        assert_eq!(fs::read(path).unwrap(), invalid);
+    }
+
+    #[test]
+    fn corrupt_state_fails_closed_without_changing_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("escrow_state.json");
+        let invalid = b"{not-json";
+        fs::write(&path, invalid).unwrap();
+
+        let error = load_state(&path).unwrap_err();
+        assert!(error.contains("corrupt"));
+        assert!(error.contains("--recover-escrow"));
+        assert_eq!(fs::read(path).unwrap(), invalid);
+    }
+
+    #[test]
+    fn unknown_block_at_boot_keeps_the_entry_but_a_reorged_block_purges_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("escrow_state.json");
+        let address = format!("keryx:{}", "q".repeat(61));
+        let mut watcher = EscrowWatcher::new(&"11".repeat(32), &address, path).unwrap();
+        let mut second = entry(2, 77, csv_window_for_daa(77));
+        second.block_hash = "03".repeat(32);
+        watcher.state = state(77);
+        watcher.state.entries.push(second);
+        watcher.rebuild_indexes();
+
+        let pending = watcher.start_state_validation();
+        assert_eq!(pending.len(), 2);
+        assert!(watcher.validation_in_progress());
+
+        // Unknown to this node: kept.
+        assert!(watcher.on_block_validation_error(&format!("cannot find header {}", "02".repeat(32))));
+        assert!(!watcher.state.entries[0].slashed);
+        assert!(watcher.validation_in_progress());
+
+        // Known but off the selected chain: purged.
+        assert!(watcher.consume_validation_ok(&"03".repeat(32), false));
+        assert!(watcher.state.entries[1].slashed);
+        assert!(!watcher.validation_in_progress());
+
+        assert!(!watcher.on_block_validation_error("cannot find header ffff"));
+    }
+
+    #[test]
+    fn explicit_flush_keeps_dirty_state_until_retry_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("state").join("escrow_state.json");
+        let address = format!("keryx:{}", "q".repeat(61));
+        let mut watcher = EscrowWatcher::new(&"11".repeat(32), &address, path.clone()).unwrap();
+        watcher.state = state(77);
+        watcher.snapshot_due = true;
+
+        fail_at(1);
+        assert!(watcher.flush_state().is_err());
+        assert!(watcher.snapshot_due);
+        fail_at(0);
+        watcher.flush_state().unwrap();
+
+        assert!(!watcher.snapshot_due);
+        let loaded: EscrowState = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(loaded.entries[0].confirm_daa, 77);
+    }
+
+    fn chain_block(hash: &str, coinbase_txid: &str, daa_score: u64, escrow_script_hex: &str) -> crate::proto::RpcBlock {
+        crate::proto::RpcBlock {
+            header: Some(crate::proto::RpcBlockHeader { daa_score, ..Default::default() }),
+            transactions: vec![RpcTransaction {
+                outputs: vec![
+                    RpcTransactionOutput { amount: 1_000, ..Default::default() },
+                    RpcTransactionOutput {
+                        amount: 250,
+                        script_public_key: Some(RpcScriptPublicKey {
+                            version: 0,
+                            script_public_key: escrow_script_hex.to_string(),
+                        }),
+                        ..Default::default()
+                    },
+                ],
+                verbose_data: Some(crate::proto::RpcTransactionVerboseData {
+                    transaction_id: coinbase_txid.to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            verbose_data: Some(crate::proto::RpcBlockVerboseData {
+                hash: hash.to_string(),
+                is_chain_block: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_reorged_out_block_purges_its_entries_and_a_re_added_one_is_tracked_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("escrow_state.json");
+        let address = format!("keryx:{}", "q".repeat(61));
+        let mut watcher = EscrowWatcher::new(&"11".repeat(32), &address, path).unwrap();
+        let script = watcher.escrow_script_bonded_hex.clone();
+        let hash = "aa".repeat(32);
+        let block = chain_block(&hash, &"bb".repeat(32), 500, &script);
+
+        watcher.handle_block(&block);
+        assert_eq!(watcher.pending_escrow(), (1, 250));
+
+        watcher.on_chain_blocks_removed(&[hash.clone(), "cc".repeat(32)]);
+        assert_eq!(watcher.pending_escrow(), (0, 0));
+        assert!(watcher.state.entries[0].slashed);
+        assert!(!watcher.outpoint_set.contains(&format!("{}:1", "bb".repeat(32))));
+        assert!(!watcher.journal_pending.is_empty());
+
+        // The block comes back into the selected chain: its coinbase is tracked afresh.
+        watcher.handle_block(&block);
+        assert_eq!(watcher.pending_escrow(), (1, 250));
+        assert_eq!(watcher.state.entries.len(), 2);
+        assert!(!watcher.state.entries[1].slashed);
+
+        // A second removal purges the live entry, not the already-slashed one.
+        watcher.on_chain_blocks_removed(&[hash]);
+        assert_eq!(watcher.pending_escrow(), (0, 0));
+    }
+
+    fn journal_line(seq: u64, e: &EscrowEntry) -> String {
+        let mut line = serde_json::to_string(&JournalLine { s: seq, e: e.clone() }).unwrap();
+        line.push('\n');
+        line
+    }
+
+    #[test]
+    fn journal_lines_newer_than_the_snapshot_are_replayed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("escrow_state.json");
+        let mut snapshot = state(10);
+        snapshot.journal_seq = 5;
+        save_state_atomic(&path, &snapshot).unwrap();
+
+        let mut claimed = snapshot.entries[0].clone();
+        claimed.claimed = true;
+        let fresh = entry(7, 20, csv_window_for_daa(20));
+        let mut journal = journal_line(5, &claimed); // stale: already folded into the snapshot
+        journal.push_str(&journal_line(6, &fresh));
+        journal.push_str(&journal_line(7, &claimed));
+        journal.push_str("{\"s\":8,\"e\":{\"coinbase_txid\":\"cut");
+        fs::write(journal_path_for(&path), journal).unwrap();
+
+        let loaded = load_state(&path).unwrap();
+        assert_eq!(loaded.entries.len(), 2);
+        assert!(loaded.entries[0].claimed);
+        assert_eq!(loaded.entries[1].coinbase_txid, fresh.coinbase_txid);
+        assert_eq!(loaded.journal_seq, 7);
+    }
+
+    #[test]
+    fn stale_journal_lines_do_not_undo_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("escrow_state.json");
+        let mut snapshot = state(10);
+        snapshot.entries[0].claimed = true;
+        snapshot.journal_seq = 9;
+        save_state_atomic(&path, &snapshot).unwrap();
+
+        let mut unclaimed = snapshot.entries[0].clone();
+        unclaimed.claimed = false;
+        fs::write(journal_path_for(&path), journal_line(3, &unclaimed)).unwrap();
+
+        let loaded = load_state(&path).unwrap();
+        assert!(loaded.entries[0].claimed);
+        assert_eq!(loaded.journal_seq, 9);
+    }
+
+    #[test]
+    fn a_snapshot_empties_the_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("escrow_state.json");
+        let journal = journal_path_for(&path);
+        fs::write(&journal, journal_line(1, &state(1).entries[0])).unwrap();
+        save_state_atomic(&path, &state(2)).unwrap();
+        assert_eq!(fs::read(&journal).unwrap(), b"");
+    }
+
+    #[test]
+    fn changes_go_to_the_journal_and_survive_a_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("escrow_state.json");
+        let address = format!("keryx:{}", "q".repeat(61));
+        let mut watcher = EscrowWatcher::new(&"11".repeat(32), &address, path.clone()).unwrap();
+        watcher.track_inference_escrow("ab".repeat(32), 100, 5_000);
+        watcher.track_inference_escrow("cd".repeat(32), 101, 6_000);
+        assert!(!watcher.journal_pending.is_empty());
+        watcher.write_journal().unwrap();
+        assert!(watcher.journal_pending.is_empty());
+        assert!(!path.exists());
+        assert_eq!(fs::read_to_string(journal_path_for(&path)).unwrap().lines().count(), 2);
+
+        let reloaded = load_state(&path).unwrap();
+        assert_eq!(reloaded.entries.len(), 2);
+        assert_eq!(reloaded.journal_seq, 2);
+
+        watcher.state.entries[0].claimed = true;
+        watcher.snapshot_due = true;
+        watcher.flush_state().unwrap();
+        assert_eq!(fs::read(journal_path_for(&path)).unwrap(), b"");
+        let snapshot: EscrowState = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(snapshot.journal_seq, 2);
+        assert!(snapshot.entries[0].claimed);
+    }
 }

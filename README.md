@@ -69,20 +69,43 @@ on first run (same as upstream).
 ./keryx-miner-rdna3 --mining-address keryx:YOUR_ADDRESS
 ```
 
-### Inference tiers (OPoI — H4 lineup, active at DAA 54,766,000)
+### Inference tiers (OPoI — H6 lineup, `POM_TIERS_H6`)
 
-| Flag | Models | Min VRAM | Fits a 7900 XT (20 GB)? |
-|------|--------|----------|--------------------------|
-| `--very-light` | EXAONE-4.0-1.2B | 4 GB | ✅ |
-| `--light` | Mistral-7B-v0.3 (Q6_K) | 8 GB | ✅ |
-| *(default)* | GLM-4-9B-0414 (Q6_K) | 12 GB | ✅ |
-| `--high` | Qwen3.6-27B (Q4_K_M) | 24 GB | no |
-| `--very-high` | Kimi-Linear-48B (Q4_K_M) | 32 GB | no |
+| Flag | Model | Tier | Min VRAM | Fits a 7900 XT (20 GB)? |
+|------|-------|------|----------|--------------------------|
+| `--very-light` | Qwen3.5-9B-abliterated (Q5_K_M) | 0 | 8 GB | ✅ |
+| `--light` | GLM-4-9B-0414 (Q6_K) | 1 | 12 GB | ✅ |
+| *(default)* | gemma-4-12B-it-abliterated (Q6_K) | 2 | 16 GB | ✅ |
+| `--high` | Qwen3.6-27B (Q4_K_M) | 3 | 24 GB | no |
+| `--very-high` | Kimi-Linear-48B (Q4_K_M) | 4 | 30 GB | no |
 
 > Under PoM, **1 GPU = 1 tier**: each tier proves possession of and serves exactly the single
-> model above — a PoM GPU is bound to the one model whose weights are resident in VRAM. This
-> build is **H4-only**: below the H4 flip point it refuses to mine (the pre-H4 lineup was
-> dropped, matching upstream v0.3.7).
+> model above — a PoM GPU is bound to the one model whose weights are resident in VRAM. The
+> miner checks the GGUF it indexes against the node-pinned `(R_T, N)` anchor of its tier and
+> refuses to mine on a mismatch.
+
+### Consensus this build mines
+
+**PoM v4** (the D=32 matrix re-walk, mainnet DAA 79,210,000) with the **H10 keccak walk seed**
+(mainnet DAA 87,360,000; both from DAA 1 on testnet) — the live rules of keryx-node v1.6.x. Each
+nonce walks a 32×32 int8 state through 256 chained 1 KB weight tiles on the GPU
+(`keryx-vulkan/shaders/pom_walk_v4.comp`); every winner is re-walked on the host, which builds the
+proof (all 256 tiles + their Merkle range proofs under the tier's `R_T`) and self-verifies it before
+submitting. The header carries `pomFinalState`, `pomTier` and the node's `serviceStateHash` (H6).
+Older eras (the v1/v2 hash walk, the H6 v3 matrix walk) are history on every network.
+
+### Solo mining: escrow delegation cert (required since H6)
+
+A solo (`grpc://`) coinbase must carry `/escrow:<key>` **and** `/esig:<cert>` — a schnorr signature
+by your **payout address** over the miner's escrow key — or the node rejects the block. On start the
+miner prints `Escrow key to authorise in your wallet: <64 hex>`:
+
+1. In your wallet, use **Authorise a miner** and paste that key.
+2. Pass the returned 128-hex line once with `--escrow-cert <cert>`; it is saved to `escrow.cert`
+   (`--escrow-cert-file`) and loaded on later starts.
+
+When the payout address *is* the miner's own escrow key, the cert is signed locally. Without a valid
+cert the miner refuses to start in solo mode. Pool mining needs none (the pool builds the coinbase).
 
 The miner is **GPU-only by default** (no CPU mining threads); pass `--threads N` (`-t`) to add CPU
 PoW workers if you want them.
@@ -174,10 +197,12 @@ automatically at every start.)
 - ✅ **VRAM capability gate runs on AMD:** total VRAM is queried via Vulkan (the largest
   device-local heap), not `nvidia-smi`, so the model-vs-VRAM filter announces only the tiers your
   card can actually serve (a 7900 XT comfortably runs `--light` and the default tier).
-- ⚠️ **Pool version gate:** some pools (suprnova) reject post-fork PoM shares from miners that don't
+- ⚠️ **Pool version gate:** some pools (suprnova) reject PoM shares from miners that don't
   advertise a recent enough `keryx-miner-supr` version in `mining.subscribe` (the floor has moved
-  with each hardfork — `0.6.3+`, then `0.7.0+`, `0.9.0+` at H5 and `0.9.2+` since H5.2); this fork advertises a
-  compatible identity so its (valid) proofs are accepted. Single string in `client/stratum.rs`.
+  with each hardfork — `0.7.0+` at H4, `0.9.2+` at H5.2, `0.12.0+` at H10); this fork advertises a
+  current identity (`0.13.3`) and subscribes as `keryx-stratum-v3`, so notifies carry the block bits
+  and a share that solves the block is never dropped under a high pool difficulty. Single string in
+  `client/stratum.rs`.
 - ⚠️ **Known benign:** an occasional panic in `MinerManager`'s shutdown/reconnect path (a worker
   thread exits before the drop-time join) — harmless under a supervised restart loop; a clean-up
   candidate.

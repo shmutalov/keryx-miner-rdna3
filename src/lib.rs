@@ -3,10 +3,13 @@ use std::any::Any;
 use std::error::Error as StdError;
 
 pub mod inference;
+pub mod keccak;
 pub mod llm_engine;
 pub mod models;
 pub mod pom;
 pub mod pom_gpu;
+pub mod pom_v3;
+pub mod pom_v4;
 pub mod slm;
 pub mod vulkan_worker;
 pub mod xoshiro256starstar;

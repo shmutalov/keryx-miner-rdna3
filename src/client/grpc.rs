@@ -24,7 +24,7 @@ use futures_util::StreamExt;
 use log::{error, info, warn};
 use rand::{thread_rng, RngCore};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc::{self, error::SendError, Sender}, oneshot};
 use tokio::task::JoinHandle;
@@ -42,17 +42,14 @@ pub struct KeryxdHandler {
     stream: Streaming<KaspadMessage>,
     miner_address: String,
     mine_when_not_synced: bool,
-    devfund_address: Option<String>,
-    devfund_percent: u16,
-    block_template_ctr: Arc<AtomicU16>,
-
     block_channel: Sender<BlockSeed>,
     block_handle: BlockHandle,
 
     /// Queue of AiRequests waiting for inference.
-    /// Each entry: (stable_id_hex16, raw_payload_bytes, model_id, prompt, max_tokens).
-    /// Fed by both BlockAdded scans and block template scans.
-    ai_request_queue: VecDeque<(String, Vec<u8>, [u8; 32], String, usize)>,
+    /// Each entry: (stable_id_hex16, request_hash, model_id, prompt, max_tokens). `request_hash`
+    /// is the identity the AiResponse names: the AiRequest transaction id from H8, the payload
+    /// digest before it. Fed by both BlockAdded scans and block template scans.
+    ai_request_queue: VecDeque<(String, [u8; 32], [u8; 32], String, usize)>,
 
     /// Block hashes queued for boot-time escrow-state validation, drained in slices of
     /// VALIDATION_WINDOW so thousands of GetBlock requests never saturate the HTTP/2
@@ -66,9 +63,9 @@ pub struct KeryxdHandler {
     /// Used by poll_inference to register the escrow outpoint after a successful AiResponse.
     ai_request_txids: std::collections::HashMap<String, (String, u64)>,
 
-    /// In-flight SLM inference task: (request_raw_bytes, result_receiver).
+    /// In-flight SLM inference task: (request_hash, result_receiver).
     /// None result means inference failed (model not ready or empty output) — skip IPFS upload.
-    inference_rx: Option<(Vec<u8>, oneshot::Receiver<Option<String>>)>,
+    inference_rx: Option<([u8; 32], oneshot::Receiver<Option<String>>)>,
 
     /// In-flight inference for a node-issued challenge.
     /// Tuple: (challenge_string, result_receiver) where challenge_string = "model_id_hex:nonce_hex".
@@ -90,13 +87,21 @@ pub struct KeryxdHandler {
 
     /// Auto-claim module: present when an escrow private key is available.
     escrow_watcher: Option<crate::escrow::EscrowWatcher>,
+
+    /// 128-char hex delegation cert embedded as `/esig:<cert>`, binding the escrow key above to
+    /// the payout address. Mandatory from H6 — a block without it is invalid.
+    escrow_cert: Option<String>,
 }
 
 #[async_trait(?Send)]
 impl Client for KeryxdHandler {
-    fn add_devfund(&mut self, address: String, percent: u16) {
-        self.devfund_address = Some(address);
-        self.devfund_percent = percent;
+    fn flush_escrow_state(&mut self) -> Result<(), Error> {
+        self.escrow_watcher.as_mut().map_or(Ok(()), |watcher| watcher.flush_state().map_err(Into::into))
+    }
+
+    fn add_devfund(&mut self, _address: String, _percent: u16) {
+        // Solo templates always pay the miner: from H6 the coinbase's `/esig:` cert is bound to
+        // the payout key, so a template paying any other address would be an invalid block.
     }
 
     async fn register(&mut self) -> Result<(), Error> {
@@ -150,9 +155,9 @@ impl KeryxdHandler {
         address: D,
         miner_address: String,
         mine_when_not_synced: bool,
-        block_template_ctr: Option<Arc<AtomicU16>>,
         escrow_privkey: Option<String>,
         escrow_state_file: String,
+        escrow_cert: Option<String>,
         ipfs_url: String,
     ) -> Result<Box<Self>, Error>
     where
@@ -194,10 +199,6 @@ impl KeryxdHandler {
             send_channel,
             miner_address,
             mine_when_not_synced,
-            devfund_address: None,
-            devfund_percent: 0,
-            block_template_ctr: block_template_ctr
-                .unwrap_or_else(|| Arc::new(AtomicU16::new((thread_rng().next_u64() % 10_000u64) as u16))),
             block_channel,
             block_handle,
             ai_request_queue: VecDeque::new(),
@@ -211,6 +212,7 @@ impl KeryxdHandler {
             ipfs_url,
             escrow_pubkey,
             escrow_watcher,
+            escrow_cert,
         }))
     }
 
@@ -237,13 +239,7 @@ impl KeryxdHandler {
     }
 
     async fn client_get_block_template(&mut self) -> Result<(), SendError<KaspadMessage>> {
-        let pay_address = match &self.devfund_address {
-            Some(devfund_address) if self.block_template_ctr.load(Ordering::SeqCst) <= self.devfund_percent => {
-                devfund_address.clone()
-            }
-            _ => self.miner_address.clone(),
-        };
-        self.block_template_ctr.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v + 1) % 10_000)).unwrap();
+        let pay_address = self.miner_address.clone();
         // Append a per-request random nonce so that parallel blocks at the same blue_score
         // get distinct coinbase payloads → distinct tx_ids (avoids DAG coinbase collisions).
         let nonce_hex = format!("{:016x}", thread_rng().next_u64());
@@ -253,6 +249,12 @@ impl KeryxdHandler {
         let escrow_part = self.escrow_pubkey
             .as_deref()
             .map(|pk| format!("/escrow:{}", pk))
+            .unwrap_or_default();
+        // Delegation cert binding that escrow key to the payout address. From H6 the node rejects
+        // a block whose coinbase carries no valid pair.
+        let esig_part = self.escrow_cert
+            .as_deref()
+            .map(|cert| format!("/esig:{}", cert))
             .unwrap_or_default();
         // Announce loaded model capabilities so the node can enforce model_id matching.
         let cap_part = {
@@ -264,7 +266,8 @@ impl KeryxdHandler {
                 format!("/ai:cap:{}", hex_ids.join(","))
             }
         };
-        let extra_data = format!("{}{}/{}/ai:v1:{}{}", EXTRA_DATA, escrow_part, nonce_hex, opoi_tag, cap_part);
+        let extra_data =
+            format!("{}{}{}/{}/ai:v1:{}{}", EXTRA_DATA, escrow_part, esig_part, nonce_hex, opoi_tag, cap_part);
         // Harvest a pending challenge response if the inference task just finished.
         let inference_result = match self.challenge_inference_rx.take() {
             Some((challenge_str, mut rx)) => match rx.try_recv() {
@@ -310,7 +313,11 @@ impl KeryxdHandler {
     /// Handles two formats:
     ///   - Subnetwork 0x03 + binary `AiRequestPayload` (future on-chain format)
     ///   - Any non-coinbase TX + `KRX:AI:1:` JSON prefix (web wallet format)
-    fn scan_txs_for_ai_requests(&mut self, txs: &[crate::proto::RpcTransaction]) {
+    fn scan_txs_for_ai_requests(&mut self, txs: &[crate::proto::RpcTransaction], block_daa: u64) {
+        // Identity of a request follows the same gate as the node: transaction id past it, payload
+        // digest before. Decided from the daa of the block the request is observed in, so both
+        // sides classify a request the same way across the activation.
+        let txid_identity = block_daa >= keryx_miner::pom::reward_routing_activation_daa();
         // Hard gate: if no models are ready, refuse to accept any AiRequest.
         // Prevents miners with missing/truncated model files from ever queuing inference work.
         let ready_ids = keryx_miner::slm::loaded_model_ids();
@@ -354,12 +361,28 @@ impl KeryxdHandler {
                     log::debug!("OPoI: skipping AiRequest — model not supported or files not ready");
                     continue;
                 }
-                let hash = blake2b_simd::blake2b(&raw);
-                let stable_id = hex::encode(&hash.as_bytes()[..8]);
+                let txid_hex = tx
+                    .verbose_data
+                    .as_ref()
+                    .map(|v| v.transaction_id.clone())
+                    .filter(|id| !id.is_empty())
+                    .or_else(|| Self::compute_rpc_txid(tx));
+                let request_hash: [u8; 32] = if txid_identity {
+                    match txid_hex.as_deref().and_then(|h| hex::decode(h).ok()).and_then(|b| <[u8; 32]>::try_from(b).ok()) {
+                        Some(id) => id,
+                        None => {
+                            log::warn!("OPoI: cannot resolve the AiRequest transaction id — request skipped");
+                            continue;
+                        }
+                    }
+                } else {
+                    blake2b_simd::blake2b(&raw).as_bytes()[..32].try_into().unwrap()
+                };
+                let stable_id = hex::encode(&request_hash[..8]);
                 if !self.ai_seen_prefixes.contains(&stable_id) {
                     info!("OPoI: queued AiRequest id={}", stable_id);
                     self.ai_seen_prefixes.insert(stable_id.clone());
-                    self.ai_request_queue.push_back((stable_id.clone(), raw, model_id, prompt, max_tokens));
+                    self.ai_request_queue.push_back((stable_id.clone(), request_hash, model_id, prompt, max_tokens));
                     while self.ai_request_queue.len() > MAX_AI_QUEUE_SIZE {
                         self.ai_request_queue.pop_front();
                     }
@@ -377,11 +400,7 @@ impl KeryxdHandler {
                 // template or block notifications, so without this fallback the escrow
                 // outpoint is never tracked and the inference_reward is never claimed.
                 if inference_reward > 0 {
-                    let txid_opt = tx.verbose_data.as_ref()
-                        .map(|v| v.transaction_id.clone())
-                        .filter(|id| !id.is_empty())
-                        .or_else(|| Self::compute_rpc_txid(tx));
-                    if let Some(txid) = txid_opt {
+                    if let Some(txid) = txid_hex {
                         self.ai_request_txids.insert(stable_id, (txid, inference_reward));
                     }
                 }
@@ -461,7 +480,7 @@ impl KeryxdHandler {
         if self.inference_rx.is_some() {
             return;
         }
-        if let Some((stable_id, raw, model_id, prompt, max_tokens)) = self.ai_request_queue.pop_front() {
+        if let Some((stable_id, request_hash, model_id, prompt, max_tokens)) = self.ai_request_queue.pop_front() {
             // Second guard: re-check readiness at execution time (files could have been deleted).
             if !keryx_miner::slm::is_model_ready(&model_id) {
                 log::error!("OPoI: model became unavailable after queuing id={} — discarding request", stable_id);
@@ -476,7 +495,7 @@ impl KeryxdHandler {
                 }
                 let _ = tx_done.send(result);
             });
-            self.inference_rx = Some((raw, rx_done));
+            self.inference_rx = Some((request_hash, rx_done));
         }
     }
 
@@ -484,11 +503,11 @@ impl KeryxdHandler {
     /// IPFS and submits a zero-input/zero-output AiResponse transaction.
     /// Returns `true` if inference just finished (regardless of tx success).
     async fn poll_inference(&mut self) -> bool {
-        let Some((raw, mut rx)) = self.inference_rx.take() else {
+        let Some((request_hash, mut rx)) = self.inference_rx.take() else {
             return false;
         };
         let Ok(result_opt) = rx.try_recv() else {
-            self.inference_rx = Some((raw, rx));
+            self.inference_rx = Some((request_hash, rx));
             return false;
         };
         let Some(result) = result_opt else {
@@ -498,8 +517,6 @@ impl KeryxdHandler {
             return true;
         };
 
-        let full_hash = blake2b_simd::blake2b(&raw);
-        let request_hash: [u8; 32] = full_hash.as_bytes()[..32].try_into().unwrap();
         info!("OPoI: inference complete, request_hash={}", hex::encode(&request_hash[..8]));
 
         let ipfs_url = self.ipfs_url.clone();
@@ -512,8 +529,28 @@ impl KeryxdHandler {
 
         let challenge_window_end = self.last_known_daa + 1000;
         let response_length = result.split_whitespace().count() as u32;
-        let resp = keryx_inference::AiResponsePayload::new(request_hash, challenge_window_end, cid, response_length);
-        info!("OPoI: uploading response CID={}, challenge_window_end={}", resp.cid_v0(), challenge_window_end);
+        // H6 service-bond era: sign the response with the escrow key (payload V2) so it counts
+        // as served for the tier cohort — an unsigned response no longer cancels a strike. The
+        // era rule mirrors the node's: V2 is rejected before the gate, so v1 is kept below it.
+        let v2 = self.last_known_daa >= keryx_miner::pom::pom_v3_activation_daa();
+        let resp = match (&self.escrow_watcher, v2) {
+            (Some(w), true) => {
+                let unsigned = keryx_inference::AiResponsePayload::new(request_hash, challenge_window_end, cid, response_length);
+                let responder = w.sign_responder(&unsigned.signed_bytes());
+                keryx_inference::AiResponsePayload::new_v2(request_hash, challenge_window_end, cid, response_length, responder)
+            }
+            (None, true) => {
+                warn!("OPoI: no escrow key configured — submitting an unsigned (v1) response; it will NOT count for the service bond");
+                keryx_inference::AiResponsePayload::new(request_hash, challenge_window_end, cid, response_length)
+            }
+            (_, false) => keryx_inference::AiResponsePayload::new(request_hash, challenge_window_end, cid, response_length),
+        };
+        info!(
+            "OPoI: uploading response CID={}, challenge_window_end={}{}",
+            resp.cid_v0(),
+            challenge_window_end,
+            if resp.responder.is_some() { " (signed, V2)" } else { "" }
+        );
 
         let rpc_tx = crate::proto::RpcTransaction {
             version: 0,
@@ -531,7 +568,7 @@ impl KeryxdHandler {
         }
 
         // Register inference escrow outpoint for auto-claim after the challenge window.
-        let stable_id = hex::encode(&full_hash.as_bytes()[..8]);
+        let stable_id = hex::encode(&request_hash[..8]);
         if let Some((txid, inference_reward)) = self.ai_request_txids.remove(&stable_id) {
             if let Some(w) = self.escrow_watcher.as_mut() {
                 w.track_inference_escrow(txid, self.last_known_daa, inference_reward);
@@ -549,7 +586,7 @@ impl KeryxdHandler {
                 if let Some(block) = notif.block {
                     if !block.transactions.is_empty() {
                         // Full block — scan directly.
-                        self.scan_txs_for_ai_requests(&block.transactions);
+                        self.scan_txs_for_ai_requests(&block.transactions, block.header.as_ref().map_or(0, |h| h.daa_score));
                         self.try_start_inference();
                         // Escrow: check for new escrow UTXOs and mature claims.
                         let claim_tx = self.escrow_watcher.as_mut().and_then(|w| w.handle_block(&block));
@@ -640,7 +677,7 @@ impl KeryxdHandler {
                     return Ok(());
                 }
                 if let Some(ref block) = template.block {
-                    self.scan_txs_for_ai_requests(&block.transactions);
+                    self.scan_txs_for_ai_requests(&block.transactions, block.header.as_ref().map_or(0, |h| h.daa_score));
                 }
                 self.try_start_inference();
                 // Pause GPU mining while any inference is in flight (GPU is occupied by the model).
@@ -685,7 +722,7 @@ impl KeryxdHandler {
                         .as_mut()
                         .map_or(false, |w| w.consume_validation_ok(&hash, is_chain));
                     if !was_validation {
-                        self.scan_txs_for_ai_requests(&block.transactions);
+                        self.scan_txs_for_ai_requests(&block.transactions, block.header.as_ref().map_or(0, |h| h.daa_score));
                         self.try_start_inference();
                         let claim_tx = self.escrow_watcher.as_mut().and_then(|w| w.handle_block(&block));
                         if let Some(w) = self.escrow_watcher.as_ref() {
@@ -771,10 +808,12 @@ impl KeryxdHandler {
             },
             // Virtual chain advanced: fetch every added chain block in full. Their coinbases
             // are the only ones that materialize UTXOs, so escrow tracking feeds off this
-            // stream (handle_block gates tracking on is_chain_block). Removed chain blocks
-            // are ignored: entries from reorged-out blocks fail their claims as orphans and
-            // are cleaned up by the existing retry/slash machinery.
+            // stream (handle_block gates tracking on is_chain_block). Entries of removed
+            // chain blocks are purged right away: their coinbase no longer exists.
             Payload::VirtualSelectedParentChainChangedNotification(notif) => {
+                if let Some(watcher) = self.escrow_watcher.as_mut() {
+                    watcher.on_chain_blocks_removed(&notif.removed_chain_block_hashes);
+                }
                 for hash in notif.added_chain_block_hashes {
                     self.client_send(GetBlockRequestMessage { hash, include_transactions: true }).await?;
                 }

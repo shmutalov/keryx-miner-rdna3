@@ -106,6 +106,11 @@ impl From<StratumErrorRepr> for StratumError {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(untagged)]
 pub(crate) enum MiningNotify {
+    // keryx-stratum-v3: the block's compact `bits` ride along (6-element with an AiRequest task,
+    // 5-element without) so a share that meets the block target is never discarded when the pool
+    // difficulty is set above the network's. Listed first: untagged decoding tries in order.
+    MiningNotifyWithTaskV3((String, [u64; 4], u64, u64, u32, String)),
+    MiningNotifyShortV3((String, [u64; 4], u64, u64, u32)),
     // 5-element: job_id, header_hash, timestamp, daa_score, task_json (AiRequest payload)
     MiningNotifyWithTask((String, [u64; 4], u64, u64, String)),
     MiningNotifyShortV2((String, [u64; 4], u64, u64)),
@@ -158,6 +163,13 @@ pub(crate) enum StratumCommand {
     // Phase 2 OPoI: miner → bridge — declare loaded SLM model IDs (sent after authorize)
     #[serde(rename = "mining.declare_capabilities")]
     MiningDeclareCapabilities(Vec<String>),
+    // Pool-dispatched inference: bridge → miner
+    // (task_id == request_hash, txid, request_hash, model_hex, prompt_b64, max_tokens, reward).
+    #[serde(rename = "mining.ai_request")]
+    MiningAiRequest((String, String, String, String, String, u32, String)),
+    // miner → bridge: (worker, task_id, request_hash, model_hex, result_b64).
+    #[serde(rename = "mining.ai_response")]
+    MiningAiResponse((String, String, String, String, String)),
     // Phase 2 OPoI: bridge → miner — "model_id_hex:nonce_hex" capability challenge
     #[serde(rename = "mining.challenge")]
     MiningChallenge((String, String)),

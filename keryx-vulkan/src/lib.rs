@@ -12,6 +12,7 @@ use std::ffi::{CStr, CString};
 
 pub mod khh;
 pub mod pom_walk;
+pub mod pom_walk_v4;
 
 // Opt-in PoM-walk micro-benchmark (variant kernels + timing). Excluded from the shipped miner.
 #[cfg(feature = "bench")]
@@ -367,6 +368,43 @@ impl Vk {
                     None,
                 )
                 .map_err(|e| e.to_string())?;
+            self.device.bind_buffer_memory(buffer, memory, 0).map_err(|e| e.to_string())?;
+            Ok(GpuBuffer { buffer, memory, size })
+        }
+    }
+
+    /// Allocate a host-writable STORAGE buffer that the GPU reads at VRAM speed: a
+    /// `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT` (BAR / ReBAR) type when the device exposes one,
+    /// else the plain host-visible type of [`create_buffer`](Self::create_buffer). For small tables
+    /// the kernel reads on every step (the v4 walk's segment LUT/prefix/addresses and its dispatch
+    /// I/O block), where a system-memory buffer would put a PCIe round trip in the hot loop.
+    pub fn create_buffer_vram_mapped(&self, size: u64) -> Result<GpuBuffer, String> {
+        assert!(size > 0, "zero-size buffer");
+        unsafe {
+            let info = vk::BufferCreateInfo::default()
+                .size(size)
+                .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let buffer = self.device.create_buffer(&info, None).map_err(|e| e.to_string())?;
+            let req = self.device.get_buffer_memory_requirements(buffer);
+            let bar = vk::MemoryPropertyFlags::DEVICE_LOCAL
+                | vk::MemoryPropertyFlags::HOST_VISIBLE
+                | vk::MemoryPropertyFlags::HOST_COHERENT;
+            let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+            let mut allocated = None;
+            for flags in [bar, host] {
+                let Ok(mt) = self.find_memory_type(req.memory_type_bits, flags) else { continue };
+                let alloc = vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(mt);
+                // The BAR heap can be small (256 MiB without ReBAR) — fall back rather than fail.
+                if let Ok(memory) = self.device.allocate_memory(&alloc, None) {
+                    allocated = Some(memory);
+                    break;
+                }
+            }
+            let Some(memory) = allocated else {
+                self.device.destroy_buffer(buffer, None);
+                return Err(format!("no host-visible memory for a {size}-byte buffer"));
+            };
             self.device.bind_buffer_memory(buffer, memory, 0).map_err(|e| e.to_string())?;
             Ok(GpuBuffer { buffer, memory, size })
         }

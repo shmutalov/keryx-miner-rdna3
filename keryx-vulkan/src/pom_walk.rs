@@ -2,6 +2,7 @@
 //! find the lowest nonce in a batch whose `pom_pow_value <= target`. The folds are byte-identical
 //! to `src/pom.rs`, so a nonce found here builds a `PomProof` the node accepts.
 
+use crate::pom_walk_v4::{PomWalkV4, V4Job};
 use crate::{GpuBuffer, Kernel, Vk};
 use std::io::Cursor;
 
@@ -80,6 +81,8 @@ pub struct PomWalkGpu {
     winner: GpuBuffer,
     n_chunks: u64,
     shard_chunks: u64,
+    /// PoM v4 grind over the same shards (segment table = one entry per shard).
+    v4: PomWalkV4,
 }
 
 impl PomWalkGpu {
@@ -162,7 +165,11 @@ impl PomWalkGpu {
         vk.write_buffer(&addr_table, words_as_bytes(&addrs));
         let winner = vk.create_buffer(std::mem::size_of::<IoHead>() as u64)?;
 
-        Ok(Self { vk, kernel, shards, addr_table, winner, n_chunks, shard_chunks })
+        // v4 segment table: shard s covers canonical chunks [s*shard_chunks, min((s+1)*shard_chunks, N)).
+        let prefix: Vec<u64> = (0..=n_shards).map(|s| (s * shard_chunks).min(n_chunks)).collect();
+        let v4 = PomWalkV4::new(&vk, &prefix, &addrs)?;
+
+        Ok(Self { vk, kernel, shards, addr_table, winner, n_chunks, shard_chunks, v4 })
     }
 
     /// Name of the GPU the miner is running on.
@@ -232,8 +239,17 @@ impl PomWalkGpu {
     }
 }
 
+impl PomWalkGpu {
+    /// PoM v4 grind of nonces `[start, start + batch)` over the resident blob — see
+    /// [`PomWalkV4::mine`].
+    pub fn mine_v4(&self, job: &V4Job, start: u64, batch: u32) -> Option<u64> {
+        self.v4.mine(&self.vk, job, start, batch)
+    }
+}
+
 impl Drop for PomWalkGpu {
     fn drop(&mut self) {
+        self.v4.destroy(&self.vk);
         self.vk.destroy_buffer(&self.winner);
         self.vk.destroy_buffer(&self.addr_table);
         for shard in &self.shards {
@@ -290,6 +306,8 @@ pub struct PomWalkShared {
     supplements: Vec<GpuBuffer>,
     n_chunks: u64,
     n_tensors: u32,
+    /// PoM v4 grind over the same tensor table.
+    v4: PomWalkV4,
 }
 
 impl PomWalkShared {
@@ -330,6 +348,7 @@ impl PomWalkShared {
         vk.write_buffer(&addrs_buf, words_as_bytes(&addrs));
         let winner = vk.create_buffer(std::mem::size_of::<IoHead>() as u64)?;
         let out32 = vk.create_buffer(32)?;
+        let v4 = PomWalkV4::new(&vk, &prefix, &addrs)?;
 
         Ok(Self {
             vk,
@@ -342,6 +361,7 @@ impl PomWalkShared {
             supplements,
             n_chunks: total,
             n_tensors,
+            v4,
         })
     }
 
@@ -406,8 +426,17 @@ impl PomWalkShared {
     }
 }
 
+impl PomWalkShared {
+    /// PoM v4 grind of nonces `[start, start + batch)` over the engine's tensors — see
+    /// [`PomWalkV4::mine`].
+    pub fn mine_v4(&self, job: &V4Job, start: u64, batch: u32) -> Option<u64> {
+        self.v4.mine(&self.vk, job, start, batch)
+    }
+}
+
 impl Drop for PomWalkShared {
     fn drop(&mut self) {
+        self.v4.destroy(&self.vk);
         for b in &self.supplements {
             self.vk.destroy_buffer(b);
         }
