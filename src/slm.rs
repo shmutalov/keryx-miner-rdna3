@@ -6,27 +6,41 @@
 //! external llama-server child, no CUDA, no CPU inference: everything runs on the GPU via Vulkan.
 use anyhow::{anyhow, Context, Result};
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::llm_engine::LlamaEngine as InferenceEngine;
 use crate::models::{ModelFormat, ModelSpec};
 
 const IPFS_GATEWAY: &str = "https://keryx-labs.com";
-/// Shared system prompt for the whole H4 lineup (vendor-agnostic wording) — MUST stay
-/// byte-identical to upstream keryx-miner's `SYSTEM_PROMPT_NEXT` so OPoI answers match
-/// other miners' for the same request.
+/// Shared system prompt for the whole lineup (vendor-agnostic wording) — MUST stay byte-identical
+/// to upstream keryx-miner's `SYSTEM_PROMPT_NEXT` so answers match other miners' for the same
+/// request. Points the model at web results / facts attached to the request (private-inference
+/// clients send them) and forbids claiming a search the request does not include.
 const SYSTEM_PROMPT_NEXT: &str =
-    "You are a Keryx Network AI — a high-capability decentralized assistant running on GPU miners via the Keryx BlockDAG protocol. \
-     Keryx miners execute AI inference as proof-of-work; results are secured on-chain via OPoI (Optimistic Proof of Inference). \
-     You have no internet access — answer from training knowledge only. \
-     CRITICAL: Never mention your underlying model name or the company that trained it. \
-     Always identify yourself as a Keryx Network AI. Be thorough but concise.";
+    "You are a Keryx Network AI, a decentralized assistant served by the GPU miners of the Keryx network. \
+     Answer in the language of the user's message. \
+     Do not introduce yourself or describe Keryx unless the user asks about it. If asked: Keryx is a proof-of-work BlockDAG \
+     derived from Kaspa (about 10 blocks per second) where each mining GPU proves on every block that it holds a model in VRAM \
+     (Proof-of-Model), so mining and inference are the same job; requests are on-chain transactions paid in KRX. \
+     Web search results, facts or earlier messages included in the request are your sources for recent or specific information: \
+     use them. Without them, answer from your training knowledge and say when it may be out of date; \
+     never claim to have searched the web or cite sources that are not included in the request. \
+     Never mention your underlying model name or the company that trained it: if asked, you are a Keryx Network AI. \
+     Be thorough but concise.";
+
+/// Answer sent when a request's prompt does not fit the model's context window — upstream's text.
+pub const PROMPT_TOO_LONG_ANSWER: &str =
+    "This request could not be served: the prompt is longer than the model's context window. Send a shorter message or less conversation history.";
 
 // ── Static engine state ──────────────────────────────────────────────────────
 
-/// Models the miner currently serves (drives `ai:cap`), set once at startup (the H4-only
-/// lineup has no era crossing left to hot-swap).
+/// Models the miner stages (downloaded, servable), set once at startup: the tier's model for every
+/// era the chain can still reach — two for tier 3 until the H14 gate, one otherwise. Which of them
+/// is announced (`ai:cap`) and served follows the chain DAA ([`note_chain_daa`]).
 static SUPPORTED_SPECS: RwLock<&'static [&'static ModelSpec]> = RwLock::new(&[]);
+/// Highest chain DAA score seen from the node or pool; 0 until the first template/job.
+static CHAIN_DAA: AtomicU64 = AtomicU64::new(0);
 /// The single resident llama-server, keyed by the model it serves. `Arc` so an in-flight request
 /// can outlive an eviction (server is killed when the last `Arc` drops).
 static SERVER: Mutex<Option<([u8; 32], Arc<InferenceEngine>)>> = Mutex::new(None);
@@ -195,31 +209,36 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<std::path::PathBuf> {
 
 /// Chat-template a raw user prompt for a model by name — the in-process engine's raw `generate`
 /// consumes an already-templated string (a raw prompt makes template-strict models emit EOG
-/// immediately, e.g. EXAONE). Ported VERBATIM from upstream keryx-miner (each template was
-/// validated there against the GGUF's embedded chat template) — llama.cpp's built-in template
-/// matcher does not recognize every H4 architecture, and OPoI answers must match other miners'
-/// byte-for-byte, so we bypass `apply_chat_template` and prompt exactly like upstream.
+/// immediately). Ported VERBATIM from upstream keryx-miner (each template was validated there
+/// against the GGUF's embedded chat template) — llama.cpp's built-in template matcher does not
+/// recognize every lineup architecture, and answers must match other miners' byte-for-byte, so we
+/// bypass `apply_chat_template` and prompt exactly like upstream.
 fn format_prompt_by_name(name: &str, prompt: &str) -> String {
     match name {
-        // EXAONE-4.0 — reasoning model: pre-fill an empty think block or the reasoning trace
-        // leaks into the visible answer (same trick as Qwen3.6 below).
-        "exaone-4.0-1.2b" => format!(
-            "[|system|]\n{}[|endofturn|]\n[|user|]\n{}\n[|assistant|]\n<think>\n\n</think>\n\n",
-            SYSTEM_PROMPT_NEXT, prompt
-        ),
-        "mistral-7b-v0.3" => format!("[INST] {}\n\n{}[/INST]", SYSTEM_PROMPT_NEXT, prompt),
         // GLM-4-0414 ignores the <|system|> role identity (keeps claiming a foreign vendor) —
         // fold the system prompt into the user turn instead.
         "glm-4-9b-0414" => format!(
             "[gMASK]<sop><|user|>\n{}\n\n{}\n<|assistant|>\n",
             SYSTEM_PROMPT_NEXT, prompt
         ),
-        // Qwen3.6 — ChatML + a pre-filled empty think block so the visible answer starts
-        // immediately (an open think block would eat the whole max_tokens budget).
-        "qwen3.6-27b" => format!(
+        // Qwen3 family — ChatML + a pre-filled empty think block so the visible answer starts
+        // immediately (an open think block would eat the whole max_tokens budget). This is the
+        // `enable_thinking = false` branch of their embedded template, verbatim.
+        "qwen3.8-27b" | "qwen3.6-27b" | "qwen3.5-9b-abliterated" => format!(
             "<|im_start|>system\n{}<|im_end|>\n\
              <|im_start|>user\n{}<|im_end|>\n\
              <|im_start|>assistant\n<think>\n\n</think>\n\n",
+            SYSTEM_PROMPT_NEXT, prompt
+        ),
+        // Gemma 4 is NOT the classic <start_of_turn> Gemma: turns are `<|turn>role … <turn|>`,
+        // and its generation prompt carries an empty thought channel when thinking is off — the
+        // same role as Qwen's empty think block. Without it the model opens its own and the
+        // channel markers leak into the answer. BOS is omitted on purpose: this GGUF sets
+        // add_bos_token, so the tokenizer prepends it.
+        "gemma-4-12b-abliterated" => format!(
+            "<|turn>system\n{}<turn|>\n\
+             <|turn>user\n{}<turn|>\n\
+             <|turn>model\n<|channel>thought\n<channel|>",
             SYSTEM_PROMPT_NEXT, prompt
         ),
         "kimi-linear-48b" => format!(
@@ -250,6 +269,31 @@ fn strip_think(text: &str) -> String {
 
 pub fn init_supported(specs: &'static [&'static ModelSpec]) {
     *SUPPORTED_SPECS.write().unwrap() = specs;
+}
+
+/// Record a chain DAA score seen from the node (template) or the pool (job).
+pub fn note_chain_daa(daa: u64) {
+    let before = CHAIN_DAA.fetch_max(daa, Ordering::AcqRel);
+    let gate = crate::pom::private_inference_activation_daa();
+    if before < gate && daa >= gate {
+        log::info!("SlmEngine: private-inference gate reached — answers travel inline, IPFS no longer required");
+    }
+}
+
+/// True once the chain reached the private-inference gate: answers travel inline in the
+/// AiResponse and this miner publishes nothing to IPFS.
+pub fn inline_answers() -> bool {
+    CHAIN_DAA.load(Ordering::Acquire) >= crate::pom::private_inference_activation_daa()
+}
+
+/// Whether a staged model is mined and served in the chain's current era. Every staged model
+/// counts until the chain DAA is known; after that a model of an era the chain has left (tier 3's
+/// Qwen3.6-27B past H14) or not yet reached (Qwen3.8-27B before it) is neither announced nor served.
+fn served_now(spec: &ModelSpec) -> bool {
+    match CHAIN_DAA.load(Ordering::Acquire) {
+        0 => true,
+        daa => crate::models::pom_tier_index(&spec.model_id, daa).is_some(),
+    }
 }
 
 /// Zero-dup: the resident in-process engine currently serving `model_id`, if any. The shared
@@ -321,7 +365,7 @@ pub fn prefetch_models(specs: &'static [&'static ModelSpec]) -> Result<()> {
 pub fn loaded_model_ids() -> Vec<[u8; 32]> {
     let specs = *SUPPORTED_SPECS.read().unwrap();
     specs.iter()
-        .filter(|s| model_dir(s).join(".ok").exists())
+        .filter(|s| served_now(s) && model_dir(s).join(".ok").exists())
         .map(|s| s.model_id)
         .collect()
 }
@@ -330,7 +374,7 @@ pub fn loaded_model_ids() -> Vec<[u8; 32]> {
 pub fn is_model_ready(model_id: &[u8; 32]) -> bool {
     let specs = *SUPPORTED_SPECS.read().unwrap();
     let Some(spec) = specs.iter().find(|s| &s.model_id == model_id) else { return false; };
-    model_dir(spec).join(".ok").exists()
+    served_now(spec) && model_dir(spec).join(".ok").exists()
 }
 
 /// Pure VRAM fit check, split out from [`pom_keep_resident`] so the arithmetic is unit-testable
@@ -442,6 +486,12 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
             } else {
                 Some(cleaned)
             }
+        }
+        // Upstream answers an oversized prompt with a fixed text instead of dropping it, so the
+        // requester learns why rather than waiting for an answer that never comes.
+        Err(e) if e.is::<crate::llm_engine::PromptTooLong>() => {
+            log::warn!("SlmEngine '{}': {} — answering with the fixed error text", spec.name, e);
+            Some(PROMPT_TOO_LONG_ANSWER.to_string())
         }
         Err(e) => {
             log::warn!("SlmEngine '{}' inference error: {}", spec.name, e);

@@ -11,6 +11,10 @@
 //! Multi-GPU: one resident blob per mining device, keyed by the raw Vulkan device index; every
 //! device mines the same tier over the one shared host index.
 //!
+//! The hardware tier is fixed for the process, the model it mines follows the block's era: at the
+//! H14 gate tier 3 swaps Qwen3.6-27B for Qwen3.8-27B, and [`ensure_installed`] rebuilds the walk
+//! (and the host index) for the new model on the first block past the gate.
+//!
 //! The seed/walk/pow folds are byte-identical across the GPU kernel, `pom.rs`, and the node, so a
 //! nonce found here builds a proof the node accepts.
 
@@ -72,21 +76,27 @@ impl Resident {
     }
 }
 
-/// Resident GPU PoM miners, one per mining device (raw Vulkan device index). An entry is dropped
-/// to free that device's VRAM (inference has priority on the inference device). The payloads are
+/// Resident GPU PoM miners, one per mining device (raw Vulkan device index), each tagged with the
+/// model whose weights it walks. An entry is dropped to free that device's VRAM (inference has
+/// priority on the inference device) or replaced when the era's model changes. The payloads are
 /// `Arc`ed so `mine` can dispatch without holding the map lock — N GPUs must not serialize each
 /// other's batches.
-static MINERS: Mutex<Option<HashMap<u32, Resident>>> = Mutex::new(None);
+static MINERS: Mutex<Option<HashMap<u32, ([u8; 32], Resident)>>> = Mutex::new(None);
 
-/// Mining-tier identity for (re)builds: (model_id, gguf_path). Set once at startup.
-static MINING_TIER: OnceLock<([u8; 32], String)> = OnceLock::new();
+/// The hardware tier this miner mines. Set once at startup; the model follows the block's era.
+static MINING_TIER: OnceLock<crate::models::Tier> = OnceLock::new();
 
 /// Number of in-flight one-time index/blob loads (workers intentionally paused, not stalled).
 static LOADING: AtomicUsize = AtomicUsize::new(0);
 
 /// Record the mining tier so the miner can build its index + GPU weight blob on first PoM activation.
-pub fn set_mining_tier(model_id: [u8; 32], gguf_path: String) {
-    let _ = MINING_TIER.set((model_id, gguf_path));
+pub fn set_mining_tier(tier: crate::models::Tier) {
+    let _ = MINING_TIER.set(tier);
+}
+
+/// The model this miner mines for a block at `daa`: the configured tier's model in that era.
+pub fn mining_model(daa: u64) -> Option<&'static crate::models::ModelSpec> {
+    crate::models::pom_model_for_tier(daa, *MINING_TIER.get()?)
 }
 
 /// Whether a PoM index/blob load is in progress on any device (worker intentionally paused).
@@ -94,14 +104,25 @@ pub fn is_loading() -> bool {
     LOADING.load(Ordering::Relaxed) > 0
 }
 
-/// Whether the GPU PoM miner is resident and ready on `device`.
-pub fn is_installed(device: u32) -> bool {
-    MINERS.lock().map(|g| g.as_ref().is_some_and(|m| m.contains_key(&device))).unwrap_or(false)
+/// Whether the GPU PoM miner on `device` is resident and walks the model a block at `daa` needs.
+pub fn is_installed(device: u32, daa: u64) -> bool {
+    let Some(spec) = mining_model(daa) else { return false };
+    MINERS
+        .lock()
+        .map(|g| g.as_ref().and_then(|m| m.get(&device)).is_some_and(|(id, _)| *id == spec.model_id))
+        .unwrap_or(false)
 }
 
 /// The resident miner for `device`, if installed.
 fn miner_on(device: u32) -> Option<Resident> {
-    MINERS.lock().ok()?.as_ref()?.get(&device).cloned()
+    MINERS.lock().ok()?.as_ref()?.get(&device).map(|(_, m)| m.clone())
+}
+
+/// Record the resident miner for `device`, replacing whatever it walked before.
+fn install(device: u32, model_id: [u8; 32], entry: Resident) {
+    if let Ok(mut g) = MINERS.lock() {
+        g.get_or_insert_with(HashMap::new).insert(device, (model_id, entry));
+    }
 }
 
 /// EXTRA VRAM the miner holds on the INFERENCE device, or 0 if nothing is installed there.
@@ -176,9 +197,9 @@ pub fn v4_batch() -> u64 {
 }
 
 /// PoM v4 search of nonces `[start, start + batch)` on `device` for a block at `daa` (>= the v4
-/// gate). The seed era (H10 keccak vs the pre-H10 v4-salted fold) comes from `daa` through the
-/// same `pom` helpers the host proof build uses, so a GPU winner always re-walks to the same
-/// `final_state` on the host. None if not installed or no winner.
+/// gate). The seed era (H14-tagged / H10 keccak vs the pre-H10 v4-salted fold) comes from `daa`
+/// through the same `pom` helpers the host proof build uses, so a GPU winner always re-walks to
+/// the same `final_state` on the host. None if not installed or no winner.
 pub fn mine_v4(
     device: u32,
     pre_pow_hash: &[u8; 32],
@@ -189,22 +210,21 @@ pub fn mine_v4(
     daa: u64,
 ) -> Option<u64> {
     let m = miner_on(device)?;
-    let h10 = daa >= crate::pom::h10_activation_daa();
     let job = keryx_vulkan::pom_walk_v4::V4Job {
         pow_words: crate::pom::pph_words_for_era(pre_pow_hash, true),
         seed_words: crate::pom::pph_words_v4(pre_pow_hash),
         timestamp,
-        h10_state: h10.then(|| crate::pom::pom_seed_h10_state(pre_pow_hash, timestamp)),
+        h10_state: crate::pom::pom_seed_state_v4_era(pre_pow_hash, timestamp, daa),
         target_le: *target_le,
     };
     m.mine_v4(&job, start, batch.min(u32::MAX as u64) as u32)
 }
 
-/// Ensure the GPU PoM miner is installed on `device`; build the host possession index (first
-/// activation, shared across devices) and stream the weight blob into that device's VRAM if
-/// needed. Returns true when ready to mine.
+/// Ensure the GPU PoM miner on `device` walks the model a block at `daa` needs; build that model's
+/// host possession index (once, shared across devices) and stream its weight blob into the
+/// device's VRAM if needed. Returns true when ready to mine.
 pub fn ensure_installed(daa: u64, device: u32) -> bool {
-    if is_installed(device) {
+    if is_installed(device, daa) {
         return true;
     }
     LOADING.fetch_add(1, Ordering::Relaxed);
@@ -214,27 +234,47 @@ pub fn ensure_installed(daa: u64, device: u32) -> bool {
 }
 
 /// PoM tier index of the mining model at a given block DAA. Recomputed per block (not frozen at
-/// index-build time) so the H4 gate applies at the exact boundary — None below the flip (this
-/// binary refuses to mine a pre-H4-era block), the `POM_TIERS_H4` index at/after it. The proof's
-/// `tier` field MUST come from here, keyed on the block's own DAA.
+/// index-build time) so a lineup gate applies at the exact boundary — None below H6 (this binary
+/// refuses to mine a pre-H6-era block). The proof's `tier` field MUST come from here, keyed on the
+/// block's own DAA.
 pub fn current_tier(daa: u64) -> Option<u8> {
-    let (model_id, _) = MINING_TIER.get()?;
-    crate::models::pom_tier_index(model_id, daa)
+    crate::models::pom_tier_index(&mining_model(daa)?.model_id, daa)
+}
+
+/// The possession index and tier a proof for a block at `daa` is built from: the era's mining
+/// model's index, once built.
+pub fn mining_index(daa: u64) -> Option<(&'static crate::pom::WeightIndex, u8)> {
+    let spec = mining_model(daa)?;
+    let tier = crate::models::pom_tier_index(&spec.model_id, daa)?;
+    Some((crate::pom::index_for(&spec.model_id)?, tier))
 }
 
 fn ensure_installed_inner(daa: u64, device: u32) -> bool {
-    let (model_id, gguf) = match MINING_TIER.get() {
-        Some(x) => x,
-        None => return false,
-    };
+    let Some(spec) = mining_model(daa) else { return false };
+    let model_id = &spec.model_id;
+    let gguf = crate::slm::gguf_path_for(spec).to_string_lossy().into_owned();
 
-    // Build the host possession index once (heavy: hashes every chunk to a disk Merkle tree).
-    // Needed to construct the PoM proof for a winning nonce, and it doubles as the zero-dup
+    // An era crossing changed the model this tier mines (tier 3 at H14): drop the old walk first,
+    // so its weights (and, zero-dup, the engine serving them) leave VRAM before the new model loads.
+    let stale = MINERS.lock().ok().and_then(|mut g| {
+        let m = g.as_mut()?;
+        match m.get(&device) {
+            Some((id, _)) if id != model_id => m.remove(&device),
+            _ => None,
+        }
+    });
+    if stale.is_some() {
+        info!("PoM: the era's mining model changed — swapping device {} to {}", device, spec.dir_name);
+    }
+    drop(stale);
+
+    // Build the host possession index once per model (heavy: hashes every chunk to a disk Merkle
+    // tree). Needed to construct the PoM proof for a winning nonce, and it doubles as the zero-dup
     // GPU upload source (its chunk table maps canonical chunks to GGUF file offsets).
-    if crate::pom::active_index().is_none() {
-        // Build-time tier is used only for logging + the get_or_build_index/set_index bookkeeping;
-        // the tier EMITTED in each proof is recomputed per block via `current_tier(daa)`. `daa` here
-        // is the block DAA at first activation (>= POM_ACTIVATION_DAA, guaranteed by the caller).
+    if crate::pom::index_for(model_id).is_none() {
+        // Build-time tier is used only for logging; the tier EMITTED in each proof is recomputed
+        // per block via `current_tier(daa)`. `daa` here is the block DAA at first activation
+        // (>= POM_ACTIVATION_DAA, guaranteed by the caller).
         let tier = match crate::models::pom_tier_index(model_id, daa) {
             Some(t) => t,
             None => return false,
@@ -246,7 +286,7 @@ fn ensure_installed_inner(daa: u64, device: u32) -> bool {
         // the mining loop retry on its next tick once the download lands. Checked via the GGUF's own
         // directory rather than slm's SUPPORTED_SPECS, which holds the legacy (v1) lineup until the
         // post-fork swap and would not list this v2 mining model.
-        let model_ready = std::path::Path::new(gguf)
+        let model_ready = std::path::Path::new(&gguf)
             .parent()
             .map(|d| d.join(".ok").exists())
             .unwrap_or(false);
@@ -262,7 +302,7 @@ fn ensure_installed_inner(daa: u64, device: u32) -> bool {
         // producing PoM blocks every one of which the node rejects with BadWeightPath.
         let gguf_path = gguf.clone();
         let expected = crate::models::pinned_pom_anchor(model_id);
-        if !crate::pom::get_or_build_index(tier, move || {
+        if !crate::pom::get_or_build_index(model_id, move || {
             let idx = crate::pom::WeightIndex::build_from_gguf(&gguf_path)?;
             if let Some(anchor) = expected {
                 if idx.n_chunks != anchor.chunks {
@@ -289,10 +329,7 @@ fn ensure_installed_inner(daa: u64, device: u32) -> bool {
         }
     }
 
-    let (idx, _) = match crate::pom::active_index() {
-        Some(x) => x,
-        None => return false,
-    };
+    let Some(idx) = crate::pom::index_for(model_id) else { return false };
 
     // Zero-dup: on the inference GPU, walk the in-process engine's own resident weight
     // buffers — 0 extra VRAM — instead of installing a second copy. Any failure falls back
@@ -300,9 +337,7 @@ fn ensure_installed_inner(daa: u64, device: u32) -> bool {
     if device == keryx_vulkan::inference_device_index() as u32 {
         match install_shared(idx, model_id) {
             Ok(entry) => {
-                if let Ok(mut g) = MINERS.lock() {
-                    g.get_or_insert_with(HashMap::new).insert(device, entry);
-                }
+                install(device, *model_id, entry);
                 return true;
             }
             Err(e) => {
@@ -327,9 +362,7 @@ fn ensure_installed_inner(daa: u64, device: u32) -> bool {
                 device,
                 idx.n_chunks
             );
-            if let Ok(mut g) = MINERS.lock() {
-                g.get_or_insert_with(HashMap::new).insert(device, Resident::Blob(Arc::new(gpu)));
-            }
+            install(device, *model_id, Resident::Blob(Arc::new(gpu)));
             true
         }
         Err(e) => {

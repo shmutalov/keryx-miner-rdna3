@@ -37,7 +37,7 @@ fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()
         return Ok(());
     }
 }
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 pub const CHUNK_WORDS: usize = 4; // 32 B chunk
 const SEED_SALT: u64 = 0x4B65727978500; // "KeryxP"
@@ -495,13 +495,48 @@ pub fn pom_block_seed_h10(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) -
     st[0]
 }
 
-/// The v4-walk seed for a block at `daa`: the H10 keccak seed at/after the H10 gate, else the
-/// salted mix64 fold. Single source of truth for the GPU search era and the host proof build.
+/// Domain tag XORed into `pre_pow_hash` for the H14 walk seed. MUST equal the node's `SEED_H14_TAG`.
+pub const SEED_H14_TAG: [u8; 32] = *b"KERYX-H14-PRIVATE-INFERENCE-SEED";
+
+/// `pre_pow_hash` as fed to the H14 walk seed.
+pub fn seed_h14_pph(pre_pow_hash: &[u8; 32]) -> [u8; 32] {
+    let mut out = *pre_pow_hash;
+    for (b, t) in out.iter_mut().zip(SEED_H14_TAG.iter()) {
+        *b ^= t;
+    }
+    out
+}
+
+/// H14 block seed: the H10 seed over the H14-tagged `pre_pow_hash`.
+/// BYTE-IDENTICAL to the node's `pom_block_seed_h14`.
+pub fn pom_block_seed_h14(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) -> u64 {
+    pom_block_seed_h10(&seed_h14_pph(pre_pow_hash), timestamp, nonce)
+}
+
+/// The v4-walk seed for a block at `daa`: the H14 seed (H10 keccak over the tagged pph) at/after
+/// the private-inference gate, the H10 keccak seed at/after H10, else the salted mix64 fold.
+/// Single source of truth for the GPU search era and the host proof build — mirrors the node's
+/// `pom_block_seed_rewalk_era`.
 pub fn pom_block_seed_v4_era(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64, daa: u64) -> u64 {
-    if daa >= h10_activation_daa() {
+    if daa >= private_inference_activation_daa() {
+        pom_block_seed_h14(pre_pow_hash, timestamp, nonce)
+    } else if daa >= h10_activation_daa() {
         pom_block_seed_h10(pre_pow_hash, timestamp, nonce)
     } else {
         pom_block_seed_v4(pre_pow_hash, timestamp, nonce)
+    }
+}
+
+/// The host-built keccak sponge the v4 walk shader absorbs each nonce into, for a block at `daa`:
+/// over the H14-tagged pph from the private-inference gate, the raw pph from H10, `None` before H10
+/// (the shader then folds the v4-salted seed words). Paired with [`pom_block_seed_v4_era`].
+pub fn pom_seed_state_v4_era(pre_pow_hash: &[u8; 32], timestamp: u64, daa: u64) -> Option<[u64; 25]> {
+    if daa >= private_inference_activation_daa() {
+        Some(pom_seed_h10_state(&seed_h14_pph(pre_pow_hash), timestamp))
+    } else if daa >= h10_activation_daa() {
+        Some(pom_seed_h10_state(pre_pow_hash, timestamp))
+    } else {
+        None
     }
 }
 
@@ -1466,17 +1501,28 @@ pub fn reward_routing_activation_daa() -> u64 {
     gate(79_210_000, 0)
 }
 
-/// The resident tier weight index + tier id, installed once at startup when PoM is enabled.
-static POM_INDEX: OnceLock<(WeightIndex, u8)> = OnceLock::new();
-
-/// Install the possession index (built from the resident model) and its tier. Call once.
-pub fn set_index(index: WeightIndex, tier: u8) {
-    let _ = POM_INDEX.set((index, tier));
+/// H14 private-inference gate. At/after this score:
+/// - every AiRequest is sealed to its tier cohort, and an AiResponse carries its sealed answer
+///   inline (before it the sealed body goes to IPFS and the response stays body-less);
+/// - the v4 walk seed is taken over the H14-tagged pph (`pom_block_seed_h14`);
+/// - tier 3 mines and serves Qwen3.8-27B instead of Qwen3.6-27B (`POM_TIERS_H14`).
+///
+/// MUST equal the node's `private_inference_activation` (`H14_ACTIVATION_DAA`): mainnet
+/// 121_985_000 (targets 2026-10-09 ~14:00 UTC), testnet 6_000.
+pub fn private_inference_activation_daa() -> u64 {
+    gate(121_985_000, 6_000)
 }
 
-/// The active possession index + tier, if installed.
-pub fn active_index() -> Option<&'static (WeightIndex, u8)> {
-    POM_INDEX.get()
+/// Possession indices built in this process, keyed by MODEL. A tier normally mines one model for
+/// the life of the process, but tier 3 swaps models at the H14 gate, so it can need a second index
+/// after the crossing. Each index is built once and leaked to `&'static` (at most one per lineup
+/// model mined), so proof builds borrow it without holding the lock.
+static POM_INDICES: Mutex<Vec<([u8; 32], &'static WeightIndex)>> = Mutex::new(Vec::new());
+
+/// The possession index built for `model_id`, if any.
+pub fn index_for(model_id: &[u8; 32]) -> Option<&'static WeightIndex> {
+    let indices = POM_INDICES.lock().unwrap_or_else(|p| p.into_inner());
+    indices.iter().find(|(id, _)| id == model_id).map(|(_, idx)| *idx)
 }
 
 /// Guards the one-time possession-index build. Every PoM GPU worker races into activation at the
@@ -1486,30 +1532,31 @@ pub fn active_index() -> Option<&'static (WeightIndex, u8)> {
 /// PoM worker exists (multi-GPU, or a GPU + a future CPU worker).
 static INDEX_BUILD_LOCK: Mutex<()> = Mutex::new(());
 
-/// Build + install the possession index exactly once across racing workers. Returns true when the
-/// index is ready (already installed, or built here). `build` runs only on the single thread that
-/// wins the lock with the index still absent; the others wait, then observe it installed.
+/// Build + install the possession index of `model_id` exactly once across racing workers. Returns
+/// true when the index is ready (already installed, or built here). `build` runs only on the single
+/// thread that wins the lock with the index still absent; the others wait, then observe it installed.
 ///
-/// Double-checked: the cheap `active_index()` read short-circuits the common case (index already
-/// built) without taking the lock; the second check under the lock closes the race window.
-pub fn get_or_build_index<F>(tier: u8, build: F) -> bool
+/// Double-checked: the cheap `index_for()` read short-circuits the common case (index already
+/// built) without taking the build lock; the second check under the lock closes the race window.
+pub fn get_or_build_index<F>(model_id: &[u8; 32], build: F) -> bool
 where
     F: FnOnce() -> candle_core::Result<WeightIndex>,
 {
-    if active_index().is_some() {
+    if index_for(model_id).is_some() {
         return true;
     }
     // A poisoned lock just means a prior builder panicked; the guard's data is `()`, so recover it
     // and proceed — the double-check below still keeps the build single.
     let _guard = INDEX_BUILD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    if active_index().is_some() {
+    if index_for(model_id).is_some() {
         return true;
     }
     log::info!("PoM: building possession index (first PoM activation) — this can take a while…");
     match build() {
         Ok(idx) => {
             log::info!("PoM: weight index ready — N={} chunks", idx.n_chunks);
-            set_index(idx, tier);
+            let idx: &'static WeightIndex = Box::leak(Box::new(idx));
+            POM_INDICES.lock().unwrap_or_else(|p| p.into_inner()).push((*model_id, idx));
             true
         }
         Err(e) => {
@@ -1586,6 +1633,43 @@ mod tests {
         st[9] ^= nonce;
         crate::keccak::f1600(&mut st);
         assert_eq!(h10, st[0]);
+    }
+
+    // Cross-implementation vectors pinned in the node's `pom::seed_h10_tests::seed_h14_vectors`
+    // (and upstream keryx-miner's `seed_h14_tests`).
+    #[test]
+    fn seed_h14_matches_the_node() {
+        let pph = [0x5au8; 32];
+        let (ts, nonce) = (1_788_000_000_000u64, 0x0123_4567_89ab_cdefu64);
+        assert_eq!(pom_block_seed_h14(&[0u8; 32], 0, 0), 0xacda16263d02e8a8);
+        assert_eq!(pom_block_seed_h14(&pph, ts, nonce), 0xcb49e5584c867af5);
+        assert_eq!(pom_block_seed_h14(&[0xa5u8; 32], ts, u64::MAX), 0xf198e8412c2f6255);
+        assert_ne!(pom_block_seed_h14(&pph, ts, nonce), pom_block_seed_h10(&pph, ts, nonce));
+        // The GPU path: host-built sponge state over the tagged pph, nonce absorbed in-kernel.
+        let mut st = pom_seed_h10_state(&seed_h14_pph(&pph), ts);
+        st[9] ^= nonce;
+        crate::keccak::f1600(&mut st);
+        assert_eq!(st[0], pom_block_seed_h14(&pph, ts, nonce));
+    }
+
+    /// The era helpers the GPU search and the host proof build share switch together at each gate,
+    /// and the sponge handed to the shader always reproduces the host seed.
+    #[test]
+    fn v4_seed_eras_switch_at_h10_and_h14() {
+        let pph = [0x5au8; 32];
+        let (ts, nonce) = (1_788_000_000_000u64, 0x0123_4567_89ab_cdefu64);
+        let (h10, h14) = (h10_activation_daa(), private_inference_activation_daa());
+        assert!(h10 < h14);
+        assert_eq!(pom_block_seed_v4_era(&pph, ts, nonce, h10 - 1), pom_block_seed_v4(&pph, ts, nonce));
+        assert!(pom_seed_state_v4_era(&pph, ts, h10 - 1).is_none());
+        assert_eq!(pom_block_seed_v4_era(&pph, ts, nonce, h14 - 1), pom_block_seed_h10(&pph, ts, nonce));
+        assert_eq!(pom_block_seed_v4_era(&pph, ts, nonce, h14), pom_block_seed_h14(&pph, ts, nonce));
+        for daa in [h10, h14 - 1, h14, h14 + 1] {
+            let mut st = pom_seed_state_v4_era(&pph, ts, daa).unwrap();
+            st[9] ^= nonce;
+            crate::keccak::f1600(&mut st);
+            assert_eq!(st[0], pom_block_seed_v4_era(&pph, ts, nonce, daa), "daa {daa}");
+        }
     }
 
     fn synth_chunk(off: u64) -> [u64; CHUNK_WORDS] {

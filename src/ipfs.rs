@@ -6,18 +6,25 @@ const KUBO_VERSION_FALLBACK: &str = "0.41.0";
 /// Upload `text` to the IPFS node at `api_url` and return the raw 34-byte multihash.
 /// The multihash format is: [0x12, 0x20, <32-byte sha2-256 digest>].
 pub fn upload(text: &str, api_url: &str) -> anyhow::Result<[u8; 34]> {
+    upload_bytes(text.as_bytes(), api_url)
+}
+
+/// [`upload`] for an opaque body (a sealed private answer before the private-inference gate).
+pub fn upload_bytes(data: &[u8], api_url: &str) -> anyhow::Result<[u8; 34]> {
     let url = format!("{}/api/v0/add?pin=true&quieter=true", api_url.trim_end_matches('/'));
     let boundary = "keryxboundary1234567890";
-    let body = format!(
-        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"result.txt\"\r\nContent-Type: text/plain\r\n\r\n{text}\r\n--{boundary}--\r\n",
+    let mut body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"result.txt\"\r\nContent-Type: application/octet-stream\r\n\r\n",
         boundary = boundary,
-        text = text,
-    );
+    )
+    .into_bytes();
+    body.extend_from_slice(data);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n", boundary = boundary).as_bytes());
     let content_type = format!("multipart/form-data; boundary={}", boundary);
     let response = ureq::post(&url)
         .set("Content-Type", &content_type)
         .timeout(Duration::from_secs(30))
-        .send_bytes(body.as_bytes())
+        .send_bytes(&body)
         .map_err(|e| anyhow::anyhow!("IPFS upload failed: {}", e))?;
     let body = response.into_string()
         .map_err(|e| anyhow::anyhow!("IPFS response read error: {}", e))?;
@@ -26,6 +33,17 @@ pub fn upload(text: &str, api_url: &str) -> anyhow::Result<[u8; 34]> {
     let cid_str = json["Hash"].as_str()
         .ok_or_else(|| anyhow::anyhow!("IPFS response missing Hash field: {:?}", json))?;
     cid_v0_to_multihash(cid_str)
+}
+
+/// The sha2-256 multihash of `data`: `[0x12, 0x20, digest]` — the CID field of an AiResponse whose
+/// sealed body travels inline (from the private-inference gate on).
+pub fn sha256_multihash(data: &[u8]) -> [u8; 34] {
+    use sha2::Digest;
+    let mut out = [0u8; 34];
+    out[0] = 0x12;
+    out[1] = 0x20;
+    out[2..].copy_from_slice(&sha2::Sha256::digest(data));
+    out
 }
 
 /// Decode a base58btc CIDv0 string (e.g. "Qm...") into a 34-byte raw multihash.

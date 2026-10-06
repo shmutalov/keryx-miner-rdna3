@@ -12,7 +12,8 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::{anyhow, Result};
-use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams};
+use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
@@ -20,8 +21,45 @@ use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 use log::info;
 
-/// Context window — matches the `-c 4096` the llama-server launch used.
-const CTX_SIZE: u32 = 4096;
+/// Context cap for a GGUF outside the lineup (tests): the old fixed `-c 4096`.
+const DEFAULT_CTX_CAP: u32 = 4096;
+/// Tokens per prompt decode call (upstream's logical `n_batch`).
+const N_BATCH: u32 = 2048;
+/// Physical batch: bounds the compute buffers, which grow with it and not with the context
+/// (upstream's `n_ubatch`).
+const N_UBATCH: u32 = 512;
+/// llama.cpp pads the KV cache to 256 cells; request contexts are sized in the same steps.
+const CTX_STEP: u32 = 256;
+/// Headroom kept free past the prompt, as upstream's `n > n_ctx - 16` check.
+const PROMPT_MARGIN: u32 = 16;
+
+/// The prompt does not fit the model's context cap. `slm` answers such a request with a fixed text
+/// (upstream's `PROMPT_TOO_LONG_ANSWER`) instead of dropping it.
+#[derive(Debug)]
+pub struct PromptTooLong {
+    pub tokens: usize,
+    pub ctx_cap: u32,
+}
+
+impl std::fmt::Display for PromptTooLong {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} prompt tokens do not fit the {}-token context", self.tokens, self.ctx_cap)
+    }
+}
+
+impl std::error::Error for PromptTooLong {}
+
+/// Context window for one request: the prompt plus its token budget, rounded up to [`CTX_STEP`]
+/// and bounded by the model's `ctx_cap`. Each request gets a fresh context, so a short chat never
+/// pays for the cap's KV cache while a long private prompt still fits.
+fn request_ctx(n_prompt: usize, max_tokens: usize, ctx_cap: u32) -> std::result::Result<u32, PromptTooLong> {
+    if n_prompt as u64 + PROMPT_MARGIN as u64 > ctx_cap as u64 {
+        return Err(PromptTooLong { tokens: n_prompt, ctx_cap });
+    }
+    let want = (n_prompt as u64 + max_tokens as u64 + 1).max(n_prompt as u64 + PROMPT_MARGIN as u64);
+    let stepped = want.div_ceil(CTX_STEP as u64) * CTX_STEP as u64;
+    Ok(stepped.min(ctx_cap as u64) as u32)
+}
 
 /// Process-wide ggml backend guard: `llama_backend_init` must run exactly once per process
 /// (`LlamaBackend::init` errors on a second call). Never torn down — model switches drop the
@@ -48,6 +86,9 @@ pub struct LlamaEngine {
     /// Serializes chats: each request runs a fresh short-lived context (its own KV cache),
     /// exactly like the stateless per-request usage of llama-server's chat endpoint.
     lock: Mutex<()>,
+    /// Largest context (tokens) a request may allocate: the lineup model's `ctx_cap`, or
+    /// `KERYX_LLAMA_CTX` when set.
+    ctx_cap: u32,
 }
 
 impl LlamaEngine {
@@ -73,8 +114,47 @@ impl LlamaEngine {
         let params = LlamaModelParams::default().with_n_gpu_layers(u32::MAX);
         let model = LlamaModel::load_from_file(backend, Path::new(gguf_path), &params)
             .map_err(|e| anyhow!("llm-engine: model load failed: {e}"))?;
-        info!("llm-engine: model resident, ready to serve");
-        Ok(Self { model, lock: Mutex::new(()) })
+        let ctx_cap = std::env::var("KERYX_LLAMA_CTX")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .filter(|&c| c >= CTX_STEP)
+            .unwrap_or_else(|| crate::models::spec_for_gguf(gguf_path).map_or(DEFAULT_CTX_CAP, |m| m.ctx_cap));
+        info!("llm-engine: model resident, ready to serve (context up to {ctx_cap} tokens per request, q8_0 KV + flash attention)");
+        Ok(Self { model, lock: Mutex::new(()), ctx_cap })
+    }
+
+    /// A fresh `n_ctx`-token context: 8-bit KV cache with flash attention (half the per-token VRAM
+    /// of f16, as upstream), falling back to the default f16 cache for an architecture the fast
+    /// path cannot serve.
+    fn new_context(&self, backend: &LlamaBackend, n_ctx: u32) -> Result<LlamaContext<'_>> {
+        let n_batch = N_BATCH.min(n_ctx);
+        // swa_full off: sliding-window layers keep only their window (+ one ubatch) of KV instead of
+        // the whole context. llama.cpp's full-size default exists for prompt-cache reuse, which a
+        // fresh single-sequence context never does — Gemma-4 at 32K: 0.6 GiB of KV instead of 5.6.
+        let params = || {
+            LlamaContextParams::default()
+                .with_n_ctx(NonZeroU32::new(n_ctx))
+                .with_n_batch(n_batch)
+                .with_n_ubatch(N_UBATCH.min(n_batch))
+                .with_swa_full(false)
+        };
+        let fast = params()
+            .with_flash_attention_policy(llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_ENABLED)
+            .with_type_k(KvCacheType::Q8_0)
+            .with_type_v(KvCacheType::Q8_0);
+        match self.model.new_context(backend, fast) {
+            Ok(ctx) => Ok(ctx),
+            Err(e) => {
+                log::debug!("llm-engine: q8_0 KV + flash attention context failed ({e}) — retrying with an f16 cache");
+                let plain = params()
+                    .with_flash_attention_policy(llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_AUTO)
+                    .with_type_k(KvCacheType::F16)
+                    .with_type_v(KvCacheType::F16);
+                self.model
+                    .new_context(backend, plain)
+                    .map_err(|e| anyhow!("llm-engine: cannot allocate a {n_ctx}-token context: {e}"))
+            }
+        }
     }
 
     /// Raw-prompt completion, greedy decoding (temperature-0 equivalent — keeps OPoI answers
@@ -94,33 +174,36 @@ impl LlamaEngine {
         // str_to_token parses special tokens (the template's control tokens) and AddBos
         // lets the tokenizer add BOS iff the model wants one — llama-server semantics.
         let tokens = self.model.str_to_token(&prompt, AddBos::Always)?;
-        if tokens.len() as u32 >= CTX_SIZE {
-            return Err(anyhow!("llm-engine: prompt ({} tokens) exceeds the {} context", tokens.len(), CTX_SIZE));
+        if tokens.is_empty() {
+            return Err(anyhow!("llm-engine: the prompt tokenized to nothing"));
         }
+        let n_ctx = request_ctx(tokens.len(), max_tokens, self.ctx_cap)?;
 
-        // Fresh context per request: n_batch = CTX_SIZE so the whole prompt decodes in one
-        // batch; KV is dropped with the context when this returns.
-        let mut ctx = self.model.new_context(
-            backend,
-            LlamaContextParams::default()
-                .with_n_ctx(NonZeroU32::new(CTX_SIZE))
-                .with_n_batch(CTX_SIZE),
-        )?;
+        // Fresh context per request, sized to this prompt + budget; KV is dropped with the
+        // context when this returns.
+        let mut ctx = self.new_context(backend, n_ctx)?;
 
-        let mut batch = LlamaBatch::new(tokens.len(), 1);
-        let last = tokens.len() as i32 - 1;
-        for (i, tok) in (0_i32..).zip(tokens.iter().copied()) {
-            batch.add(tok, i, &[0], i == last)?; // logits only for the last prompt token
+        // Feed the prompt in batches of at most n_batch tokens (one decode call each), logits
+        // only for the last prompt token.
+        let n_batch = N_BATCH.min(n_ctx) as usize;
+        let mut batch = LlamaBatch::new(n_batch, 1);
+        let last = tokens.len() - 1;
+        for (c, chunk) in tokens.chunks(n_batch).enumerate() {
+            batch.clear();
+            for (j, tok) in chunk.iter().copied().enumerate() {
+                let pos = c * n_batch + j;
+                batch.add(tok, pos as i32, &[0], pos == last)?;
+            }
+            ctx.decode(&mut batch)?;
         }
-        ctx.decode(&mut batch)?;
 
         // Greedy decode until end-of-generation or the token budget. Output is accumulated
         // as BYTES: byte-level BPE tokens can split UTF-8 sequences mid-character, so
         // per-token string conversion would corrupt multi-byte output.
-        let budget = max_tokens.min((CTX_SIZE as usize - tokens.len()).saturating_sub(1));
+        let budget = max_tokens.min((n_ctx as usize - tokens.len()).saturating_sub(1));
         let mut sampler = LlamaSampler::greedy();
         let mut out = Vec::<u8>::new();
-        let mut n_cur = batch.n_tokens();
+        let mut n_cur = tokens.len() as i32;
         for _ in 0..budget {
             let token = sampler.sample(&ctx, batch.n_tokens() - 1);
             sampler.accept(token);
@@ -330,6 +413,104 @@ mod tests {
 
     /// The stop scan must catch a marker regardless of how token pieces split it, cut at the
     /// EARLIEST marker, and never fire on clean output.
+    /// A prompt longer than one decode batch is fed in several batches, and a prompt past the
+    /// context cap is refused with `PromptTooLong` instead of failing the engine. Ignored by default
+    /// (loads a multi-GB model); run with:
+    ///   KERYX_TEST_GGUF=<path to a lineup model.gguf> cargo test --release -- --ignored inproc_long_prompt
+    #[test]
+    #[ignore = "loads a multi-GB GGUF onto the GPU; set KERYX_TEST_GGUF to run"]
+    fn inproc_long_prompt() {
+        let Ok(gguf) = std::env::var("KERYX_TEST_GGUF") else {
+            eprintln!("SKIP: KERYX_TEST_GGUF not set");
+            return;
+        };
+        let engine = LlamaEngine::launch(&gguf).expect("engine launch");
+        let filler = "The quick brown fox jumps over the lazy dog. ".repeat(600);
+        let prompt = format!(
+            "<|im_start|>user\n{filler}\nHow many times does the word fox appear above? Answer in one short sentence.<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+        let n = engine.model.str_to_token(&prompt, AddBos::Always).unwrap().len();
+        assert!(n > N_BATCH as usize, "prompt of {n} tokens fits one batch");
+        let out = engine.generate(&prompt, 48, &[]).expect("generate over a multi-batch prompt");
+        eprintln!("{n}-token prompt → {out:?}");
+        assert!(!out.trim().is_empty(), "empty completion");
+
+        let huge = "word ".repeat(engine.ctx_cap as usize + 64);
+        let err = engine.generate(&huge, 16, &[]).expect_err("a prompt past the cap must be refused");
+        assert!(err.is::<PromptTooLong>(), "unexpected error: {err}");
+    }
+
+    /// VRAM dry run: llama.cpp loads only the GGUF metadata (`no_alloc`) and, per context size,
+    /// logs what it WOULD allocate — `llama_kv_cache: size = …` (K/V), `llama_memory_recurrent:
+    /// size = …` (hybrid models' recurrent state), `llama_context: Vulkan0 compute buffer size = …`
+    /// — with the exact context parameters `new_context` uses. Weights are not read, so a sparse
+    /// stub holding just the GGUF header works too. Run with:
+    ///   KERYX_TEST_GGUF=<model.gguf> [KERYX_TEST_CTX=4096,32768] [KERYX_TEST_KV=f16] \
+    ///     cargo test --release --lib -- --ignored --nocapture vram_dry_run
+    #[test]
+    #[ignore = "needs a Vulkan device and a GGUF; set KERYX_TEST_GGUF to run"]
+    fn vram_dry_run() {
+        let Ok(gguf) = std::env::var("KERYX_TEST_GGUF") else {
+            eprintln!("SKIP: KERYX_TEST_GGUF not set");
+            return;
+        };
+        let ctxs: Vec<u32> = std::env::var("KERYX_TEST_CTX")
+            .unwrap_or_else(|_| "4096,8192,32768,65536,131072".into())
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+        let f16 = std::env::var("KERYX_TEST_KV").is_ok_and(|v| v == "f16");
+        let _backend = backend().expect("llama backend");
+        let path = std::ffi::CString::new(gguf.clone()).unwrap();
+        unsafe {
+            let mut mp = llama_cpp_sys_2::llama_model_default_params();
+            mp.n_gpu_layers = i32::MAX;
+            mp.no_alloc = true;
+            mp.use_mmap = false; // llama.cpp asserts no_alloc never maps host-pointer buffers
+            let model = llama_cpp_sys_2::llama_model_load_from_file(path.as_ptr(), mp);
+            assert!(!model.is_null(), "metadata load failed for {gguf}");
+            eprintln!("DRYRUN model {gguf}: tensors {:.1} MiB", llama_cpp_sys_2::llama_model_size(model) as f64 / 1048576.0);
+            for n_ctx in ctxs {
+                let mut cp = llama_cpp_sys_2::llama_context_default_params();
+                let n_batch = N_BATCH.min(n_ctx);
+                cp.n_ctx = n_ctx;
+                cp.n_batch = n_batch;
+                cp.n_ubatch = N_UBATCH.min(n_batch);
+                cp.swa_full = false;
+                if f16 {
+                    cp.flash_attn_type = llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_AUTO;
+                    cp.type_k = llama_cpp_sys_2::GGML_TYPE_F16;
+                    cp.type_v = llama_cpp_sys_2::GGML_TYPE_F16;
+                } else {
+                    cp.flash_attn_type = llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_ENABLED;
+                    cp.type_k = llama_cpp_sys_2::GGML_TYPE_Q8_0;
+                    cp.type_v = llama_cpp_sys_2::GGML_TYPE_Q8_0;
+                }
+                eprintln!("DRYRUN ctx {n_ctx} kv {}", if f16 { "f16" } else { "q8_0" });
+                let ctx = llama_cpp_sys_2::llama_init_from_model(model, cp);
+                assert!(!ctx.is_null(), "context {n_ctx} could not be planned");
+                llama_cpp_sys_2::llama_free(ctx);
+            }
+            llama_cpp_sys_2::llama_model_free(model);
+        }
+    }
+
+    /// A request context covers its prompt plus budget in 256-token steps, never past the cap,
+    /// and a prompt that leaves no room under the cap is refused up front.
+    #[test]
+    fn request_ctx_fits_prompt_and_budget_under_the_cap() {
+        assert_eq!(request_ctx(100, 64, 32_768).unwrap(), 256);
+        assert_eq!(request_ctx(1_000, 1_000, 32_768).unwrap(), 2_048);
+        assert_eq!(request_ctx(30_000, 8_000, 32_768).unwrap(), 32_768);
+        assert_eq!(request_ctx(32_752, 0, 32_768).unwrap(), 32_768);
+        let e = request_ctx(32_753, 16, 32_768).unwrap_err();
+        assert_eq!((e.tokens, e.ctx_cap), (32_753, 32_768));
+        // `slm` recognizes the refusal through anyhow.
+        let wrapped: anyhow::Error = e.into();
+        assert!(wrapped.is::<PromptTooLong>());
+    }
+
     #[test]
     fn find_stop_cuts_split_and_earliest_markers() {
         let stops = &["<|im_end|>", "<|im_start|>"];

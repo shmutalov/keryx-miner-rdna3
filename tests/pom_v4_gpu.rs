@@ -1,5 +1,6 @@
 //! Lockstep: the Vulkan PoM v4 grind (`shaders/pom_walk_v4.comp`) against the host v4 walk
-//! (`keryx_miner::pom_v4`, byte-exact with the node) — both seed eras, both resident layouts.
+//! (`keryx_miner::pom_v4`, byte-exact with the node) — every seed era (pre-H10, H10, H14), both
+//! resident layouts.
 //!
 //! The kernel only reports the LOWEST nonce whose pow value meets the target, so the test sets the
 //! target to several order statistics of the host-computed pow values of a nonce batch: for every
@@ -12,7 +13,7 @@
 //!
 //! Run: `cargo test --test pom_v4_gpu -- --nocapture` (skips when no Vulkan device is present).
 
-use keryx_miner::pom::{mix64, pom_block_seed_v4_era, pom_pow_value, pom_seed_h10_state, pph_words_for_era, pph_words_v4};
+use keryx_miner::pom::{mix64, pom_block_seed_v4_era, pom_pow_value, pom_seed_state_v4_era, pph_words_for_era, pph_words_v4};
 use keryx_miner::pom_v4::{
     v4_first_offset, v4_initial_state, v4_next_offset, v4_state_root, v4_transition, POM_V4_K, POM_V4_TILE_BYTES,
     POM_V4_TILE_CHUNKS,
@@ -67,18 +68,19 @@ fn host_pows(blob: &[u8], pph: &[u8; 32], ts: u64, start: u64, n: u64, daa: u64)
         .collect()
 }
 
-fn job(pph: &[u8; 32], ts: u64, h10: bool, target: [u8; 32]) -> V4Job {
+/// The job `pom_gpu::mine_v4` hands the kernel for a block at `daa` (same era helper).
+fn job(pph: &[u8; 32], ts: u64, daa: u64, target: [u8; 32]) -> V4Job {
     V4Job {
         pow_words: pph_words_for_era(pph, true),
         seed_words: pph_words_v4(pph),
         timestamp: ts,
-        h10_state: h10.then(|| pom_seed_h10_state(pph, ts)),
+        h10_state: pom_seed_state_v4_era(pph, ts, daa),
         target_le: target,
     }
 }
 
 /// Every order-statistic threshold must yield exactly the host's first passing nonce.
-fn check(label: &str, mine: &dyn Fn(&V4Job, u64, u32) -> Option<u64>, pows: &[[u8; 32]], pph: &[u8; 32], ts: u64, start: u64, h10: bool) {
+fn check(label: &str, mine: &dyn Fn(&V4Job, u64, u32) -> Option<u64>, pows: &[[u8; 32]], pph: &[u8; 32], ts: u64, start: u64, daa: u64) {
     let mut sorted = pows.to_vec();
     sorted.sort_by(|a, b| {
         for i in (0..32).rev() {
@@ -92,7 +94,7 @@ fn check(label: &str, mine: &dyn Fn(&V4Job, u64, u32) -> Option<u64>, pows: &[[u
     for &k in &[0, 1, n / 4, n / 2, n - 1] {
         let target = sorted[k];
         let want = pows.iter().position(|p| le_leq(p, &target)).map(|i| start.wrapping_add(i as u64));
-        let got = mine(&job(pph, ts, h10, target), start, n as u32);
+        let got = mine(&job(pph, ts, daa, target), start, n as u32);
         assert_eq!(got, want, "{label}: threshold = order statistic {k}");
     }
     // Below the minimum nothing wins.
@@ -102,7 +104,7 @@ fn check(label: &str, mine: &dyn Fn(&V4Job, u64, u32) -> Option<u64>, pows: &[[u
     for b in below[..i].iter_mut() {
         *b = 0xff;
     }
-    assert_eq!(mine(&job(pph, ts, h10, below), start, n as u32), None, "{label}: below the minimum");
+    assert_eq!(mine(&job(pph, ts, daa, below), start, n as u32), None, "{label}: below the minimum");
 }
 
 #[test]
@@ -149,11 +151,11 @@ fn v4_gpu_grind_matches_the_host_walk() {
         .collect();
     let shards = PomWalkGpu::new_sharded(&words, n_chunks, 1024).expect("sharded blob");
 
-    for (h10, daa) in [(true, u64::MAX), (false, 80_000_000u64)] {
+    // Mainnet gates: v4 79,210,000, H10 87,360,000, H14 121,985,000.
+    for (era, daa) in [("H14 seed", u64::MAX), ("H10 seed", 100_000_000u64), ("pre-H10 v4 seed", 80_000_000u64)] {
         let pows = host_pows(&blob, &pph, ts, start, n, daa);
-        let era = if h10 { "H10 seed" } else { "pre-H10 v4 seed" };
-        check(&format!("segments, {era}"), &|j, s, b| seg.mine(&vk, j, s, b), &pows, &pph, ts, start, h10);
-        check(&format!("shards, {era}"), &|j, s, b| shards.mine_v4(j, s, b), &pows, &pph, ts, start, h10);
+        check(&format!("segments, {era}"), &|j, s, b| seg.mine(&vk, j, s, b), &pows, &pph, ts, start, daa);
+        check(&format!("shards, {era}"), &|j, s, b| shards.mine_v4(j, s, b), &pows, &pph, ts, start, daa);
     }
 
     seg.destroy(&vk);

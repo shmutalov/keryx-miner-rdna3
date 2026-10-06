@@ -556,6 +556,7 @@ impl StratumHandler {
                                 .unwrap();
                             // Remember the real daa so plain `Short` notifies can inherit it (PoM gate).
                             LAST_DAA_SCORE.store(daa_score, Ordering::Relaxed);
+                            keryx_miner::slm::note_chain_daa(daa_score);
                             // OPoI hard gate (mirrors solo grpc.rs): no models ready = no mining.
                             if !keryx_miner::pow_only() && keryx_miner::slm::loaded_model_ids().is_empty() {
                                 if self.block_template_ctr.load(Ordering::SeqCst) % 200 == 0 {
@@ -567,6 +568,14 @@ impl StratumHandler {
                             let inference_started = match task_json {
                                 // PoW-only test mode: ignore the AiRequest task entirely and just mine.
                                 Some(_) if keryx_miner::pow_only() => false,
+                                // The task path publishes plaintext answers to IPFS; from the
+                                // private-inference gate on only the pool can build an answer
+                                // (it opens the sealed request and dispatches `mining.ai_request`).
+                                Some(_) if daa_score >= keryx_miner::pom::private_inference_activation_daa() => {
+                                    warn!("OPoI: pool still dispatches inference tasks; private inference needs a v3 pool (mining.ai_request) — task ignored");
+                                    *self.current_task_slot.lock().await = None;
+                                    false
+                                }
                                 Some(task_json) => self.handle_ai_task(id.clone(), task_json, miner).await,
                                 None => {
                                     // No AiRequest in this job — clear the task slot.

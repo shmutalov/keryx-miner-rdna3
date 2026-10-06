@@ -123,34 +123,26 @@ fn filter_plugins(dirname: &str) -> Vec<String> {
 /// rather than error. The capability gate (`filter_specs_by_vram`) does the announce-time drop;
 /// this is just an upfront, tier-labelled heads-up.
 ///
-/// VRAM requirements (GGUF weights only, not counting GPU workspace):
-///   Qwen3-8B-ablit. →  ~4.6 GB  (Q4_K_S — H5 tier 0, requires ≥6 GB card)
-///   Mistral-7B-v0.3 →  ~5.9 GB  (Q6_K — requires ≥8 GB card)
-///   GLM-4-9B-0414   →  ~8.3 GB  (Q6_K — requires ≥12 GB card)
-///   Qwen3.6-27B     → ~16.5 GB  (requires ≥24 GB card)
-///   Kimi-Linear-48B → ~29.7 GB  (requires ≥32 GB card)
-fn check_gpu_vram_for_tier(needs_high: bool, needs_very_high: bool) {
+/// VRAM requirements (`ModelSpec::min_vram_mb`: weights + KV/workspace):
+///   Qwen3.5-9B-ablit.  →  8 GB card  (--very-light)
+///   GLM-4-9B-0414      → 12 GB card  (--light)
+///   Gemma-4-12B-ablit. → 16 GB card  (default)
+///   Qwen3.6/3.8-27B    → 24 GB card  (--high; Qwen3.8 from H14)
+///   Kimi-Linear-48B    → 32 GB card  (--very-high)
+fn check_gpu_vram_for_tier(tier: keryx_miner::models::Tier) {
     let Some(vram_mb) = query_vram_mb() else { return };
+    let spec = keryx_miner::models::spec_for_tier(tier);
 
-    let (model_label, min_vram_mb): (&str, u64) = if needs_very_high {
-        ("Kimi-Linear-48B (--very-high)", 30_000)
-    } else if needs_high {
-        ("Qwen3.6-27B (--high)", 24_000)
-    } else {
-        ("GLM-4-9B-0414 (default)", 12_000)
-    };
-
-    if vram_mb < min_vram_mb {
+    if vram_mb < spec.min_vram_mb {
         log::warn!(
             "⚠  {} needs ≥{} GB VRAM but only {} GB on this GPU — GPU inference for this tier \
-             will OOM. Use a smaller tier (--light Mistral-7B / --very-light Qwen3-8B) or \
-             serve it via a host/CPU path.",
-            model_label,
-            min_vram_mb / 1024,
+             will OOM. Use a smaller tier (--light GLM-4-9B / --very-light Qwen3.5-9B).",
+            spec.dir_name,
+            spec.min_vram_mb / 1000,
             vram_mb / 1024,
         );
     } else {
-        log::info!("GPU: {} MB VRAM — ready for {}", vram_mb, model_label);
+        log::info!("GPU: {} MB VRAM — ready for {}", vram_mb, spec.dir_name);
     }
 }
 
@@ -259,8 +251,9 @@ async fn client_main(
     escrow_privkey: Option<String>,
     escrow_cert: Option<String>,
 ) -> Result<(), Error> {
-    // IPFS is only needed to serve/fetch OPoI model files; skip it in PoW-only test mode.
-    if !keryx_miner::pow_only() {
+    // IPFS carries pre-H14 answers only; skip it in PoW-only test mode and once the chain reached
+    // the private-inference gate (answers travel inline in the AiResponse from then on).
+    if !keryx_miner::pow_only() && !keryx_miner::slm::inline_answers() {
         let ipfs_url = opt.ipfs_url.clone();
         tokio::task::spawn_blocking(move || crate::ipfs::ensure_daemon(&ipfs_url)).await.ok();
     }
@@ -535,55 +528,44 @@ async fn run() -> Result<(), Error> {
     };
 
     // Phase-3 OPoI / PoM: load inference models before mining starts. Under PoM each tier
-    // mines AND serves exactly ONE model (1 GPU = 1 tier); multi-tier coverage is a network
-    // property, not a per-GPU one. H4 lineup:
-    //   --very-light → Qwen3-8B-ablit.  (PoM tier 0, H5)
-    //   --light      → Mistral-7B-v0.3  (tier 1)
-    //   (no flag)    → GLM-4-9B-0414    (tier 2) [default]
-    //   --high       → Qwen3.6-27B      (tier 3)
-    //   --very-high  → Kimi-Linear-48B  (tier 4)
-
-    // Warn if GPU 0's VRAM is too small for the selected model tier (Vulkan-queried).
-    check_gpu_vram_for_tier(opt.high || opt.very_high, opt.very_high);
-
+    // mines AND serves exactly ONE model per era (1 GPU = 1 tier); multi-tier coverage is a
+    // network property, not a per-GPU one. H6 lineup (H14 swaps tier 3):
+    //   --very-light → Qwen3.5-9B-abliterated   (tier 0)
+    //   --light      → GLM-4-9B-0414            (tier 1)
+    //   (no flag)    → Gemma-4-12B-abliterated  (tier 2) [default]
+    //   --high       → Qwen3.6-27B, Qwen3.8-27B from H14 (tier 3)
+    //   --very-high  → Kimi-Linear-48B          (tier 4)
     let tier = if opt.very_high {
-        info!("--very-high mode: top tier — mines Kimi-Linear-48B under PoM.");
         keryx_miner::models::Tier::VeryHigh
     } else if opt.high {
-        info!("--high mode: high tier — mines Qwen3.6-27B under PoM.");
         keryx_miner::models::Tier::High
     } else if opt.light {
-        info!("--light mode: light tier — mines Mistral-7B-v0.3 under PoM.");
         keryx_miner::models::Tier::Light
     } else if opt.very_light {
-        info!("--very-light mode: entry tier — mines Qwen3-8B-abliterated under PoM.");
         keryx_miner::models::Tier::VeryLight
     } else {
-        info!("default mode: mines GLM-4-9B-0414 under PoM.");
         keryx_miner::models::Tier::Default
     };
-    // H4-only binary: stage, announce, and prefetch exactly the one H4 model for the selected
-    // hardware tier, filtered by hardware capability. Below the H4 flip this binary refuses to
-    // mine (`pom_tier_index` returns None), so no pre-H4 lineup is ever staged.
-    let specs_v2 = filter_specs_by_vram(keryx_miner::models::specs_for_tier(tier));
-    // PoM: pick the highest tier this miner serves that has a pinned R_T (the model it will
-    // mine under possession). Captured before `specs_v2` is consumed; the index is built after
-    // prefetch (below). `&'static ModelSpec` is Copy so this survives the moves.
-    let pom_spec = if keryx_miner::pom::pom_activation_daa() != u64::MAX {
-        specs_v2
-            .iter()
-            .copied()
-            .filter(|s| keryx_miner::models::is_pom_model(&s.model_id))
-            .max_by_key(|s| s.min_vram_mb)
-    } else {
-        None
-    };
-    // Announce the H4 lineup from the start (static — no crossing swap left).
-    keryx_miner::slm::init_supported(specs_v2);
-    log::debug!(
-        "OPoI Phase-3 active — {} uncensored model(s) staged (H4-only lineup).",
-        specs_v2.len(),
+    let era_models = keryx_miner::models::pom_models_all_eras(tier, None);
+    info!(
+        "Model tier: mines {} under PoM.",
+        era_models.iter().map(|s| s.dir_name).collect::<Vec<_>>().join(", then (from H14) ")
     );
+
+    // Warn if GPU 0's VRAM is too small for the selected model tier (Vulkan-queried).
+    check_gpu_vram_for_tier(tier);
+
+    // Stage, announce and prefetch the tier's model for every era the chain can still reach (tier 3
+    // stages Qwen3.6-27B and Qwen3.8-27B until H14, so the crossing swaps without a mid-run
+    // download), filtered by hardware capability. Below H6 this binary refuses to mine
+    // (`pom_tier_index` returns None), so no older lineup is ever staged.
+    let specs_v2 = filter_specs_by_vram(Box::leak(era_models.into_boxed_slice()));
+    // PoM mines the tier's era model under possession: configured only when that model survived the
+    // capability gate. The index is built after prefetch (below).
+    let mine_pom = keryx_miner::pom::pom_activation_daa() != u64::MAX && !specs_v2.is_empty();
+    // Announce the staged lineup; `slm` narrows it to the chain's current era once the DAA is known.
+    keryx_miner::slm::init_supported(specs_v2);
+    log::debug!("OPoI Phase-3 active — {} uncensored model(s) staged.", specs_v2.len());
     // Block until the uncensored lineup is fully downloaded before mining: never start hashing
     // while a model this miner will serve is still downloading.
     if keryx_miner::pow_only() {
@@ -604,15 +586,14 @@ async fn run() -> Result<(), Error> {
     // pre-PoM legacy phase the GPU + host stay free for the legacy lineup (mining + inference start
     // immediately). The possession index AND the GPU walk are built by the mining loop the first
     // time PoM is active (DAA >= POM_ACTIVATION_DAA). Here we only record cheap config.
-    if let Some(spec) = pom_spec {
-        let gpath = keryx_miner::slm::gguf_path_for(spec).to_string_lossy().into_owned();
-        // Record the mining MODEL so the walk can be built on demand (zero-dup: over the
-        // in-process engine's resident weights on the inference GPU). The PoM tier INDEX is
-        // computed per block from the block DAA (`pom_gpu::current_tier`), not frozen here —
-        // the H4 gate makes it None below the flip, so a startup-frozen value would be wrong.
-        keryx_miner::pom_gpu::set_mining_tier(spec.model_id, gpath);
-        info!("PoM: configured to mine {} under possession; index + GPU walk load lazily when PoM activates (DAA {}).",
-            spec.dir_name, keryx_miner::pom::pom_activation_daa());
+    if mine_pom {
+        // Record the mining TIER so the walk can be built on demand (zero-dup: over the in-process
+        // engine's resident weights on the inference GPU). The MODEL and the PoM tier index are
+        // resolved per block from the block DAA (`pom_gpu::mining_model` / `current_tier`), not
+        // frozen here — tier 3's model changes at H14.
+        keryx_miner::pom_gpu::set_mining_tier(tier);
+        info!("PoM: configured to mine under possession; index + GPU walk load lazily when PoM activates (DAA {}).",
+            keryx_miner::pom::pom_activation_daa());
     }
 
     // Verify the Vulkan inference backend before mining. OPoI challenges are mandatory, so a miner

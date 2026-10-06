@@ -9,7 +9,7 @@
 ///   --very-light  Qwen3.5-9B-abliterated Q5_K_M (Alibaba)  — 8 GB
 ///   --light       GLM-4-9B-0414          Q6_K   (Zhipu)    — 12 GB
 ///   (default)     Gemma-4-12B-abliterated Q6_K  (Google)   — 16 GB
-///   --high        Qwen3.6-27B            Q4_K_M (Alibaba)  — 24 GB
+///   --high        Qwen3.6-27B            Q4_K_M (Alibaba)  — 24 GB  (Qwen3.8-27B Q4_K from H14)
 ///   --very-high   Kimi-Linear-48B        Q4_K_M (Moonshot) — 32 GB
 ///
 /// All GGUF weights are pinned on the Keryx IPFS gateway; each
@@ -45,6 +45,11 @@ pub struct ModelSpec {
     /// KV cache + workspace. Used by the OPoI capability gate so `ai:cap`
     /// never announces a model the miner cannot load. 0 = never gated.
     pub min_vram_mb: u64,
+    /// Smallest context window (tokens) the engine should hold to serve the model: the budget
+    /// clients assume. Mirrors upstream's per-model floor.
+    pub ctx_floor: u32,
+    /// Largest context window worth allocating for one request.
+    pub ctx_cap: u32,
 }
 
 // ── H6 lineup ───────────────────────────────────────────────────
@@ -69,6 +74,8 @@ pub const QWEN3_5_9B_ABLITERATED: ModelSpec = ModelSpec {
     dir_name: "Qwen3.5-9B-abliterated",
     // ~6.5 GB Q5_K_M weights + ~1.3 GB KV/workspace → 8 GB card.
     min_vram_mb: 8_000,
+    ctx_floor: 8_192,
+    ctx_cap: 32_768,
 };
 
 pub const GLM_4_9B_0414: ModelSpec = ModelSpec {
@@ -86,6 +93,8 @@ pub const GLM_4_9B_0414: ModelSpec = ModelSpec {
     dir_name: "GLM-4-9B-0414",
     // ~8.3 GB Q6_K weights + ~1.5 GB KV/workspace → 12 GB card.
     min_vram_mb: 12_000,
+    ctx_floor: 32_768,
+    ctx_cap: 32_768,
 };
 
 /// Tier-2 model — gemma-4-12B-it-abliterated Q6_K (huihui-ai abliteration, mradermacher
@@ -104,6 +113,8 @@ pub const GEMMA_4_12B_ABLITERATED: ModelSpec = ModelSpec {
     dir_name: "Gemma-4-12B-abliterated",
     // ~9.8 GB Q6_K weights + ~2 GB KV/workspace → 16 GB card (fills the 12→24 GB gap).
     min_vram_mb: 16_000,
+    ctx_floor: 32_768,
+    ctx_cap: 131_072,
 };
 
 pub const QWEN3_6_27B: ModelSpec = ModelSpec {
@@ -122,6 +133,28 @@ pub const QWEN3_6_27B: ModelSpec = ModelSpec {
     // ~16.5 GB Q4_K_M weights + ~2.5 GB KV/workspace → 24 GB card (7900 XTX-class; a 20 GB
     // 7900 XT is excluded by this gate, matching upstream's ladder).
     min_vram_mb: 24_000,
+    ctx_floor: 32_768,
+    ctx_cap: 65_536,
+};
+
+/// Tier-3 model from the private-inference gate (H14) — Huihui-Qwen3.8-27B-abliterated Q4_K
+/// (qwen35 hybrid-SSM, like Qwen3.6). `model_id` MUST equal the node's `QWEN3_8_27B_MODEL_ID`.
+pub const QWEN3_8_27B: ModelSpec = ModelSpec {
+    name: "qwen3.8-27b",
+    model_id: [
+        0x73, 0x74, 0x0b, 0x44, 0x3b, 0xdc, 0x00, 0xaf,
+        0xda, 0x5f, 0xa3, 0x4e, 0xb9, 0x99, 0x9d, 0x3f,
+        0xea, 0x77, 0xdc, 0xc3, 0xf6, 0xde, 0x23, 0x8f,
+        0xab, 0x70, 0x13, 0x94, 0xcd, 0xc9, 0x6f, 0xb3,
+    ],
+    format: ModelFormat::GgufQwen35,
+    tokenizer_cid: "",
+    weight_cids: &["QmW7LDz7ZTfw9vpAR9jMhFHWriLhxh728Kihp7oTSLgvyg"],
+    dir_name: "Qwen3.8-27B",
+    // ~16.8 GB Q4_K weights + KV/workspace → 24 GB card, like Qwen3.6-27B.
+    min_vram_mb: 24_000,
+    ctx_floor: 32_768,
+    ctx_cap: 65_536,
 };
 
 pub const KIMI_LINEAR_48B: ModelSpec = ModelSpec {
@@ -139,6 +172,8 @@ pub const KIMI_LINEAR_48B: ModelSpec = ModelSpec {
     dir_name: "Kimi-Linear-48B",
     // ~29.7 GB Q4_K_M weights (MoE, 3B active) + KV/workspace → needs a 32 GB card.
     min_vram_mb: 30_000,
+    ctx_floor: 32_768,
+    ctx_cap: 131_072,
 };
 
 /// VRAM floor (MB) at which a card is still allowed to be ASSIGNED this model's PoM tier, as
@@ -156,10 +191,12 @@ pub fn is_pom_model(model_id: &[u8; 32]) -> bool {
         || *model_id == GLM_4_9B_0414.model_id
         || *model_id == GEMMA_4_12B_ABLITERATED.model_id
         || *model_id == QWEN3_6_27B.model_id
+        || *model_id == QWEN3_8_27B.model_id
         || *model_id == KIMI_LINEAR_48B.model_id
 }
 
-/// Mirror of the node's per-block tier table (`POM_TIERS_H6`), recomputed from the block DAA.
+/// Mirror of the node's per-block tier table (`POM_TIERS_H6`, `POM_TIERS_H14` from the
+/// private-inference gate), recomputed from the block DAA.
 /// Below the H6 gate this binary refuses to mine (None) — it never produces a pre-H6-era block.
 pub fn pom_tier_index(model_id: &[u8; 32], daa: u64) -> Option<u8> {
     if daa < crate::pom::pom_v3_activation_daa() {
@@ -172,7 +209,9 @@ pub fn pom_tier_index(model_id: &[u8; 32], daa: u64) -> Option<u8> {
     } else if *model_id == GEMMA_4_12B_ABLITERATED.model_id {
         Some(2)
     } else if *model_id == QWEN3_6_27B.model_id {
-        Some(3)
+        (daa < crate::pom::private_inference_activation_daa()).then_some(3)
+    } else if *model_id == QWEN3_8_27B.model_id {
+        (daa >= crate::pom::private_inference_activation_daa()).then_some(3)
     } else if *model_id == KIMI_LINEAR_48B.model_id {
         Some(4)
     } else {
@@ -188,7 +227,7 @@ pub struct PomAnchor {
     pub chunks: u64,
 }
 
-/// Per-model `(R_T, N)` anchors, copied VERBATIM from the node's `POM_TIERS_H6`
+/// Per-model `(R_T, N)` anchors, copied VERBATIM from the node's `POM_TIERS_H6` / `POM_TIERS_H14`
 /// (`keryx-node consensus/core/src/config/params.rs`). The miner asserts its freshly-built
 /// possession index matches the pinned `(root, N)` for the model it mines (see
 /// `pom_gpu::ensure_installed_inner`), so a wrong-quant / corrupt / truncated GGUF is caught once
@@ -232,6 +271,15 @@ pub const POM_ANCHORS: &[PomAnchor] = &[
         chunks: 516_762_688,
     },
     PomAnchor {
+        // Tier 3 @ H14 — Qwen3.8-27B Q4_K. Values from `POM_TIERS_H14[3]`.
+        model_id: QWEN3_8_27B.model_id,
+        root: [
+            0x40, 0x6c, 0x19, 0x56, 0xf9, 0xf5, 0xdd, 0x13, 0x4d, 0x34, 0x61, 0xc6, 0x19, 0x11, 0x32, 0xa3,
+            0xb1, 0x57, 0x2c, 0xc1, 0x6f, 0x39, 0x5a, 0x2b, 0xc2, 0xf1, 0xc6, 0x69, 0xfa, 0xe3, 0x74, 0xa1,
+        ],
+        chunks: 524_991_232,
+    },
+    PomAnchor {
         model_id: KIMI_LINEAR_48B.model_id,
         root: [
             0x95, 0x74, 0x71, 0x0f, 0xfa, 0xb6, 0x78, 0xf0, 0x68, 0xb4, 0xe6, 0x5a, 0xbe, 0x72, 0x40, 0x86,
@@ -263,15 +311,18 @@ pub fn h6_staged() -> bool {
 
 /// DAA marking the latest scheduled era for startup staging (VRAM ladder + initial mining model).
 /// The miner does NOT idle until the crossing — it stages against the latest scheduled lineup,
-/// prefetches every scheduled era (`pom_models_all_eras`), and hot-swaps the resident model at
-/// the crossing (`pom_gpu::advance_mining_tier_if_due`).
+/// prefetches every scheduled era (`pom_models_all_eras`), and swaps the resident model at the
+/// crossing (`pom_gpu::ensure_installed` rebuilds the walk for the block's era model).
 pub fn staging_daa() -> u64 {
-    crate::pom::pom_v3_activation_daa()
+    match crate::pom::private_inference_activation_daa() {
+        u64::MAX => crate::pom::pom_v3_activation_daa(),
+        h14 => h14.max(crate::pom::pom_v3_activation_daa()),
+    }
 }
 
 /// The single model a hardware `tier` mines AND serves at `daa` — matching the node's per-block
-/// tier table (`pom_tiers`). The hardware tier is fixed; the model it must mine flips at a gate,
-/// which is what arms `advance_mining_tier_if_due`.
+/// tier table (`pom_tiers`). The hardware tier is fixed; the model it must mine flips at a gate
+/// (tier 3 at H14), which is what makes `pom_gpu::ensure_installed` swap the resident model.
 /// `None` when the tier has no consensus-valid model in that era: it mines nothing there and
 /// idles until its gate, rather than downloading and mining a model the node would reject. The
 /// retirement of a crossed era is expressed by returning `None` for it.
@@ -283,6 +334,7 @@ pub fn pom_model_for_tier(daa: u64, tier: Tier) -> Option<&'static ModelSpec> {
         Tier::VeryLight => &QWEN3_5_9B_ABLITERATED,
         Tier::Light => &GLM_4_9B_0414,
         Tier::Default => &GEMMA_4_12B_ABLITERATED,
+        Tier::High if daa >= crate::pom::private_inference_activation_daa() => &QWEN3_8_27B,
         Tier::High => &QWEN3_6_27B,
         Tier::VeryHigh => &KIMI_LINEAR_48B,
     })
@@ -296,7 +348,10 @@ pub fn pom_model_for_tier(daa: u64, tier: Tier) -> Option<&'static ModelSpec> {
 /// below the tip can still be mined, so an era the chain has already left needs no model. `None`
 /// (node unreachable, or pool mining) keeps every scheduled era.
 pub fn pom_models_all_eras(tier: Tier, chain_daa: Option<u64>) -> Vec<&'static ModelSpec> {
-    let gates = vec![crate::pom::pom_v3_activation_daa(), staging_daa()];
+    let mut gates = vec![crate::pom::pom_v3_activation_daa(), staging_daa()];
+    if crate::pom::private_inference_activation_daa() != u64::MAX {
+        gates.push(crate::pom::private_inference_activation_daa());
+    }
     let mut out: Vec<&'static ModelSpec> = Vec::new();
     for gate in reachable_gates(gates, chain_daa) {
         let Some(s) = pom_model_for_tier(gate, tier) else { continue };
@@ -332,29 +387,24 @@ pub fn spec_for_tier(tier: Tier) -> &'static ModelSpec {
     pom_model_for_tier(staging_daa(), tier).expect("the staging era carries every tier")
 }
 
-/// [`spec_for_tier`] as a one-element static slice — the shape the staging/announce path
-/// (`init_supported`/`prefetch_models`) consumes.
-pub fn specs_for_tier(tier: Tier) -> &'static [&'static ModelSpec] {
-    match tier {
-        Tier::VeryLight => &[&QWEN3_5_9B_ABLITERATED],
-        Tier::Light => &[&GLM_4_9B_0414],
-        Tier::Default => &[&GEMMA_4_12B_ABLITERATED],
-        Tier::High => &[&QWEN3_6_27B],
-        Tier::VeryHigh => &[&KIMI_LINEAR_48B],
-    }
-}
-
 /// Resolves a model name/id.
 pub const REGISTRY: &[&ModelSpec] = &[
     &QWEN3_5_9B_ABLITERATED,
     &GLM_4_9B_0414,
     &GEMMA_4_12B_ABLITERATED,
     &QWEN3_6_27B,
+    &QWEN3_8_27B,
     &KIMI_LINEAR_48B,
 ];
 
 pub fn find(name: &str) -> Option<&'static ModelSpec> {
     REGISTRY.iter().copied().find(|m| m.name == name)
+}
+
+/// The lineup model a GGUF path belongs to, by its `<models>/<dir_name>/` component.
+pub fn spec_for_gguf(path: &str) -> Option<&'static ModelSpec> {
+    let normalized = path.replace('\\', "/");
+    REGISTRY.iter().copied().find(|m| normalized.contains(&format!("/{}/", m.dir_name)))
 }
 
 pub fn available_names() -> Vec<&'static str> {
@@ -390,34 +440,60 @@ mod tests {
         assert_eq!(reachable_gates(vec![54_766_000, 59_009_037, 59_009_037], Some(66_000_000)), vec![59_009_037]);
     }
 
-    /// The per-block tier table — mirror of the node's `POM_TIERS_H6` order. `u64::MAX` sits
-    /// at/after every gate on any network, so this exercises the table without touching the
-    /// global testnet switch.
+    /// The per-block tier table — mirror of the node's `POM_TIERS_H14` (and, below the H14 gate,
+    /// `POM_TIERS_H6`) order. `u64::MAX` sits at/after every gate on any network, so this exercises
+    /// the table without touching the global testnet switch.
     #[test]
     fn tier_table_mirrors_node() {
         let daa = u64::MAX;
         assert_eq!(pom_tier_index(&QWEN3_5_9B_ABLITERATED.model_id, daa), Some(0));
         assert_eq!(pom_tier_index(&GLM_4_9B_0414.model_id, daa), Some(1));
         assert_eq!(pom_tier_index(&GEMMA_4_12B_ABLITERATED.model_id, daa), Some(2));
-        assert_eq!(pom_tier_index(&QWEN3_6_27B.model_id, daa), Some(3));
+        assert_eq!(pom_tier_index(&QWEN3_8_27B.model_id, daa), Some(3));
+        assert_eq!(pom_tier_index(&QWEN3_6_27B.model_id, daa), None);
         assert_eq!(pom_tier_index(&KIMI_LINEAR_48B.model_id, daa), Some(4));
 
         // The hardware-tier -> model map agrees with the table, tier for tier.
         assert_eq!(pom_model_for_tier(daa, Tier::VeryLight).unwrap().model_id, QWEN3_5_9B_ABLITERATED.model_id);
         assert_eq!(pom_model_for_tier(daa, Tier::Light).unwrap().model_id, GLM_4_9B_0414.model_id);
         assert_eq!(pom_model_for_tier(daa, Tier::Default).unwrap().model_id, GEMMA_4_12B_ABLITERATED.model_id);
-        assert_eq!(pom_model_for_tier(daa, Tier::High).unwrap().model_id, QWEN3_6_27B.model_id);
+        assert_eq!(pom_model_for_tier(daa, Tier::High).unwrap().model_id, QWEN3_8_27B.model_id);
         assert_eq!(pom_model_for_tier(daa, Tier::VeryHigh).unwrap().model_id, KIMI_LINEAR_48B.model_id);
 
-        // Every registry model is a mineable tier, has a pinned anchor, and every tier's staged
-        // model is in the registry.
-        let expected_chunks = [203_469_888u64, 258_040_832, 305_318_656, 516_762_688, 927_994_064];
+        // Just below the H14 gate tier 3 is still Qwen3.6-27B.
+        let pre_h14 = crate::pom::private_inference_activation_daa() - 1;
+        assert!(pre_h14 >= crate::pom::pom_v3_activation_daa());
+        assert_eq!(pom_tier_index(&QWEN3_6_27B.model_id, pre_h14), Some(3));
+        assert_eq!(pom_tier_index(&QWEN3_8_27B.model_id, pre_h14), None);
+        assert_eq!(pom_model_for_tier(pre_h14, Tier::High).unwrap().model_id, QWEN3_6_27B.model_id);
+
+        // Every registry model is a mineable tier in some era and has its pinned anchor (values
+        // from the node's `POM_TIERS_H6` / `POM_TIERS_H14`).
+        let expected_chunks = [203_469_888u64, 258_040_832, 305_318_656, 516_762_688, 524_991_232, 927_994_064];
+        assert_eq!(REGISTRY.len(), expected_chunks.len());
         for (spec, chunks) in REGISTRY.iter().zip(expected_chunks) {
             assert!(is_pom_model(&spec.model_id), "{} is not a PoM model", spec.name);
-            assert!(pom_tier_index(&spec.model_id, daa).is_some(), "{} has no tier", spec.name);
+            let tier = pom_tier_index(&spec.model_id, daa).or_else(|| pom_tier_index(&spec.model_id, pre_h14));
+            assert!(tier.is_some(), "{} has no tier", spec.name);
             let a = pinned_pom_anchor(&spec.model_id).unwrap_or_else(|| panic!("{} anchor missing", spec.name));
             assert_eq!(a.chunks, chunks, "{} chunk count", spec.name);
+            assert_eq!(spec_for_gguf(&format!("C:\\miner\\models\\{}\\model.gguf", spec.dir_name)).map(|s| s.name), Some(spec.name));
         }
+        // Node `h14_lineup_tests`: the Qwen3.8-27B id and root.
+        assert_eq!(hex::encode(QWEN3_8_27B.model_id), "73740b443bdc00afda5fa34eb9999d3fea77dcc3f6de238fab701394cdc96fb3");
+        assert_eq!(
+            hex::encode(pinned_pom_anchor(&QWEN3_8_27B.model_id).unwrap().root),
+            "406c1956f9f5dd134d3461c6191132a3b1572cc16f395a2bc2f1c669fae374a1"
+        );
+
+        // Tier 3 stages both eras' models until the chain passes the gate; the other tiers one.
+        let h14 = crate::pom::private_inference_activation_daa();
+        let high = |chain| pom_models_all_eras(Tier::High, chain).iter().map(|s| s.name).collect::<Vec<_>>();
+        assert_eq!(high(None), vec!["qwen3.6-27b", "qwen3.8-27b"]);
+        assert_eq!(high(Some(h14 - 1)), vec!["qwen3.6-27b", "qwen3.8-27b"]);
+        assert_eq!(high(Some(h14)), vec!["qwen3.8-27b"]);
+        assert_eq!(pom_models_all_eras(Tier::VeryLight, None).len(), 1);
+        assert_eq!(spec_for_tier(Tier::High).name, "qwen3.8-27b");
 
         // Below the gate the miner produces nothing rather than a block the node would reject.
         let gate = crate::pom::pom_v3_activation_daa();

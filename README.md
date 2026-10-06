@@ -69,30 +69,39 @@ on first run (same as upstream).
 ./keryx-miner-rdna3 --mining-address keryx:YOUR_ADDRESS
 ```
 
-### Inference tiers (OPoI — H6 lineup, `POM_TIERS_H6`)
+### Inference tiers (OPoI — H6 lineup `POM_TIERS_H6`, tier 3 swapped at H14 `POM_TIERS_H14`)
 
 | Flag | Model | Tier | Min VRAM | Fits a 7900 XT (20 GB)? |
 |------|-------|------|----------|--------------------------|
 | `--very-light` | Qwen3.5-9B-abliterated (Q5_K_M) | 0 | 8 GB | ✅ |
 | `--light` | GLM-4-9B-0414 (Q6_K) | 1 | 12 GB | ✅ |
 | *(default)* | gemma-4-12B-it-abliterated (Q6_K) | 2 | 16 GB | ✅ |
-| `--high` | Qwen3.6-27B (Q4_K_M) | 3 | 24 GB | no |
+| `--high` | Qwen3.6-27B (Q4_K_M); **Qwen3.8-27B (Q4_K) from H14** | 3 | 24 GB | no |
 | `--very-high` | Kimi-Linear-48B (Q4_K_M) | 4 | 30 GB | no |
 
 > Under PoM, **1 GPU = 1 tier**: each tier proves possession of and serves exactly the single
 > model above — a PoM GPU is bound to the one model whose weights are resident in VRAM. The
 > miner checks the GGUF it indexes against the node-pinned `(R_T, N)` anchor of its tier and
-> refuses to mine on a mismatch.
+> refuses to mine on a mismatch. `--high` downloads both tier-3 models until the H14 gate and swaps
+> the resident model on the first block past it.
 
 ### Consensus this build mines
 
 **PoM v4** (the D=32 matrix re-walk, mainnet DAA 79,210,000) with the **H10 keccak walk seed**
-(mainnet DAA 87,360,000; both from DAA 1 on testnet) — the live rules of keryx-node v1.6.x. Each
+(mainnet DAA 87,360,000; both from DAA 1 on testnet) and, from **H14** (private inference, mainnet
+DAA 121,985,000 ≈ 2026-10-09 14:00 UTC; testnet 6,000), the H10 seed taken over the H14-tagged
+pre-PoW hash — the rules of keryx-node v1.6.4. Each
 nonce walks a 32×32 int8 state through 256 chained 1 KB weight tiles on the GPU
 (`keryx-vulkan/shaders/pom_walk_v4.comp`); every winner is re-walked on the host, which builds the
 proof (all 256 tiles + their Merkle range proofs under the tier's `R_T`) and self-verifies it before
 submitting. The header carries `pomFinalState`, `pomTier` and the node's `serviceStateHash` (H6).
 Older eras (the v1/v2 hash walk, the H6 v3 matrix walk) are history on every network.
+
+**Private inference (H14).** Every AiRequest is sealed to its tier's provider cohort. A solo miner
+opens the ones addressed to its escrow key, answers, and seals the answer back to the requester; the
+sealed body rides inline in the signed AiResponse, so IPFS (kubo) is no longer needed past the gate.
+Pool miners get the opened prompt from the pool (`mining.ai_request`), and legacy notify-borne
+inference tasks are ignored past the gate.
 
 ### Solo mining: escrow delegation cert (required since H6)
 

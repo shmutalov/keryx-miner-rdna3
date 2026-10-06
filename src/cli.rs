@@ -4,7 +4,7 @@ use log::LevelFilter;
 use crate::Error;
 
 #[derive(Parser, Debug)]
-#[clap(name = "keryx-miner", version, about = "A Keryx high performance GPU miner with OPoI inference\n\nH6 model tiers — one model per tier (default: gemma-4-12B-it-abliterated):\n  --very-light Qwen3.5-9B-abliterated (Q5_K_M) — 8GB+ VRAM, smallest tier\n  --light      GLM-4-9B-0414 (Q6_K) — 12GB+ VRAM\n  (default)    gemma-4-12B-it-abliterated (Q6_K) — 16GB+ VRAM\n  --high       Qwen3.6-27B (Q4_K_M) — 24GB+ VRAM\n  --very-high  Kimi-Linear-48B (Q4_K_M) — 30GB+ VRAM", term_width = 0)]
+#[clap(name = "keryx-miner", version, about = "A Keryx high performance GPU miner with OPoI inference\n\nH6 model tiers — one model per tier (default: gemma-4-12B-it-abliterated):\n  --very-light Qwen3.5-9B-abliterated (Q5_K_M) — 8GB+ VRAM, smallest tier\n  --light      GLM-4-9B-0414 (Q6_K) — 12GB+ VRAM\n  (default)    gemma-4-12B-it-abliterated (Q6_K) — 16GB+ VRAM\n  --high       Qwen3.8-27B (Q4_K) — 24GB+ VRAM (Qwen3.6-27B before H14)\n  --very-high  Kimi-Linear-48B (Q4_K_M) — 30GB+ VRAM", term_width = 0)]
 pub struct Opt {
     // ── OPoI / Inference ─────────────────────────────────────────────────────
 
@@ -26,7 +26,7 @@ pub struct Opt {
 
     #[clap(
         long = "high",
-        help = "Model tier: Qwen3.6-27B (Q4_K_M) — 24GB+ VRAM",
+        help = "Model tier: Qwen3.8-27B (Q4_K) — 24GB+ VRAM (Qwen3.6-27B before H14)",
         help_heading = "OPoI / Inference",
         conflicts_with_all = &["very-light", "light", "very-high"]
     )]

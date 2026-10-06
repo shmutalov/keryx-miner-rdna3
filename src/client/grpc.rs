@@ -35,6 +35,21 @@ use tonic::{transport::Channel as TonicChannel, Streaming};
 static EXTRA_DATA: &str = concat!(env!("CARGO_PKG_VERSION"), "/", env!("PACKAGE_COMPILE_TIME"));
 type BlockHandle = JoinHandle<Result<(), PollSendError<KaspadMessage>>>;
 
+/// Private-inference state of a queued request; `None` for a plaintext request.
+#[derive(Clone, Copy)]
+enum PrivateRequest {
+    /// Opened with the escrow key; the answer is sealed under this root key.
+    Opened([u8; 32]),
+    /// Names this miner but cannot be opened; answered with a plaintext error body.
+    Unreadable,
+}
+
+/// Body of the answer to a private request this miner could not open (upstream's text).
+const UNREADABLE_PRIVATE_REQUEST_ANSWER: &str = "keryx: private request could not be opened by this responder";
+
+/// A queued AiRequest: (stable_id_hex16, request_hash, model_id, prompt, max_tokens, private state).
+type QueuedAiRequest = (String, [u8; 32], [u8; 32], String, usize, Option<PrivateRequest>);
+
 #[allow(dead_code)]
 pub struct KeryxdHandler {
     client: RpcClient<TonicChannel>,
@@ -46,10 +61,11 @@ pub struct KeryxdHandler {
     block_handle: BlockHandle,
 
     /// Queue of AiRequests waiting for inference.
-    /// Each entry: (stable_id_hex16, request_hash, model_id, prompt, max_tokens). `request_hash`
-    /// is the identity the AiResponse names: the AiRequest transaction id from H8, the payload
-    /// digest before it. Fed by both BlockAdded scans and block template scans.
-    ai_request_queue: VecDeque<(String, [u8; 32], [u8; 32], String, usize)>,
+    /// Each entry: (stable_id_hex16, request_hash, model_id, prompt, max_tokens, private state).
+    /// `request_hash` is the identity the AiResponse names: the AiRequest transaction id from H8,
+    /// the payload digest before it. A private request's prompt is the opened plaintext. Fed by
+    /// both BlockAdded scans and block template scans.
+    ai_request_queue: VecDeque<QueuedAiRequest>,
 
     /// Block hashes queued for boot-time escrow-state validation, drained in slices of
     /// VALIDATION_WINDOW so thousands of GetBlock requests never saturate the HTTP/2
@@ -59,13 +75,17 @@ pub struct KeryxdHandler {
     /// Stable IDs already queued or in-flight — used for deduplication.
     ai_seen_prefixes: std::collections::HashSet<String>,
 
+    /// Stable IDs of requests this escrow key has already answered on-chain; such a request is
+    /// never served again (the node rejects the duplicate, the inference would be wasted).
+    ai_answered_by_me: std::collections::HashSet<String>,
+
     /// Maps stable_id → (txid, inference_reward_sompi) for confirmed AiRequest TXs.
     /// Used by poll_inference to register the escrow outpoint after a successful AiResponse.
     ai_request_txids: std::collections::HashMap<String, (String, u64)>,
 
-    /// In-flight SLM inference task: (request_hash, result_receiver).
-    /// None result means inference failed (model not ready or empty output) — skip IPFS upload.
-    inference_rx: Option<([u8; 32], oneshot::Receiver<Option<String>>)>,
+    /// In-flight SLM inference task: (request_hash, private state, result_receiver).
+    /// None result means inference failed (model not ready or empty output) — no AiResponse.
+    inference_rx: Option<([u8; 32], Option<PrivateRequest>, oneshot::Receiver<Option<String>>)>,
 
     /// In-flight inference for a node-issued challenge.
     /// Tuple: (challenge_string, result_receiver) where challenge_string = "model_id_hex:nonce_hex".
@@ -204,6 +224,7 @@ impl KeryxdHandler {
             ai_request_queue: VecDeque::new(),
             validation_queue: VecDeque::new(),
             ai_seen_prefixes: std::collections::HashSet::new(),
+            ai_answered_by_me: std::collections::HashSet::new(),
             ai_request_txids: std::collections::HashMap::new(),
             inference_rx: None,
             challenge_inference_rx: None,
@@ -318,6 +339,19 @@ impl KeryxdHandler {
         // digest before. Decided from the daa of the block the request is observed in, so both
         // sides classify a request the same way across the activation.
         let txid_identity = block_daa >= keryx_miner::pom::reward_routing_activation_daa();
+        // Requests this escrow key already answered on-chain are never served again.
+        if let Some(mine) = self.escrow_watcher.as_ref().map(|w| w.pubkey_bytes()) {
+            for sid in Self::own_answered_request_ids(txs, &mine) {
+                if self.ai_answered_by_me.insert(sid.clone()) {
+                    log::debug!("OPoI: request id={} already answered by this miner on-chain", sid);
+                }
+                self.ai_request_queue.retain(|(queued, ..)| *queued != sid);
+            }
+            if self.ai_answered_by_me.len() > MAX_AI_SEEN_IDS {
+                self.ai_answered_by_me.clear();
+                self.ai_answered_by_me.shrink_to_fit();
+            }
+        }
         // Hard gate: if no models are ready, refuse to accept any AiRequest.
         // Prevents miners with missing/truncated model files from ever queuing inference work.
         let ready_ids = keryx_miner::slm::loaded_model_ids();
@@ -330,33 +364,35 @@ impl KeryxdHandler {
             txs.len(),
             txs.iter().map(|t| t.subnetwork_id.as_str()).collect::<Vec<_>>()
         );
+        let escrow_secret = self.escrow_watcher.as_ref().map(|w| w.secret_bytes());
         for tx in txs {
-            // (raw, model_id, prompt, max_tokens, inference_reward)
-            let extracted: Option<(Vec<u8>, [u8; 32], String, usize, u64)> =
+            // (raw, model_id, prompt, max_tokens, inference_reward, private state)
+            let extracted: Option<(Vec<u8>, [u8; 32], String, usize, u64, Option<PrivateRequest>)> =
                 if tx.subnetwork_id == keryx_inference::SUBNETWORK_ID_AI_REQUEST_HEX {
-                    // Binary AiRequestPayload (dedicated AI subnetwork).
+                    // Binary AiRequestPayload (dedicated AI subnetwork). A private one (every request
+                    // from H14) is sealed to its tier cohort: opened here with the escrow key.
                     hex::decode(&tx.payload).ok().and_then(|raw| {
-                        keryx_inference::AiRequestPayload::deserialize(&raw).map(|req| {
-                            let model_id = req.model_id;
-                            let prompt = String::from_utf8_lossy(&req.prompt).into_owned();
-                            let max_tokens = req.max_tokens as usize;
-                            let inference_reward = req.inference_reward;
-                            (raw, model_id, prompt, max_tokens, inference_reward)
-                        })
+                        let req = keryx_inference::AiRequestPayload::deserialize(&raw)?;
+                        let (prompt, private) = if req.is_private() {
+                            Self::open_private_request(&req, escrow_secret.as_ref())?
+                        } else {
+                            (String::from_utf8_lossy(&req.prompt).into_owned(), None)
+                        };
+                        Some((raw, req.model_id, prompt, req.max_tokens as usize, req.inference_reward, private))
                     })
                 } else if !tx.inputs.is_empty() {
                     // KRX:AI:1: JSON format — model routed by "m" field, skipped if not loaded.
                     hex::decode(&tx.payload).ok().and_then(|raw| {
                         Self::parse_krx_ai_payload(&raw).and_then(|(model_name, prompt, max_tokens)| {
                             let model_id = keryx_miner::models::find(&model_name)?.model_id;
-                            Some((raw, model_id, prompt, max_tokens, 0u64))
+                            Some((raw, model_id, prompt, max_tokens, 0u64, None))
                         })
                     })
                 } else {
                     None // coinbase — skip
                 };
 
-            if let Some((raw, model_id, prompt, max_tokens, inference_reward)) = extracted {
+            if let Some((raw, model_id, prompt, max_tokens, inference_reward, private)) = extracted {
                 if !ready_ids.contains(&model_id) {
                     log::debug!("OPoI: skipping AiRequest — model not supported or files not ready");
                     continue;
@@ -379,17 +415,21 @@ impl KeryxdHandler {
                     blake2b_simd::blake2b(&raw).as_bytes()[..32].try_into().unwrap()
                 };
                 let stable_id = hex::encode(&request_hash[..8]);
+                if self.ai_answered_by_me.contains(&stable_id) {
+                    log::debug!("OPoI: skipping AiRequest id={} — already answered by this miner", stable_id);
+                    continue;
+                }
                 if !self.ai_seen_prefixes.contains(&stable_id) {
-                    info!("OPoI: queued AiRequest id={}", stable_id);
+                    info!("OPoI: queued AiRequest id={}{}", stable_id, if private.is_some() { " (private)" } else { "" });
                     self.ai_seen_prefixes.insert(stable_id.clone());
-                    self.ai_request_queue.push_back((stable_id.clone(), request_hash, model_id, prompt, max_tokens));
+                    self.ai_request_queue.push_back((stable_id.clone(), request_hash, model_id, prompt, max_tokens, private));
                     while self.ai_request_queue.len() > MAX_AI_QUEUE_SIZE {
                         self.ai_request_queue.pop_front();
                     }
                     while self.ai_seen_prefixes.len() > MAX_AI_SEEN_IDS {
                         self.ai_seen_prefixes.clear();
                         self.ai_seen_prefixes.shrink_to_fit();
-                        for (sid, _, _, _, _) in &self.ai_request_queue {
+                        for (sid, ..) in &self.ai_request_queue {
                             self.ai_seen_prefixes.insert(sid.clone());
                         }
                     }
@@ -404,6 +444,47 @@ impl KeryxdHandler {
                         self.ai_request_txids.insert(stable_id, (txid, inference_reward));
                     }
                 }
+            }
+        }
+    }
+
+    /// Stable IDs of the requests answered in `txs` by the responder `mine`.
+    fn own_answered_request_ids(txs: &[crate::proto::RpcTransaction], mine: &[u8; 32]) -> Vec<String> {
+        txs.iter()
+            .filter(|tx| tx.subnetwork_id == keryx_inference::SUBNETWORK_ID_AI_RESPONSE_HEX)
+            .filter_map(|tx| hex::decode(&tx.payload).ok())
+            .filter_map(|raw| keryx_inference::AiResponsePayload::deserialize(&raw))
+            .filter(|resp| resp.responder.as_ref().is_some_and(|r| r.escrow_pubkey == *mine))
+            .map(|resp| hex::encode(&resp.request_hash[..8]))
+            .collect()
+    }
+
+    /// Opens a private request with the escrow key. `None` when the request is not for this
+    /// miner (no escrow key, or not among the recipients); an addressed request that cannot be
+    /// opened is still queued, to be answered with a plaintext error body.
+    fn open_private_request(
+        req: &keryx_inference::AiRequestPayload,
+        escrow_secret: Option<&[u8; 32]>,
+    ) -> Option<(String, Option<PrivateRequest>)> {
+        let Some(secret) = escrow_secret else {
+            log::debug!("OPoI: skipping private AiRequest — no escrow key configured");
+            return None;
+        };
+        match keryx_inference::open_request(req, secret) {
+            Ok(opened) => match decode_private_prompt(&opened.prompt) {
+                Some(prompt) => Some((prompt, Some(PrivateRequest::Opened(opened.root_key)))),
+                None => {
+                    warn!("OPoI: private AiRequest opened but its compressed prompt is invalid — answering with an error body");
+                    Some((String::new(), Some(PrivateRequest::Unreadable)))
+                }
+            },
+            Err(keryx_inference::PrivateError::NotARecipient) => {
+                log::debug!("OPoI: skipping private AiRequest — this escrow key is not a recipient");
+                None
+            }
+            Err(e) => {
+                warn!("OPoI: private AiRequest names this miner but cannot be opened ({}) — answering with an error body", e);
+                Some((String::new(), Some(PrivateRequest::Unreadable)))
             }
         }
     }
@@ -480,14 +561,25 @@ impl KeryxdHandler {
         if self.inference_rx.is_some() {
             return;
         }
-        if let Some((stable_id, request_hash, model_id, prompt, max_tokens)) = self.ai_request_queue.pop_front() {
+        while self.ai_request_queue.front().is_some_and(|(sid, ..)| self.ai_answered_by_me.contains(sid)) {
+            if let Some((sid, ..)) = self.ai_request_queue.pop_front() {
+                info!("OPoI: request id={} already answered by this miner — skipped", sid);
+            }
+        }
+        if let Some((stable_id, request_hash, model_id, prompt, max_tokens, private)) = self.ai_request_queue.pop_front() {
+            let (tx_done, rx_done) = oneshot::channel::<Option<String>>();
+            if matches!(private, Some(PrivateRequest::Unreadable)) {
+                // No inference to run: the answer is the fixed error text.
+                let _ = tx_done.send(Some(UNREADABLE_PRIVATE_REQUEST_ANSWER.to_string()));
+                self.inference_rx = Some((request_hash, private, rx_done));
+                return;
+            }
             // Second guard: re-check readiness at execution time (files could have been deleted).
             if !keryx_miner::slm::is_model_ready(&model_id) {
                 log::error!("OPoI: model became unavailable after queuing id={} — discarding request", stable_id);
                 return;
             }
             info!("OPoI: spawning SLM inference (max_tokens={})", max_tokens);
-            let (tx_done, rx_done) = oneshot::channel::<Option<String>>();
             tokio::task::spawn_blocking(move || {
                 let result = keryx_miner::slm::load_and_run_inference(&model_id, &prompt, max_tokens);
                 if result.is_none() {
@@ -495,19 +587,20 @@ impl KeryxdHandler {
                 }
                 let _ = tx_done.send(result);
             });
-            self.inference_rx = Some((request_hash, rx_done));
+            self.inference_rx = Some((request_hash, private, rx_done));
         }
     }
 
-    /// Polls the in-flight inference task. When complete, uploads the result to
-    /// IPFS and submits a zero-input/zero-output AiResponse transaction.
+    /// Polls the in-flight inference task. When complete, submits a zero-input/zero-output
+    /// AiResponse: a private answer is sealed to the requester and, from the private-inference
+    /// gate on, travels inline; anything else is uploaded to IPFS first and named by its CID.
     /// Returns `true` if inference just finished (regardless of tx success).
     async fn poll_inference(&mut self) -> bool {
-        let Some((request_hash, mut rx)) = self.inference_rx.take() else {
+        let Some((request_hash, private, mut rx)) = self.inference_rx.take() else {
             return false;
         };
         let Ok(result_opt) = rx.try_recv() else {
-            self.inference_rx = Some((request_hash, rx));
+            self.inference_rx = Some((request_hash, private, rx));
             return false;
         };
         let Some(result) = result_opt else {
@@ -519,14 +612,45 @@ impl KeryxdHandler {
 
         info!("OPoI: inference complete, request_hash={}", hex::encode(&request_hash[..8]));
 
+        // A private answer is sealed to the requester; the plaintext is never published. From
+        // the gate on it travels inline and the CID field carries its multihash; before the
+        // gate the sealed body is pinned on IPFS like a plaintext answer.
+        let publish: Vec<u8> = match private {
+            None => result.clone().into_bytes(),
+            Some(p) => {
+                let body = match p {
+                    PrivateRequest::Opened(root_key) => {
+                        let Some(pubkey) = self.escrow_watcher.as_ref().map(|w| w.pubkey_bytes()) else {
+                            warn!("OPoI: escrow key gone — private AiResponse skipped");
+                            return true;
+                        };
+                        keryx_inference::seal_response(&root_key, &request_hash, &pubkey, result.as_bytes())
+                    }
+                    PrivateRequest::Unreadable => result.clone().into_bytes(),
+                };
+                if self.last_known_daa >= keryx_miner::pom::private_inference_activation_daa() {
+                    let cid = crate::ipfs::sha256_multihash(&body);
+                    self.submit_ai_response(request_hash, &result, cid, Some(body)).await;
+                    return true;
+                }
+                body
+            }
+        };
+
         let ipfs_url = self.ipfs_url.clone();
-        let result_clone = result.clone();
-        let cid = match tokio::task::spawn_blocking(move || crate::ipfs::upload(&result_clone, &ipfs_url)).await {
+        let cid = match tokio::task::spawn_blocking(move || crate::ipfs::upload_bytes(&publish, &ipfs_url)).await {
             Ok(Ok(cid)) => cid,
             Ok(Err(e)) => { warn!("OPoI: IPFS upload failed: {} — AiResponse tx skipped", e); return true; }
             Err(e) => { warn!("OPoI: IPFS spawn_blocking failed: {} — AiResponse tx skipped", e); return true; }
         };
+        self.submit_ai_response(request_hash, &result, cid, None).await;
+        true
+    }
 
+    /// Builds and submits the zero-input/zero-output AiResponse for `cid`, then registers the
+    /// request's inference escrow for auto-claim. A `private_body` rides inline under the
+    /// responder signature (V2 only).
+    async fn submit_ai_response(&mut self, request_hash: [u8; 32], result: &str, cid: [u8; 34], private_body: Option<Vec<u8>>) {
         let challenge_window_end = self.last_known_daa + 1000;
         let response_length = result.split_whitespace().count() as u32;
         // H6 service-bond era: sign the response with the escrow key (payload V2) so it counts
@@ -535,9 +659,16 @@ impl KeryxdHandler {
         let v2 = self.last_known_daa >= keryx_miner::pom::pom_v3_activation_daa();
         let resp = match (&self.escrow_watcher, v2) {
             (Some(w), true) => {
-                let unsigned = keryx_inference::AiResponsePayload::new(request_hash, challenge_window_end, cid, response_length);
+                let mut unsigned = keryx_inference::AiResponsePayload::new(request_hash, challenge_window_end, cid, response_length);
+                if let Some(body) = &private_body {
+                    unsigned = unsigned.with_private_body(body.clone());
+                }
                 let responder = w.sign_responder(&unsigned.signed_bytes());
-                keryx_inference::AiResponsePayload::new_v2(request_hash, challenge_window_end, cid, response_length, responder)
+                let resp = keryx_inference::AiResponsePayload::new_v2(request_hash, challenge_window_end, cid, response_length, responder);
+                match private_body {
+                    Some(body) => resp.with_private_body(body),
+                    None => resp,
+                }
             }
             (None, true) => {
                 warn!("OPoI: no escrow key configured — submitting an unsigned (v1) response; it will NOT count for the service bond");
@@ -546,10 +677,11 @@ impl KeryxdHandler {
             (_, false) => keryx_inference::AiResponsePayload::new(request_hash, challenge_window_end, cid, response_length),
         };
         info!(
-            "OPoI: uploading response CID={}, challenge_window_end={}{}",
+            "OPoI: uploading response CID={}, challenge_window_end={}{}{}",
             resp.cid_v0(),
             challenge_window_end,
-            if resp.responder.is_some() { " (signed, V2)" } else { "" }
+            if resp.responder.is_some() { " (signed, V2)" } else { "" },
+            if resp.private_body.is_some() { " (private body inline)" } else { "" }
         );
 
         let rpc_tx = crate::proto::RpcTransaction {
@@ -574,8 +706,6 @@ impl KeryxdHandler {
                 w.track_inference_escrow(txid, self.last_known_daa, inference_reward);
             }
         }
-
-        true
     }
 
     async fn handle_message(&mut self, msg: Payload, miner: &mut MinerManager) -> Result<(), Error> {
@@ -623,6 +753,7 @@ impl KeryxdHandler {
                 {
                     if daa > self.last_known_daa {
                         self.last_known_daa = daa;
+                        keryx_miner::slm::note_chain_daa(daa);
                     }
                     // H4-only binary: the served lineup is static (set once at startup) —
                     // no era crossing left to hot-swap.
@@ -827,5 +958,117 @@ impl KeryxdHandler {
 impl Drop for KeryxdHandler {
     fn drop(&mut self) {
         self.block_handle.abort();
+    }
+}
+
+/// Leading bytes of a private prompt compressed with raw DEFLATE.
+const COMPRESSED_PROMPT_MAGIC: [u8; 4] = [0x00, b'K', b'Z', 0x01];
+const MAX_DECOMPRESSED_PROMPT_LEN: u64 = 1 << 20;
+
+/// Plaintext of an opened private prompt: inflated when it carries the compression magic.
+/// `None` for a compressed prompt that is corrupt or inflates past the cap.
+fn decode_private_prompt(bytes: &[u8]) -> Option<String> {
+    use std::io::Read;
+    let Some(deflated) = bytes.strip_prefix(&COMPRESSED_PROMPT_MAGIC[..]) else {
+        return Some(String::from_utf8_lossy(bytes).into_owned());
+    };
+    let mut inflated = Vec::new();
+    flate2::read::DeflateDecoder::new(deflated).take(MAX_DECOMPRESSED_PROMPT_LEN + 1).read_to_end(&mut inflated).ok()?;
+    if inflated.len() as u64 > MAX_DECOMPRESSED_PROMPT_LEN {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&inflated).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PrivateRequest;
+    use keryx_inference::{escrow_pubkey_of, open_response, seal_request, AiRequestPayload};
+
+    /// Only the responses signed by this miner's escrow key mark a request as already answered.
+    #[test]
+    fn own_answered_request_ids_keeps_only_this_responder() {
+        use keryx_inference::{AiResponder, AiResponsePayload};
+        let mine = [0xAAu8; 32];
+        let other = [0xBBu8; 32];
+        let response = |request_hash: [u8; 32], key: [u8; 32]| crate::proto::RpcTransaction {
+            subnetwork_id: keryx_inference::SUBNETWORK_ID_AI_RESPONSE_HEX.to_string(),
+            payload: hex::encode(
+                AiResponsePayload::new_v2(request_hash, 10, [0x12u8; 34], 3, AiResponder { escrow_pubkey: key, signature: [0u8; 64] })
+                    .serialize(),
+            ),
+            ..Default::default()
+        };
+        let txs = vec![response([1u8; 32], mine), response([2u8; 32], other), response([3u8; 32], mine)];
+        let ids = super::KeryxdHandler::own_answered_request_ids(&txs, &mine);
+        assert_eq!(ids, vec![hex::encode([1u8; 8]), hex::encode([3u8; 8])]);
+        assert!(super::KeryxdHandler::own_answered_request_ids(&txs, &[0xCCu8; 32]).is_empty());
+    }
+
+    /// A private request is opened for a named recipient, skipped for anyone else, and queued as
+    /// unreadable when addressed to this key but tampered with.
+    #[test]
+    fn open_private_request_classifies_recipients() {
+        let mine = [0x11u8; 32];
+        let other = [0x22u8; 32];
+        let recipients = [escrow_pubkey_of(&mine).unwrap()];
+        let (req, _secret) = seal_request([5u8; 32], 64, 1_000, 2_000, b"sealed prompt", &recipients).unwrap();
+
+        assert!(super::KeryxdHandler::open_private_request(&req, None).is_none());
+        assert!(super::KeryxdHandler::open_private_request(&req, Some(&other)).is_none());
+        let (prompt, private) = super::KeryxdHandler::open_private_request(&req, Some(&mine)).unwrap();
+        assert_eq!(prompt, "sealed prompt");
+        assert!(matches!(private, Some(PrivateRequest::Opened(_))));
+
+        // A flipped ciphertext byte still names this key: answered, with the error body.
+        let mut tampered = req.serialize();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        let tampered = AiRequestPayload::deserialize(&tampered).unwrap();
+        let (prompt, private) = super::KeryxdHandler::open_private_request(&tampered, Some(&mine)).unwrap();
+        assert!(prompt.is_empty());
+        assert!(matches!(private, Some(PrivateRequest::Unreadable)));
+    }
+
+    /// The sealed answer opens with the requester's root key and nobody else's, and its inline CID
+    /// is the body's sha2-256 multihash.
+    #[test]
+    fn sealed_answer_round_trips_to_the_requester() {
+        let mine = [0x11u8; 32];
+        let pubkey = escrow_pubkey_of(&mine).unwrap();
+        let (req, secret) = seal_request([5u8; 32], 64, 1_000, 2_000, b"q", &[pubkey]).unwrap();
+        let (_, private) = super::KeryxdHandler::open_private_request(&req, Some(&mine)).unwrap();
+        let Some(PrivateRequest::Opened(root_key)) = private else { panic!("not opened") };
+        let request_hash = [9u8; 32];
+        let body = keryx_inference::seal_response(&root_key, &request_hash, &pubkey, b"answer");
+        assert_eq!(open_response(&secret.root_key, &request_hash, &pubkey, &body).unwrap(), b"answer");
+        assert!(open_response(&[0u8; 32], &request_hash, &pubkey, &body).is_err());
+        let cid = crate::ipfs::sha256_multihash(&body);
+        assert_eq!(&cid[..2], &[0x12, 0x20]);
+    }
+
+    #[test]
+    fn private_prompt_inflates_when_marked() {
+        use super::{decode_private_prompt, COMPRESSED_PROMPT_MAGIC, MAX_DECOMPRESSED_PROMPT_LEN};
+        use std::io::Write;
+        let deflate = |data: &[u8]| {
+            let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
+            enc.write_all(data).unwrap();
+            let mut out = COMPRESSED_PROMPT_MAGIC.to_vec();
+            out.extend(enc.finish().unwrap());
+            out
+        };
+
+        assert_eq!(decode_private_prompt("Bonjour, ça va ?".as_bytes()).as_deref(), Some("Bonjour, ça va ?"));
+        let text = "Entrée 41 — le code est ORCHIDÉE-7319. ".repeat(500);
+        let packed = deflate(text.as_bytes());
+        assert!(packed.len() < text.len() / 10);
+        assert_eq!(decode_private_prompt(&packed).as_deref(), Some(text.as_str()));
+
+        let mut corrupt = COMPRESSED_PROMPT_MAGIC.to_vec();
+        corrupt.extend([0xFF; 32]);
+        assert_eq!(decode_private_prompt(&corrupt), None);
+        let bomb = deflate(&vec![b'a'; MAX_DECOMPRESSED_PROMPT_LEN as usize + 1]);
+        assert_eq!(decode_private_prompt(&bomb), None);
     }
 }

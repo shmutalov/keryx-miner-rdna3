@@ -377,9 +377,10 @@ impl MinerManager {
                             let time = u64::from_le_bytes(s.pow_hash_header[32..40].try_into().unwrap());
                             (pph, time, s.target.to_le_bytes(), s.daa_score)
                         };
-                        // An inference may have evicted the mining model (inference has priority).
-                        // Rebuild the walk (reloads the model resident) before mining resumes.
-                        if !keryx_miner::pom_gpu::is_installed(pom_device) {
+                        // An inference may have evicted the mining model (inference has priority), or
+                        // an era gate changed the model this tier mines (tier 3 at H14). Rebuild the
+                        // walk (reloads the model resident) before mining resumes.
+                        if !keryx_miner::pom_gpu::is_installed(pom_device, daa) {
                             // A resident-model reload is a multi-second blocking GPU op with no
                             // cooperative Close check inside it. If a shutdown/new job is already
                             // pending, act on it now instead of starting a reload that would
@@ -391,7 +392,12 @@ impl MinerManager {
                                     None => { state = None; continue; }
                                 }
                             }
-                            keryx_miner::pom_gpu::ensure_installed(daa, pom_device);
+                            if !keryx_miner::pom_gpu::ensure_installed(daa, pom_device) {
+                                // Nothing to walk yet (model still downloading, or no model for
+                                // this tier in the block's era): back off instead of spinning.
+                                std::thread::sleep(Duration::from_secs(1));
+                                continue;
+                            }
                         }
                         // Era dispatch on THIS block's own DAA — the same gates
                         // `State::generate_block_if_pom` uses when it re-walks the winner on the host.
@@ -423,8 +429,7 @@ impl MinerManager {
                             // index reindexing at H2 is applied at the exact boundary — else the node
                             // rejects the proof (BadWeightPath).
                             let built = state.as_ref().and_then(|s| {
-                                let (idx, _) = keryx_miner::pom::active_index()?;
-                                let tier = keryx_miner::pom_gpu::current_tier(s.daa_score)?;
+                                let (idx, tier) = keryx_miner::pom_gpu::mining_index(s.daa_score)?;
                                 s.generate_block_if_pom(nonce, idx, tier)
                             });
                             if let Some(block_seed) = built {
@@ -585,10 +590,8 @@ impl MinerManager {
                     // recomputed from this block's DAA (per-block, not the frozen build-time tier) so
                     // the H2 reindex is applied at the boundary — else the node rejects (BadWeightPath).
                     let found = if state_ref.daa_score >= keryx_miner::pom::pom_activation_daa() {
-                        keryx_miner::pom::active_index().and_then(|(idx, _)| {
-                            let tier = keryx_miner::pom_gpu::current_tier(state_ref.daa_score)?;
-                            state_ref.generate_block_if_pom(nonce.0, idx, tier)
-                        })
+                        keryx_miner::pom_gpu::mining_index(state_ref.daa_score)
+                            .and_then(|(idx, tier)| state_ref.generate_block_if_pom(nonce.0, idx, tier))
                     } else {
                         state_ref.generate_block_if_pow(nonce.0)
                     };
