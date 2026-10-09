@@ -222,12 +222,12 @@ impl Client for StratumHandler {
                     MiningSubscribe::MiningSubscribeOptions((
                         // suprnova's bridge version-gates PoM shares by the reported keryx-miner-supr
                         // version, raising the floor at every hardfork (H4 >= 0.7.0, H5.2 >= 0.9.2,
-                        // H10 >= 0.12.0 — the mandatory one-way-seed release). This build mines the
-                        // live consensus: PoM v4 (D=32 re-walk) with the H10 keccak seed, the H6
-                        // header fields, and stratum-v3 notifies (supr >= 0.13.0) — so advertise the
-                        // current supr release. Bump this single string if the pool raises the floor
-                        // again. (Real build: keryx-miner/CARGO_PKG_VERSION.)
-                        "keryx-miner-supr/0.13.3.0".to_string(),
+                        // H10 >= 0.12.0 — the mandatory one-way-seed release, H14 >= 0.14.0). This
+                        // build mines the live consensus: PoM v4 (D=32 re-walk) with the H14 seed, the
+                        // H6 header fields, and stratum-v3 notifies (supr >= 0.13.0) — so advertise
+                        // the current supr release. Bump this single string if the pool raises the
+                        // floor again. (Real build: keryx-miner/CARGO_PKG_VERSION.)
+                        "keryx-miner-supr/0.14.1.0".to_string(),
                         KERYX_STRATUM_DAA_CAPABILITY.into(),
                     )),
                 )),
