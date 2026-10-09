@@ -546,19 +546,23 @@ async fn run() -> Result<(), Error> {
     } else {
         keryx_miner::models::Tier::Default
     };
-    let era_models = keryx_miner::models::pom_models_all_eras(tier, None);
+    // H14 is live on mainnet (DAA 121,985,000) and testnet (6,000): no pre-H14 block can be mined
+    // any more, so stage only the current era's model. Without a known tip every scheduled era would
+    // be staged, and a fresh --high install would also fetch the retired Qwen3.6-27B (16.5 GB) —
+    // enough to fail the prefetch on a small disk and stop the miner.
+    let era_models = keryx_miner::models::pom_models_all_eras(tier, Some(keryx_miner::models::staging_daa()));
     info!(
         "Model tier: mines {} under PoM.",
-        era_models.iter().map(|s| s.dir_name).collect::<Vec<_>>().join(", then (from H14) ")
+        era_models.iter().map(|s| s.dir_name).collect::<Vec<_>>().join(", then ")
     );
 
     // Warn if GPU 0's VRAM is too small for the selected model tier (Vulkan-queried).
     check_gpu_vram_for_tier(tier);
 
-    // Stage, announce and prefetch the tier's model for every era the chain can still reach (tier 3
-    // stages Qwen3.6-27B and Qwen3.8-27B until H14, so the crossing swaps without a mid-run
-    // download), filtered by hardware capability. Below H6 this binary refuses to mine
-    // (`pom_tier_index` returns None), so no older lineup is ever staged.
+    // Stage, announce and prefetch the tier's model for every era still reachable (a future gate's
+    // model is staged alongside, so the crossing swaps without a mid-run download), filtered by
+    // hardware capability. Below H6 this binary refuses to mine (`pom_tier_index` returns None), so
+    // no older lineup is ever staged.
     let specs_v2 = filter_specs_by_vram(Box::leak(era_models.into_boxed_slice()));
     // PoM mines the tier's era model under possession: configured only when that model survived the
     // capability gate. The index is built after prefetch (below).

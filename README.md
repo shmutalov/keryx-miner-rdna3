@@ -82,8 +82,8 @@ on first run (same as upstream).
 > Under PoM, **1 GPU = 1 tier**: each tier proves possession of and serves exactly the single
 > model above — a PoM GPU is bound to the one model whose weights are resident in VRAM. The
 > miner checks the GGUF it indexes against the node-pinned `(R_T, N)` anchor of its tier and
-> refuses to mine on a mismatch. `--high` downloads both tier-3 models until the H14 gate and swaps
-> the resident model on the first block past it.
+> refuses to mine on a mismatch. With H14 live, `--high` stages only Qwen3.8-27B; the retired
+> `models/Qwen3.6-27B` folder can be deleted.
 
 ### Consensus this build mines
 
@@ -208,8 +208,8 @@ automatically at every start.)
   card can actually serve (a 7900 XT comfortably runs `--light` and the default tier).
 - ⚠️ **Pool version gate:** some pools (suprnova) reject PoM shares from miners that don't
   advertise a recent enough `keryx-miner-supr` version in `mining.subscribe` (the floor has moved
-  with each hardfork — `0.7.0+` at H4, `0.9.2+` at H5.2, `0.12.0+` at H10); this fork advertises a
-  current identity (`0.13.3`) and subscribes as `keryx-stratum-v3`, so notifies carry the block bits
+  with each hardfork — `0.7.0+` at H4, `0.9.2+` at H5.2, `0.12.0+` at H10, `0.14.0+` at H14); this
+  fork advertises a current identity (`0.14.1`) and subscribes as `keryx-stratum-v3`, so notifies carry the block bits
   and a share that solves the block is never dropped under a high pool difficulty. Single string in
   `client/stratum.rs`.
 - ⚠️ **Known benign:** an occasional panic in `MinerManager`'s shutdown/reconnect path (a worker
