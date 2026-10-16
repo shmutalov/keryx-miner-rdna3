@@ -49,6 +49,13 @@ pub struct Opt {
     pub ipfs_url: String,
 
     #[clap(
+        long = "log-ai",
+        help = "Log the prompt and answer of every inference, private requests included (also KERYX_LOG_AI=1)",
+        help_heading = "OPoI / Inference"
+    )]
+    pub log_ai: bool,
+
+    #[clap(
         long = "models-dir",
         help = "Directory where model files are stored/downloaded (overrides default <exe_dir>/models; also settable via KERYX_MODELS_DIR)",
         help_heading = "OPoI / Inference"

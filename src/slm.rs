@@ -462,9 +462,32 @@ pub fn ensure_loaded(model_id: &[u8; 32]) -> bool {
     }
 }
 
-/// Load the requested model on demand (relaunching llama-server if a different model is cached),
-/// then run inference over HTTP. Blocking — call from `spawn_blocking`.
-pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize) -> Option<String> {
+/// Whether every inference logs its prompt and answer: `KERYX_LOG_AI` set to anything but empty or
+/// `0` (`--log-ai` sets it). Private requests are logged as opened, in plaintext — hence off by
+/// default.
+pub fn ai_log_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("KERYX_LOG_AI").map(|v| !v.is_empty() && v != "0").unwrap_or(false))
+}
+
+/// Load the requested model on demand (swapping out a different resident model), then run
+/// inference in-process. Blocking — call from `spawn_blocking`. `request` names the request in the
+/// `--log-ai` log lines; prompt and answer are Debug-escaped there, so each stays one line and a
+/// prompt cannot forge log lines.
+pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize, request: &str) -> Option<String> {
+    if !ai_log_enabled() {
+        return run_inference(model_id, prompt, max_tokens);
+    }
+    log::info!("AI [{request}] prompt (max_tokens={max_tokens}): {prompt:?}");
+    let answer = run_inference(model_id, prompt, max_tokens);
+    match &answer {
+        Some(text) => log::info!("AI [{request}] answer: {text:?}"),
+        None => log::info!("AI [{request}] no answer"),
+    }
+    answer
+}
+
+fn run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize) -> Option<String> {
     let specs = *SUPPORTED_SPECS.read().unwrap();
     let spec = specs.iter().find(|s| &s.model_id == model_id)?;
 

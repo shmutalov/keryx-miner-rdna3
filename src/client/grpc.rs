@@ -580,8 +580,12 @@ impl KeryxdHandler {
                 return;
             }
             info!("OPoI: spawning SLM inference (max_tokens={})", max_tokens);
+            let label = match private {
+                Some(PrivateRequest::Opened(_)) => format!("solo request {stable_id}, private"),
+                _ => format!("solo request {stable_id}"),
+            };
             tokio::task::spawn_blocking(move || {
-                let result = keryx_miner::slm::load_and_run_inference(&model_id, &prompt, max_tokens);
+                let result = keryx_miner::slm::load_and_run_inference(&model_id, &prompt, max_tokens, &label);
                 if result.is_none() {
                     log::warn!("OPoI: inference returned no result for id={} — AiResponse will be skipped", stable_id);
                 }
@@ -781,8 +785,9 @@ impl KeryxdHandler {
                                 }
                                 let prompt = format!("Keryx inference challenge {}: briefly describe what you are.", nonce_hex);
                                 let (tx_done, rx_done) = oneshot::channel::<Option<String>>();
+                                let label = format!("solo challenge {:.8}", nonce_hex);
                                 tokio::task::spawn_blocking(move || {
-                                    let result = keryx_miner::slm::load_and_run_inference(&model_id, &prompt, 64);
+                                    let result = keryx_miner::slm::load_and_run_inference(&model_id, &prompt, 64, &label);
                                     let _ = tx_done.send(result);
                                 });
                                 self.challenge_inference_rx = Some((challenge, rx_done));

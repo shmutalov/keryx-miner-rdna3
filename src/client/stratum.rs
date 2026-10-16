@@ -769,8 +769,9 @@ impl StratumHandler {
         let pending = self.ai_response_pending.clone();
         let last_id = self.last_stratum_id.clone();
         task::spawn_blocking(move || {
+            let label = format!("pool ai_request {:.16}", request.task_id);
             let result =
-                keryx_miner::slm::load_and_run_inference(&request.model_id, &request.prompt, request.max_tokens)
+                keryx_miner::slm::load_and_run_inference(&request.model_id, &request.prompt, request.max_tokens, &label)
                     .unwrap_or_default();
             let id = last_id.fetch_add(1, Ordering::SeqCst);
             match request.response(id, worker, &result) {
@@ -852,8 +853,9 @@ impl StratumHandler {
         info!("chat[{}]: inference (max_tokens={}) — mining paused", req.req_id, req.max_tokens);
         task::spawn_blocking(move || {
             let started = std::time::Instant::now();
-            let text =
-                keryx_miner::slm::load_and_run_inference(&model_id, &req.prompt, req.max_tokens).unwrap_or_default();
+            let label = format!("pool chat {}", req.req_id);
+            let text = keryx_miner::slm::load_and_run_inference(&model_id, &req.prompt, req.max_tokens, &label)
+                .unwrap_or_default();
             let ms = started.elapsed().as_millis() as u32;
             // The GPU is done: resume mining before the send, which blocks while the pool
             // connection is backed up (a held pause once kept mining stopped ~1 min past a 0.65 s
@@ -961,7 +963,8 @@ impl StratumHandler {
         let challenge_flag = Arc::clone(&self.challenge_in_flight);
 
         tokio::task::spawn_blocking(move || {
-            let result = keryx_miner::slm::load_and_run_inference(&model_id, &prompt, CHALLENGE_MAX_TOKENS);
+            let label = format!("pool challenge {:.8}", nonce_hex);
+            let result = keryx_miner::slm::load_and_run_inference(&model_id, &prompt, CHALLENGE_MAX_TOKENS, &label);
             let text = result.unwrap_or_default();
             // Clear both flags — PoW resumes on the next mining.notify from the bridge.
             miner_flag.store(false, Ordering::SeqCst);
@@ -1140,7 +1143,7 @@ fn do_inference_and_upload(
     stable_id: &str,
 ) -> Option<String> {
     info!("OPoI [{}]: starting SLM inference (max_tokens={})", stable_id, max_tokens);
-    let text = keryx_miner::slm::load_and_run_inference(model_id, prompt, max_tokens)?;
+    let text = keryx_miner::slm::load_and_run_inference(model_id, prompt, max_tokens, &format!("pool task {stable_id}"))?;
     if text.is_empty() {
         warn!("OPoI [{}]: inference returned empty text — skipping IPFS upload", stable_id);
         return None;
