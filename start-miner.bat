@@ -32,9 +32,12 @@ REM     mined. Keep 0 to mine. ---
 set "KERYX_POW_ONLY=0"
 
 REM set RUST_LOG=debug
+set RUST_LOG=info,llama.cpp=error
 REM set RUST_BACKTRACE=1
-REM Log every AI prompt and answer, private requests included (same as --log-ai).
-REM set "KERYX_LOG_AI=1"
+REM Append every AI prompt and answer, private requests included, to
+REM target\release\ai-requests.log (same as --log-ai). Put a file path instead of 1
+REM to log elsewhere.
+set "KERYX_LOG_AI=1"
 REM --high (Qwen3.8-27B) is gated at 24 GB; the 20 GB 7900 XT needs the gate off to run it.
 set KERYX_SKIP_VRAM_GATE=1
 REM Cap each inference request at 32K tokens. The model allows 64K, which fits the
@@ -72,7 +75,7 @@ echo.
 
 :run
 call :sync_build
-"%MINER%" --mining-address "%MINING_ADDRESS%" --keryxd-address "%POOL%" --worker "%WORKER%" --high
+"%MINER%" --mining-address "%MINING_ADDRESS%" --keryxd-address "%POOL%" --worker "%WORKER%" --very-light
 
 echo.
 echo Miner exited (code %errorlevel%). Restarting in 5s -- close this window to stop.
