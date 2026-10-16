@@ -9,7 +9,7 @@
 //!      POM_BENCH_SEGMENTS (default 300)
 
 use keryx_vulkan::pom_walk::PomWalkGpu;
-use keryx_vulkan::pom_walk_v4::{PomWalkV4, V4Job};
+use keryx_vulkan::pom_walk_v4::{PomWalkV4, V4Job, V4Kernel};
 use keryx_vulkan::Vk;
 use std::time::Instant;
 
@@ -37,12 +37,21 @@ fn time(label: &str, iters: u64, batch: u32, mut run: impl FnMut(u64) -> Option<
     run(0); // warm-up (pipeline + caches)
     let mut rates = Vec::new();
     for it in 0..iters {
-        let t = Instant::now();
-        let found = run((it + 1) * batch as u64);
-        let dt = t.elapsed().as_secs_f64();
-        assert!(found.is_none(), "an all-zero target can never be met");
-        rates.push(batch as f64 / dt);
+        rates.push(rate(batch, || run((it + 1) * batch as u64)));
     }
+    report(label, rates);
+}
+
+/// Nonces per second of one grind.
+fn rate(batch: u32, run: impl FnOnce() -> Option<u64>) -> f64 {
+    let t = Instant::now();
+    let found = run();
+    let dt = t.elapsed().as_secs_f64();
+    assert!(found.is_none(), "an all-zero target can never be met");
+    batch as f64 / dt
+}
+
+fn report(label: &str, mut rates: Vec<f64>) {
     rates.sort_by(|a, b| a.partial_cmp(b).unwrap());
     eprintln!(
         "{label:<28} min {:>9.0}  med {:>9.0}  max {:>9.0} nonces/s",
@@ -102,9 +111,37 @@ fn pom_v4_grind_rate() {
         addrs.push(addr);
         prefix.push(first + len);
     }
-    let seg = PomWalkV4::new(&vk, &prefix, &addrs).expect("v4 walk over segments");
-    time(&format!("{n_segments} segments (LUT)"), iters, batch, |start| seg.mine(&vk, &job, start, batch));
-    seg.destroy(&vk);
+    // Both transitions over the same table. Warm up to steady-state clocks, then alternate them run
+    // by run so boost, power-limit and thermal drift hit both alike.
+    let walks: Vec<(V4Kernel, PomWalkV4)> = [V4Kernel::Dot4, V4Kernel::MatrixCores]
+        .into_iter()
+        .filter_map(|kind| match PomWalkV4::with_kernel(&vk, &prefix, &addrs, kind) {
+            Ok(walk) => Some((kind, walk)),
+            Err(e) => {
+                eprintln!("{}: unavailable ({e})", kind.name());
+                None
+            }
+        })
+        .collect();
+    let warmup = Instant::now();
+    let mut start = 0u64;
+    while warmup.elapsed().as_secs_f64() < env("POM_BENCH_WARMUP_S", 5) as f64 {
+        for (_, walk) in &walks {
+            walk.mine(&vk, &job, start, batch);
+            start += batch as u64;
+        }
+    }
+    let mut rates = vec![Vec::new(); walks.len()];
+    for _ in 0..iters {
+        for (k, (_, walk)) in walks.iter().enumerate() {
+            rates[k].push(rate(batch, || walk.mine(&vk, &job, start, batch)));
+            start += batch as u64;
+        }
+    }
+    for ((kind, walk), r) in walks.iter().zip(rates) {
+        report(&format!("{n_segments} segments, {}", kind.name()), r);
+        walk.destroy(&vk);
+    }
     for b in &bufs {
         vk.destroy_buffer(b);
     }
