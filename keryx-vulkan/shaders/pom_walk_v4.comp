@@ -18,16 +18,29 @@
 // with two barriers per step (both wave-local with one nonce per workgroup): the shared footprint
 // — not registers — bounds occupancy, and 2 KB per wave is what lets a SIMD hold 16 waves (RGP on
 // a 7900 XT: the 3.1 KB double-buffered layout allocated 4 KB and capped it at 8).
+//
+// POM_V4_CM (built as pom_walk_v4_cm.spv): the same walk with the 32x32x32 int8 transition on the
+// matrix cores (VK_KHR_cooperative_matrix) instead of packed v_dot4 — see the CM main() below.
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_integer_dot_product : require
 #extension GL_EXT_control_flow_attributes : require
+#ifdef POM_V4_CM
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#endif
 
 // Nonces per workgroup. 1 measured fastest on a 7900 XT (1.12 M/s vs 0.99 at 2, 0.95 at 4, 0.91 at
 // 8): with one nonce per workgroup the per-step barrier couples no other walk. The host pins
 // wave32, so the workgroup is exactly one full wave.
 #ifndef NPW
 #define NPW 1
+#endif
+#if defined(POM_V4_CM) && NPW != 1
+#error "the matrix-core walk is one nonce per workgroup (one wave32 subgroup)"
 #endif
 layout(local_size_x = 32, local_size_y = NPW) in;
 
@@ -81,7 +94,22 @@ layout(push_constant) uniform Push {
     uint zero;                 // always 0 — see rho8
 } pc;                          // 48 + 16 = 64 B
 
+#ifdef POM_V4_CM
+// Words per tile column and bytes per state row; 8 and 32 are unpadded (2 KB per nonce, the same
+// LDS budget as the v_dot4 walk), larger values pad the fragment loads off shared banks.
+#ifndef CM_TS
+#define CM_TS 8u
+#endif
+#ifndef CM_SS
+#define CM_SS 32u
+#endif
+// The tile (column x at x*CM_TS); before the walk the layout probe, after it the Merkle scratch.
+shared uint s_mem[32u * CM_TS];
+// The walk state, row x at x*CM_SS — int8 so the matrix-core loads read it directly.
+shared int8_t s_state[32u * CM_SS];
+#else
 shared uint s_mem[NPW * V4_SLOT_UINTS];
+#endif
 
 // splitmix64 finalizer — exactly `pom::mix64`.
 uint64_t mix64(uint64_t x) {
@@ -187,6 +215,170 @@ Seg chunk_ptr(uint64_t idx) {
     return Seg(ADDRS.a[lo] + (idx - PREFIX.p[lo]) * 32UL);
 }
 
+// pom_pow_value (H3) of the walk's folded root: 4 keyed mix64 folds -> 256-bit LE value; a value
+// at or under the target makes nonce `i` a winner (lowest batch index wins).
+void report(uint64_t fin, uint i) {
+    uint64_t o0 = mix64(fin ^ pc.p0 ^ 0x9E3779B97F4A7C15UL);
+    uint64_t o1 = mix64(o0 ^ pc.p1 ^ 0xC2B2AE3D27D4EB4FUL);
+    uint64_t o2 = mix64(o1 ^ pc.p2 ^ 0x165667B19E3779F9UL);
+    uint64_t o3 = mix64(o2 ^ pc.p3 ^ 0xD6E8FEB86659FD93UL);
+    bool le;
+    if (o3 != IO.t[3]) { le = o3 < IO.t[3]; }
+    else if (o2 != IO.t[2]) { le = o2 < IO.t[2]; }
+    else if (o1 != IO.t[1]) { le = o1 < IO.t[1]; }
+    else { le = o0 <= IO.t[0]; }
+    if (le) {
+        atomicMin(IO.offset, i);
+    }
+}
+
+#ifdef POM_V4_CM
+// Matrix-core transition: next = S x T^T as 2x2 output blocks of 16x16, each the sum of two
+// 16x16x16 int8 products with A = state rows (row-major in s_state) and B(k, j) = tile byte
+// j*32 + k (the tile column-major in s_mem). The products are exact int32, so the walk is
+// byte-identical to the v_dot4 path. rho8 runs on the accumulator elements in registers; the
+// element -> (row, col) layout is implementation-defined, so it is read once from a position
+// matrix (element (r, c) = r*16 + c) loaded the same way. New state bytes are written in place:
+// a 16-row block's A fragments are in registers before any of its bytes are stored, and the other
+// block's rows are disjoint.
+#define CM_ACC coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define CM_A coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define CM_B coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+#define CM_ELEMS 8u // accumulator elements per invocation: 256 over the host-pinned wave32
+
+void main() {
+    const uint x = gl_LocalInvocationID.x;     // state row == tile column this invocation loads
+    const uint i = gl_WorkGroupID.x;
+    // Past the batch: walk the last seed (every barrier is reached), never report.
+    const uint64_t seed = SEEDS.s[min(i, pc.batch - 1u)];
+    // The host pins wave32 (one nonce = one subgroup) and checks this before using the kernel.
+    if (i == 0u && x == 0u) {
+        IO._pad = gl_SubgroupSize;
+    }
+
+    // Accumulator element layout: the position (row*16 + col) of each element this lane holds.
+    for (uint p = x; p < 256u; p += 32u) {
+        s_mem[p] = p;
+    }
+    barrier();
+    uint tw_pos[CM_ELEMS];   // row * rho_tweak_row + col * rho_tweak_col within a block
+    uint st_pos[CM_ELEMS];   // byte offset within a block of s_state
+    {
+        CM_ACC probe;
+        coopMatLoad(probe, s_mem, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        [[unroll]] for (uint e = 0u; e < CM_ELEMS; e++) {
+            const uint p = uint(probe[e]);
+            const uint r = p >> 4u, c = p & 15u;
+            tw_pos[e] = r * 0xC2B2AE35u + c * 0x85EBCA6Bu;
+            st_pos[e] = r * CM_SS + c;
+        }
+    }
+
+    // S_0: mix64 keystream per row, as the little-endian bytes of row x.
+    {
+        uint64_t h = mix64(seed ^ (V4_S0_ROW_SALT + uint64_t(x)));
+        [[unroll]] for (uint k4 = 0u; k4 < V4_D4; k4++) {
+            h = mix64(h);
+            const uint w = uint(h);
+            [[unroll]] for (uint b = 0u; b < 4u; b++) {
+                s_state[x * CM_SS + k4 * 4u + b] = int8_t(w >> (8u * b));
+            }
+        }
+    }
+
+    // Prefetch tile 1's column x into registers.
+    uint64_t off = mod_tiles(mix64(seed ^ V4_OFFSET_FIRST_SALT));
+    uint64_t w0, w1, w2, w3;
+    {
+        Seg c = chunk_ptr(off * 32UL + uint64_t(x));
+        w0 = c.words[0]; w1 = c.words[1]; w2 = c.words[2]; w3 = c.words[3];
+    }
+    barrier(); // the probe is read before the first tile overwrites it
+
+    for (uint step = 1u; step <= 256u; step++) {
+        const uint col = x * CM_TS;
+        s_mem[col + 0u] = uint(w0); s_mem[col + 1u] = uint(w0 >> 32);
+        s_mem[col + 2u] = uint(w1); s_mem[col + 3u] = uint(w1 >> 32);
+        s_mem[col + 4u] = uint(w2); s_mem[col + 5u] = uint(w2 >> 32);
+        s_mem[col + 6u] = uint(w3); s_mem[col + 7u] = uint(w3 >> 32);
+        barrier();
+
+        // Next offset from THIS tile's snippet (column 0 = its first 8 words); the next tile's
+        // load is in flight during the transition.
+        if (step < 256u) {
+            uint64_t sf = 0UL;
+            [[unroll]] for (uint w = 0u; w < 8u; w++) {
+                sf = mix64(sf ^ uint64_t(s_mem[w]));
+            }
+            off = mod_tiles(mix64(seed ^ (uint64_t(step + 1u) * V4_OFFSET_STEP_SALT) ^ sf));
+            Seg c = chunk_ptr(off * 32UL + uint64_t(x));
+            w0 = c.words[0]; w1 = c.words[1]; w2 = c.words[2]; w3 = c.words[3];
+        }
+
+        // B[kb][jb]: rows k = 16kb.., columns j = 16jb.. — column j is tile column j.
+        CM_B b[2][2];
+        [[unroll]] for (uint kb = 0u; kb < 2u; kb++) {
+            [[unroll]] for (uint jb = 0u; jb < 2u; jb++) {
+                coopMatLoad(b[kb][jb], s_mem, jb * 16u * CM_TS + kb * 4u, CM_TS, gl_CooperativeMatrixLayoutColumnMajor);
+            }
+        }
+        const uint step_tw = step * 0x9E3779B9u;
+        [[unroll]] for (uint xb = 0u; xb < 2u; xb++) {
+            CM_A a0, a1;
+            coopMatLoad(a0, s_state, xb * 16u * CM_SS, CM_SS, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(a1, s_state, xb * 16u * CM_SS + 16u, CM_SS, gl_CooperativeMatrixLayoutRowMajor);
+            [[unroll]] for (uint jb = 0u; jb < 2u; jb++) {
+                CM_ACC acc = CM_ACC(0);
+                acc = coopMatMulAdd(a0, b[0][jb], acc);
+                acc = coopMatMulAdd(a1, b[1][jb], acc);
+                const uint blk_tw = step_tw + xb * (16u * 0xC2B2AE35u) + jb * (16u * 0x85EBCA6Bu);
+                const uint blk_st = xb * 16u * CM_SS + jb * 16u;
+                [[unroll]] for (uint e = 0u; e < CM_ELEMS; e++) {
+                    s_state[blk_st + st_pos[e]] = int8_t(rho8(int(acc[e]), blk_tw + tw_pos[e]));
+                }
+            }
+        }
+        // The state is complete and this tile is fully read before the next step.
+        barrier();
+    }
+
+    // root_K: 32 blake3 row leaves + complete depth-5 tree, in place in s_mem (each level's lanes
+    // read their two children before any of them writes its parent over them).
+    {
+        uint m[16];
+        [[unroll]] for (uint k4 = 0u; k4 < V4_D4; k4++) {
+            uint w = 0u;
+            [[unroll]] for (uint b = 0u; b < 4u; b++) {
+                w |= (uint(int(s_state[x * CM_SS + k4 * 4u + b])) & 0xffu) << (8u * b);
+            }
+            m[k4] = w;
+        }
+        [[unroll]] for (uint k = 8u; k < 16u; k++) m[k] = 0u;
+        uint h[8];
+        b3_one_block(m, 32u, h);
+        [[unroll]] for (uint k = 0u; k < 8u; k++) s_mem[x * 8u + k] = h[k];
+    }
+    barrier();
+    [[unroll]] for (uint n = 32u; n > 1u; n >>= 1) {
+        uint m[16];
+        if (x < n / 2u) {
+            [[unroll]] for (uint k = 0u; k < 16u; k++) m[k] = s_mem[x * 16u + k];
+        }
+        barrier();
+        if (x < n / 2u) {
+            uint h[8];
+            b3_one_block(m, 64u, h);
+            [[unroll]] for (uint k = 0u; k < 8u; k++) s_mem[x * 8u + k] = h[k];
+        }
+        barrier();
+    }
+
+    if (x == 0u && i < pc.batch) {
+        report(uint64_t(s_mem[0]) | (uint64_t(s_mem[1]) << 32), i);
+    }
+}
+
+#else
 void main() {
     const uint x = gl_LocalInvocationID.x;     // state row == tile column this invocation loads
     const uint slot = gl_LocalInvocationID.y;  // nonce slot in the workgroup
@@ -292,19 +484,7 @@ void main() {
     }
 
     if (x == 0u && i < pc.batch) {
-        const uint64_t fin = uint64_t(s_mem[src]) | (uint64_t(s_mem[src + 1u]) << 32);
-        // pom_pow_value (H3): 4 keyed mix64 folds -> 256-bit LE value, then le_leq vs target.
-        uint64_t o0 = mix64(fin ^ pc.p0 ^ 0x9E3779B97F4A7C15UL);
-        uint64_t o1 = mix64(o0 ^ pc.p1 ^ 0xC2B2AE3D27D4EB4FUL);
-        uint64_t o2 = mix64(o1 ^ pc.p2 ^ 0x165667B19E3779F9UL);
-        uint64_t o3 = mix64(o2 ^ pc.p3 ^ 0xD6E8FEB86659FD93UL);
-        bool le;
-        if (o3 != IO.t[3]) { le = o3 < IO.t[3]; }
-        else if (o2 != IO.t[2]) { le = o2 < IO.t[2]; }
-        else if (o1 != IO.t[1]) { le = o1 < IO.t[1]; }
-        else { le = o0 <= IO.t[0]; }
-        if (le) {
-            atomicMin(IO.offset, i);
-        }
+        report(uint64_t(s_mem[src]) | (uint64_t(s_mem[src + 1u]) << 32), i);
     }
 }
+#endif

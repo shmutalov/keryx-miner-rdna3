@@ -20,6 +20,26 @@ fn find_glslc() -> PathBuf {
     PathBuf::from("glslc") // assume on PATH
 }
 
+/// Extra builds of a shader under preprocessor defines: (source stem, output stem, defines).
+const VARIANTS: &[(&str, &str, &[&str])] = &[
+    // The PoM v4 walk with its transition on the matrix cores (VK_KHR_cooperative_matrix).
+    ("pom_walk_v4", "pom_walk_v4_cm", &["-DPOM_V4_CM"]),
+];
+
+fn compile(glslc: &PathBuf, src: &std::path::Path, spv: &std::path::Path, defines: &[&str]) {
+    let status = Command::new(glslc)
+        .args(["-O", "--target-env=vulkan1.3"])
+        .args(defines)
+        .arg(src)
+        .arg("-o")
+        .arg(spv)
+        .status()
+        .unwrap_or_else(|e| {
+            panic!("failed to run glslc ({}): {e}. Install the Vulkan SDK or set GLSLC/VULKAN_SDK.", glslc.display())
+        });
+    assert!(status.success(), "glslc failed to compile {} {defines:?}", src.display());
+}
+
 fn main() {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let shader_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("shaders");
@@ -36,18 +56,10 @@ fn main() {
             continue;
         }
         let stem = path.file_stem().unwrap().to_str().unwrap();
-        let spv = out_dir.join(format!("{stem}.spv"));
         println!("cargo:rerun-if-changed={}", path.display());
-
-        let status = Command::new(&glslc)
-            .args(["-O", "--target-env=vulkan1.3"])
-            .arg(&path)
-            .arg("-o")
-            .arg(&spv)
-            .status()
-            .unwrap_or_else(|e| {
-                panic!("failed to run glslc ({}): {e}. Install the Vulkan SDK or set GLSLC/VULKAN_SDK.", glslc.display())
-            });
-        assert!(status.success(), "glslc failed to compile {}", path.display());
+        compile(&glslc, &path, &out_dir.join(format!("{stem}.spv")), &[]);
+        for (_, out_stem, defines) in VARIANTS.iter().filter(|(src, ..)| *src == stem) {
+            compile(&glslc, &path, &out_dir.join(format!("{out_stem}.spv")), defines);
+        }
     }
 }

@@ -130,6 +130,9 @@ pub struct Vk {
     /// `subgroupSizeControl` was enabled at device creation, so pipelines may pin their subgroup
     /// size. False on a borrowed device (its owner chose the features).
     subgroup_size_control: bool,
+    /// int8 16x16x16 subgroup cooperative matrices (VK_KHR_cooperative_matrix + shaderInt8) and a
+    /// wave32 pipeline pin are enabled — the PoM v4 matrix-core walk can run here.
+    coopmat_wave32: bool,
     /// Present iff borrowed: the owner's serialized queue-submit hook.
     external_submit: Option<ExternalSubmit>,
 }
@@ -223,11 +226,20 @@ impl Vk {
             let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
                 .shader_integer_dot_product(true)
                 .subgroup_size_control(subgroup_size_control);
-            let dci = vk::DeviceCreateInfo::default()
+            // The PoM v4 matrix-core walk: VK_KHR_cooperative_matrix + shaderInt8 (its state is
+            // int8 in shared memory), enabled only where the int8 shape and a wave32 pin exist.
+            let coopmat_wave32 = coopmat_i8_wave32_support(&entry, &instance, pdevice);
+            let coopmat_ext = [ash::khr::cooperative_matrix::NAME.as_ptr()];
+            let mut coopmat_features = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
+            features12 = features12.shader_int8(coopmat_wave32);
+            let mut dci = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&qcis)
                 .enabled_features(&features)
                 .push_next(&mut features12)
                 .push_next(&mut features13);
+            if coopmat_wave32 {
+                dci = dci.enabled_extension_names(&coopmat_ext).push_next(&mut coopmat_features);
+            }
             let device = instance
                 .create_device(pdevice, &dci, None)
                 .map_err(|e| format!("create_device failed: {e}"))?;
@@ -256,6 +268,7 @@ impl Vk {
                 owned: true,
                 external_submit: None,
                 subgroup_size_control,
+                coopmat_wave32,
             })
         }
     }
@@ -292,6 +305,11 @@ impl Vk {
                 None,
             )
             .map_err(|e| format!("create_command_pool (borrowed device): {e}"))?;
+        // ggml creates its device with every supported core feature (shaderInt8,
+        // subgroupSizeControl) and with VK_KHR_cooperative_matrix + its feature whenever the device
+        // supports them (unless GGML_VK_DISABLE_COOPMAT), so hardware support means enabled here.
+        let coopmat_wave32 = std::env::var_os("GGML_VK_DISABLE_COOPMAT").is_none()
+            && coopmat_i8_wave32_support(&entry, &instance, pdevice);
         Ok(Self {
             _entry: entry,
             instance,
@@ -306,6 +324,7 @@ impl Vk {
             owned: false,
             external_submit: Some(external_submit),
             subgroup_size_control: false,
+            coopmat_wave32,
         })
     }
 
@@ -327,6 +346,11 @@ impl Vk {
     /// Human-readable name of the selected GPU (e.g. "AMD Radeon RX 7900 XT").
     pub fn device_name(&self) -> &str {
         &self.device_name
+    }
+
+    /// Whether the PoM v4 matrix-core walk can run here (int8 cooperative matrices + a wave32 pin).
+    pub fn coopmat_wave32(&self) -> bool {
+        self.coopmat_wave32
     }
 
     /// Raw enumeration index of the selected GPU (stable id across workers/llama-server pinning).
@@ -706,6 +730,20 @@ impl Vk {
         push_size: u32,
         required_subgroup_size: Option<u32>,
     ) -> Result<Kernel, String> {
+        self.build_kernel(spirv, n_bindings, push_size, required_subgroup_size.filter(|_| self.subgroup_size_control))
+    }
+
+    /// [`make_kernel`](Self::make_kernel) for a kernel that is only correct at wave32 (the PoM v4
+    /// matrix-core walk): always pins the subgroup size. Only on a device where
+    /// [`coopmat_wave32`](Self::coopmat_wave32) holds.
+    pub fn make_kernel_wave32(&self, spirv: &[u32], n_bindings: u32, push_size: u32) -> Result<Kernel, String> {
+        if !self.coopmat_wave32 {
+            return Err("no wave32 pipeline pin on this device".into());
+        }
+        self.build_kernel(spirv, n_bindings, push_size, Some(32))
+    }
+
+    fn build_kernel(&self, spirv: &[u32], n_bindings: u32, push_size: u32, pin: Option<u32>) -> Result<Kernel, String> {
         unsafe {
             let bindings: Vec<_> = (0..n_bindings)
                 .map(|i| {
@@ -742,13 +780,13 @@ impl Vk {
                 .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(spirv), None)
                 .map_err(|e| e.to_string())?;
             let entry = CString::new("main").unwrap();
-            let mut required = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
-                .required_subgroup_size(required_subgroup_size.unwrap_or(0));
+            let mut required =
+                vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default().required_subgroup_size(pin.unwrap_or(0));
             let mut stage = vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::COMPUTE)
                 .module(module)
                 .name(&entry);
-            if required_subgroup_size.is_some() && self.subgroup_size_control {
+            if pin.is_some() {
                 stage = stage.push_next(&mut required);
             }
             let pipeline = self
@@ -928,4 +966,44 @@ pub struct Kernel {
 
 fn cstr_array_to_string(arr: &[std::os::raw::c_char]) -> String {
     unsafe { CStr::from_ptr(arr.as_ptr()).to_string_lossy().into_owned() }
+}
+
+/// Whether `pdevice` can run the PoM v4 matrix-core walk: VK_KHR_cooperative_matrix with an
+/// int8 x int8 -> int32 16x16x16 subgroup shape, shaderInt8, and compute pipelines pinnable to
+/// wave32 (one nonce = one 32-lane subgroup).
+unsafe fn coopmat_i8_wave32_support(entry: &ash::Entry, instance: &ash::Instance, pdevice: vk::PhysicalDevice) -> bool {
+    let has_ext = instance.enumerate_device_extension_properties(pdevice).is_ok_and(|exts| {
+        exts.iter().any(|e| e.extension_name_as_c_str() == Ok(ash::khr::cooperative_matrix::NAME))
+    });
+    if !has_ext {
+        return false;
+    }
+    let mut coopmat = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
+    let mut f12 = vk::PhysicalDeviceVulkan12Features::default();
+    let mut f13 = vk::PhysicalDeviceVulkan13Features::default();
+    let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut coopmat).push_next(&mut f12).push_next(&mut f13);
+    instance.get_physical_device_features2(pdevice, &mut features);
+    if coopmat.cooperative_matrix != vk::TRUE || f12.shader_int8 != vk::TRUE || f13.subgroup_size_control != vk::TRUE {
+        return false;
+    }
+    let mut subgroups = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
+    let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut subgroups);
+    instance.get_physical_device_properties2(pdevice, &mut props);
+    if !(subgroups.min_subgroup_size <= 32
+        && 32 <= subgroups.max_subgroup_size
+        && subgroups.required_subgroup_size_stages.contains(vk::ShaderStageFlags::COMPUTE))
+    {
+        return false;
+    }
+    let (i8, i32) = (vk::ComponentTypeKHR::SINT8, vk::ComponentTypeKHR::SINT32);
+    ash::khr::cooperative_matrix::Instance::new(entry, instance)
+        .get_physical_device_cooperative_matrix_properties(pdevice)
+        .is_ok_and(|shapes| {
+            shapes.iter().any(|s| {
+                (s.m_size, s.n_size, s.k_size) == (16, 16, 16)
+                    && (s.a_type, s.b_type, s.c_type, s.result_type) == (i8, i8, i32, i32)
+                    && s.saturating_accumulation == vk::FALSE
+                    && s.scope == vk::ScopeKHR::SUBGROUP
+            })
+        })
 }

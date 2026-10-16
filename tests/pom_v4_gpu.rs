@@ -19,7 +19,7 @@ use keryx_miner::pom_v4::{
     POM_V4_TILE_CHUNKS,
 };
 use keryx_vulkan::pom_walk::PomWalkGpu;
-use keryx_vulkan::pom_walk_v4::{PomWalkV4, V4Job};
+use keryx_vulkan::pom_walk_v4::{PomWalkV4, V4Job, V4Kernel};
 use keryx_vulkan::Vk;
 
 /// Same generator as `pom_v3::lockstep_blob` (whole tiles + a sub-tile tail the walk never reads).
@@ -142,7 +142,15 @@ fn v4_gpu_grind_matches_the_host_walk() {
         addrs.push(addr);
         prefix.push(first + sz);
     }
-    let seg = PomWalkV4::new(&vk, &prefix, &addrs).expect("v4 walk over segments");
+    let seg = PomWalkV4::with_kernel(&vk, &prefix, &addrs, V4Kernel::Dot4).expect("v4 walk over segments");
+    // The matrix-core transition over the same table, where the device has one.
+    let seg_cm = match PomWalkV4::with_kernel(&vk, &prefix, &addrs, V4Kernel::MatrixCores) {
+        Ok(walk) => Some(walk),
+        Err(e) => {
+            eprintln!("SKIP matrix cores: {e}");
+            None
+        }
+    };
 
     // Streamed-blob layout with small shards (1024 chunks) — many shards, never straddled.
     let words: Vec<u64> = blob[..(n_chunks * 32) as usize]
@@ -156,9 +164,15 @@ fn v4_gpu_grind_matches_the_host_walk() {
         let pows = host_pows(&blob, &pph, ts, start, n, daa);
         check(&format!("segments, {era}"), &|j, s, b| seg.mine(&vk, j, s, b), &pows, &pph, ts, start, daa);
         check(&format!("shards, {era}"), &|j, s, b| shards.mine_v4(j, s, b), &pows, &pph, ts, start, daa);
+        if let Some(cm) = &seg_cm {
+            check(&format!("segments, matrix cores, {era}"), &|j, s, b| cm.mine(&vk, j, s, b), &pows, &pph, ts, start, daa);
+        }
     }
 
     seg.destroy(&vk);
+    if let Some(cm) = &seg_cm {
+        cm.destroy(&vk);
+    }
     for b in &bufs {
         vk.destroy_buffer(b);
     }

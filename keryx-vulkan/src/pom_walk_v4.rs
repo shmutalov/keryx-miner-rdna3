@@ -11,9 +11,38 @@
 use crate::{GpuBuffer, Kernel, Vk};
 use std::io::Cursor;
 
-/// SPIR-V for the v4 walk and its seed pre-pass, compiled from `shaders/` by build.rs.
+/// SPIR-V for the v4 walk (v_dot4 and matrix-core builds of one source) and its seed pre-pass,
+/// compiled from `shaders/` by build.rs.
 const POM_WALK_V4_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pom_walk_v4.spv"));
+const POM_WALK_V4_CM_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pom_walk_v4_cm.spv"));
 const POM_SEED_V4_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pom_seed_v4.spv"));
+
+/// How the walk computes its 32x32x32 int8 state transition. Both are byte-identical.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum V4Kernel {
+    /// Packed int8 dot products (v_dot4).
+    Dot4,
+    /// int8 cooperative matrices on the matrix cores (RDNA3+: v_wmma), at wave32.
+    MatrixCores,
+}
+
+impl V4Kernel {
+    pub fn name(self) -> &'static str {
+        match self {
+            V4Kernel::Dot4 => "v_dot4",
+            V4Kernel::MatrixCores => "matrix cores",
+        }
+    }
+}
+
+/// The transition to try first: the matrix cores (~+35% on a 7900 XT), unless
+/// `KERYX_POM_V4_KERNEL=dot` asks for v_dot4.
+fn requested_kernel() -> V4Kernel {
+    match std::env::var("KERYX_POM_V4_KERNEL").ok().as_deref().map(str::trim) {
+        Some("dot") => V4Kernel::Dot4,
+        _ => V4Kernel::MatrixCores,
+    }
+}
 
 /// Invocations per workgroup of the seed pre-pass (`local_size_x` in pom_seed_v4.comp).
 const SEED_WG: u32 = 64;
@@ -92,6 +121,9 @@ pub struct V4Job {
 /// that also owns the `Vk`; released through [`destroy`](Self::destroy) before that `Vk` drops.
 pub struct PomWalkV4 {
     kernel: Kernel,
+    kind: V4Kernel,
+    /// Why the requested matrix-core kernel is not the one running, if it was refused.
+    fallback: Option<String>,
     seed_kernel: Kernel,
     /// Per-nonce seeds of one dispatch, written by the pre-pass and read by the walk (VRAM only).
     seeds: GpuBuffer,
@@ -108,7 +140,21 @@ pub struct PomWalkV4 {
 impl PomWalkV4 {
     /// Build over a segment table: `prefix` = T+1 cumulative canonical-chunk starts
     /// (`prefix[0] == 0`, `prefix[T] == n_chunks`), `addrs` = the T segment device addresses.
+    /// The transition runs on the matrix cores where they pass their checks, else (or with
+    /// `KERYX_POM_V4_KERNEL=dot`) on v_dot4; a refusal is explained by [`describe`](Self::describe).
     pub fn new(vk: &Vk, prefix: &[u64], addrs: &[u64]) -> Result<Self, String> {
+        match requested_kernel() {
+            V4Kernel::Dot4 => Self::with_kernel(vk, prefix, addrs, V4Kernel::Dot4),
+            V4Kernel::MatrixCores => Self::with_kernel(vk, prefix, addrs, V4Kernel::MatrixCores).or_else(|e| {
+                let mut walk = Self::with_kernel(vk, prefix, addrs, V4Kernel::Dot4)?;
+                walk.fallback = Some(e);
+                Ok(walk)
+            }),
+        }
+    }
+
+    /// [`new`](Self::new) with an explicit transition; an unusable matrix-core kernel is an error.
+    pub fn with_kernel(vk: &Vk, prefix: &[u64], addrs: &[u64], kind: V4Kernel) -> Result<Self, String> {
         let t = addrs.len();
         if t == 0 || prefix.len() != t + 1 || prefix[0] != 0 {
             return Err(format!("v4 walk: malformed segment table ({} starts, {} addresses)", prefix.len(), t));
@@ -124,10 +170,22 @@ impl PomWalkV4 {
         let t_count = u32::try_from(t).map_err(|_| "v4 walk: too many segments")?;
         let (lut, lut_sh) = build_lut(prefix);
 
-        let spirv = ash::util::read_spv(&mut Cursor::new(POM_WALK_V4_SPV)).map_err(|e| e.to_string())?;
-        // wave32: each 32-invocation nonce slot is exactly one full wave on RDNA (driver default
-        // where subgroup size control is unavailable, e.g. on ggml's borrowed device).
-        let kernel = vk.make_kernel_with_subgroup(&spirv, 5, std::mem::size_of::<V4Push>() as u32, Some(32))?;
+        let push_size = std::mem::size_of::<V4Push>() as u32;
+        let kernel = match kind {
+            V4Kernel::Dot4 => {
+                let spirv = ash::util::read_spv(&mut Cursor::new(POM_WALK_V4_SPV)).map_err(|e| e.to_string())?;
+                // wave32: each 32-invocation nonce slot is exactly one full wave on RDNA (driver
+                // default where subgroup size control is unavailable, e.g. on ggml's borrowed device).
+                vk.make_kernel_with_subgroup(&spirv, 5, push_size, Some(32))?
+            }
+            V4Kernel::MatrixCores => {
+                if !vk.coopmat_wave32() {
+                    return Err("no int8 cooperative matrices with a wave32 pin on this device".into());
+                }
+                let spirv = ash::util::read_spv(&mut Cursor::new(POM_WALK_V4_CM_SPV)).map_err(|e| e.to_string())?;
+                vk.make_kernel_wave32(&spirv, 5, push_size)?
+            }
+        };
         let seed_spirv = ash::util::read_spv(&mut Cursor::new(POM_SEED_V4_SPV)).map_err(|e| e.to_string())?;
         let seed_kernel = vk.make_kernel(&seed_spirv, 2, std::mem::size_of::<SeedPush>() as u32)?;
         let seeds = vk.create_device_local_buffer(V4_MAX_DISPATCH_NONCES as u64 * 8)?;
@@ -139,8 +197,10 @@ impl PomWalkV4 {
         let lut_buf = vk.create_buffer_vram_mapped((lut.len() * 4) as u64)?;
         vk.write_buffer(&lut_buf, as_bytes(&lut));
 
-        Ok(Self {
+        let walk = Self {
             kernel,
+            kind,
+            fallback: None,
             seed_kernel,
             seeds,
             io,
@@ -151,7 +211,27 @@ impl PomWalkV4 {
             t_count,
             n_tiles,
             inv_n: u64::MAX / n_tiles,
-        })
+        };
+        if kind == V4Kernel::MatrixCores {
+            if let Err(e) = walk.check_wave32(vk).and_then(|()| walk.check_against_dot4(vk)) {
+                walk.destroy(vk);
+                return Err(e);
+            }
+        }
+        Ok(walk)
+    }
+
+    /// The transition this walk runs.
+    pub fn kernel(&self) -> V4Kernel {
+        self.kind
+    }
+
+    /// The transition for the log: its name, and why matrix cores were refused if they were asked for.
+    pub fn describe(&self) -> String {
+        match &self.fallback {
+            Some(why) => format!("{} (matrix cores refused: {why})", self.kind.name()),
+            None => self.kind.name().to_string(),
+        }
     }
 
     /// Tiles the walk addresses (`floor(n_chunks / 32)`).
@@ -159,39 +239,93 @@ impl PomWalkV4 {
         self.n_tiles
     }
 
+    /// The matrix-core kernel is only correct at wave32: walk one nonce and read back the subgroup
+    /// size it ran at (the kernel reports it in `Io._pad`).
+    fn check_wave32(&self, vk: &Vk) -> Result<(), String> {
+        let job = V4Job { pow_words: [0; 4], seed_words: [0; 4], timestamp: 0, h10_state: None, target_le: [0; 32] };
+        self.dispatch(vk, &self.kernel, &job, 0, 1);
+        let mut out = [0u8; 8];
+        vk.read_buffer(&self.io, &mut out);
+        match u32::from_le_bytes(out[4..8].try_into().unwrap()) {
+            32 => Ok(()),
+            n => Err(format!("the driver ran it at subgroup size {n}, not 32")),
+        }
+    }
+
+    /// Before the matrix-core kernel mines, it must name the same lowest winner as v_dot4 over
+    /// this walk's own table: 2048 nonces at two target hardnesses (first winners ~2 and ~128
+    /// nonces in, so every walk up to there is compared). A driver that runs the matrix ops but
+    /// gets them wrong would otherwise mine silently without ever finding a valid share.
+    fn check_against_dot4(&self, vk: &Vk) -> Result<(), String> {
+        let spirv = ash::util::read_spv(&mut Cursor::new(POM_WALK_V4_SPV)).map_err(|e| e.to_string())?;
+        let dot = vk.make_kernel_with_subgroup(&spirv, 5, std::mem::size_of::<V4Push>() as u32, Some(32))?;
+        let mut verdict = Ok(());
+        for msb in [0x7Fu8, 0x01] {
+            let mut target_le = [0xFFu8; 32];
+            target_le[31] = msb;
+            let job = V4Job {
+                pow_words: [1, 2, 3, 4],
+                seed_words: [5, 6, 7, 8],
+                timestamp: 1_788_000_000_000,
+                h10_state: Some([0x0123_4567_89AB_CDEF; 25]),
+                target_le,
+            };
+            let (cm, reference) = (self.winner(vk, &self.kernel, &job, 2048), self.winner(vk, &dot, &job, 2048));
+            if cm != reference {
+                verdict = Err(format!("it disagrees with v_dot4 (lowest winner {cm:?} vs {reference:?})"));
+                break;
+            }
+        }
+        vk.destroy_kernel(&dot);
+        verdict
+    }
+
+    /// Lowest winning batch index among nonces `[0, n)` under `kernel`.
+    fn winner(&self, vk: &Vk, kernel: &Kernel, job: &V4Job, n: u32) -> Option<u32> {
+        self.dispatch(vk, kernel, job, 0, n);
+        let mut out = [0u8; 4];
+        vk.read_buffer(&self.io, &mut out);
+        Some(u32::from_le_bytes(out)).filter(|&offset| offset != NO_WINNER)
+    }
+
+    /// One seed pre-pass + `kernel` walk over nonces `[start, start + n)` (n <= the dispatch cap),
+    /// with the winner slot reset; blocks until the GPU is done.
+    fn dispatch(&self, vk: &Vk, kernel: &Kernel, job: &V4Job, start: u64, n: u32) {
+        let io = V4Io { offset: NO_WINNER, _pad: 0, t: words4(&job.target_le), h10: job.h10_state.unwrap_or([0; 25]) };
+        vk.write_buffer(&self.io, struct_bytes(&io));
+        let seed_push = SeedPush {
+            s: job.seed_words,
+            timestamp: job.timestamp,
+            start_nonce: start,
+            batch: n,
+            seed_h10: job.h10_state.is_some() as u32,
+        };
+        let push = V4Push {
+            p: job.pow_words,
+            n_tiles: self.n_tiles,
+            inv_n: self.inv_n,
+            batch: n,
+            t_count: self.t_count,
+            lut_sh: self.lut_sh,
+            zero: 0,
+        };
+        // Seeds first, then the walk that reads them — one submit, barrier in between.
+        let seed_bufs: [&GpuBuffer; 2] = [&self.io, &self.seeds];
+        let walk_bufs: [&GpuBuffer; 5] = [&self.io, &self.prefix, &self.addrs, &self.lut, &self.seeds];
+        vk.dispatch_seq(&[
+            (&self.seed_kernel, &seed_bufs[..], struct_bytes(&seed_push), n.div_ceil(SEED_WG)),
+            (kernel, &walk_bufs[..], struct_bytes(&push), n.div_ceil(V4_NPW)),
+        ]);
+    }
+
     /// Search nonces `[start, start + batch)`; returns the lowest winning nonce. Ground in
     /// ascending TDR-bounded sub-dispatches, so the first sub-batch with a winner holds the global
     /// lowest one.
     pub fn mine(&self, vk: &Vk, job: &V4Job, start: u64, batch: u32) -> Option<u64> {
-        let io = V4Io { offset: NO_WINNER, _pad: 0, t: words4(&job.target_le), h10: job.h10_state.unwrap_or([0; 25]) };
         let mut done: u32 = 0;
         while done < batch {
             let sub = (batch - done).min(V4_MAX_DISPATCH_NONCES);
-            vk.write_buffer(&self.io, struct_bytes(&io));
-            let seed_push = SeedPush {
-                s: job.seed_words,
-                timestamp: job.timestamp,
-                start_nonce: start.wrapping_add(done as u64),
-                batch: sub,
-                seed_h10: job.h10_state.is_some() as u32,
-            };
-            let push = V4Push {
-                p: job.pow_words,
-                n_tiles: self.n_tiles,
-                inv_n: self.inv_n,
-                batch: sub,
-                t_count: self.t_count,
-                lut_sh: self.lut_sh,
-                zero: 0,
-            };
-            // Seeds first, then the walk that reads them — one submit, barrier in between.
-            let seed_bufs: [&GpuBuffer; 2] = [&self.io, &self.seeds];
-            let walk_bufs: [&GpuBuffer; 5] = [&self.io, &self.prefix, &self.addrs, &self.lut, &self.seeds];
-            vk.dispatch_seq(&[
-                (&self.seed_kernel, &seed_bufs[..], struct_bytes(&seed_push), sub.div_ceil(SEED_WG)),
-                (&self.kernel, &walk_bufs[..], struct_bytes(&push), sub.div_ceil(V4_NPW)),
-            ]);
-
+            self.dispatch(vk, &self.kernel, job, start.wrapping_add(done as u64), sub);
             let mut out = [0u8; 4];
             vk.read_buffer(&self.io, &mut out);
             if let offset @ 0..=0xFFFF_FFFE = u32::from_le_bytes(out) {

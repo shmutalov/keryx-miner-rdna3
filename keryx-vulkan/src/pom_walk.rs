@@ -245,6 +245,11 @@ impl PomWalkGpu {
     pub fn mine_v4(&self, job: &V4Job, start: u64, batch: u32) -> Option<u64> {
         self.v4.mine(&self.vk, job, start, batch)
     }
+
+    /// The v4 transition in use, for the log ([`PomWalkV4::describe`]).
+    pub fn v4_kernel(&self) -> String {
+        self.v4.describe()
+    }
 }
 
 impl Drop for PomWalkGpu {
@@ -431,6 +436,11 @@ impl PomWalkShared {
     /// [`PomWalkV4::mine`].
     pub fn mine_v4(&self, job: &V4Job, start: u64, batch: u32) -> Option<u64> {
         self.v4.mine(&self.vk, job, start, batch)
+    }
+
+    /// The v4 transition in use, for the log ([`PomWalkV4::describe`]).
+    pub fn v4_kernel(&self) -> String {
+        self.v4.describe()
     }
 }
 

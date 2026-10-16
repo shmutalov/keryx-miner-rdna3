@@ -168,6 +168,7 @@ exporting anything. Prebuilt release binaries need none of this.
 | Var | Meaning |
 |-----|---------|
 | `KERYX_POM_V4_BATCH` | nonces per PoM dispatch (default `32768`) |
+| `KERYX_POM_V4_KERNEL` | `dot` = run the PoM walk's int8 matrix product on packed dot products instead of the matrix cores (the default wherever the GPU has int8 cooperative matrices and they pass a startup check against the dot-product kernel — RDNA3+; ~+35% on a 7900 XT) |
 | `KERYX_POW_ONLY` | (testing) `1` = skip OPoI models + inference; every block is PoM, which needs the model, so nothing is mined |
 | `RUST_LOG` | log filter (`-d` = everything at debug). llama.cpp's own output logs under the `llama.cpp` target at debug: `RUST_LOG=info,llama.cpp=debug` brings back just that |
 | `KERYX_LOG_AI` | `1` = append the prompt and answer of every inference, private requests included, to `ai-requests.log` next to the miner; any other value is the file's path (same as `--log-ai[=FILE]`) |

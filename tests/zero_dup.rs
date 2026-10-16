@@ -8,6 +8,7 @@
 use keryx_miner::llm_engine::LlamaEngine;
 use keryx_miner::pom::WeightIndex;
 use keryx_vulkan::pom_walk::{words4, PomWalkGpu};
+use keryx_vulkan::pom_walk_v4::V4Job;
 
 fn splitmix(x: &mut u64) -> u64 {
     *x = x.wrapping_add(0x9E3779B97F4A7C15);
@@ -29,8 +30,11 @@ fn shared_walk_matches_streamed_blob() {
     let engine = LlamaEngine::launch(&gguf).expect("engine launch");
 
     // 2. Shared walk over the engine's tensors — VK-resident in place, host-side (token_embd)
-    //    supplemented into a small owned buffer, canonical name-sorted table throughout.
+    //    supplemented into a small owned buffer, canonical name-sorted table throughout. Its v4
+    //    walk runs on the matrix cores (on ggml's device), the blob's below on v_dot4.
+    std::env::set_var("KERYX_POM_V4_KERNEL", "cm");
     let (shared, supl_bytes) = engine.build_shared_walk().expect("shared walk");
+    std::env::set_var("KERYX_POM_V4_KERNEL", "dot");
     eprintln!(
         "shared walk: N={} chunks, {} MB supplemented (host-side tensors)",
         shared.n_chunks(),
@@ -58,6 +62,7 @@ fn shared_walk_matches_streamed_blob() {
     let mut source =
         |first: u64, out: &mut [u8]| idx.read_chunk_range(first, out).map_err(|e| e.to_string());
     let blob = PomWalkGpu::new_streamed(None, idx.n_chunks, &mut source).expect("streamed blob");
+    std::env::remove_var("KERYX_POM_V4_KERNEL");
 
     // 6. Winner equality across target hardnesses: all-win, ~50%, ~0.4%, ~0.002%, none.
     let start: u64 = 0xA1B2_C3D4_0000_0000;
@@ -103,6 +108,28 @@ fn shared_walk_matches_streamed_blob() {
         "prefix kernel: walk_v2 must change the walk"
     );
 
+    // 6b. PoM v4 (the live walk): the shared walk's transition (matrix cores on ggml's borrowed
+    //     device) must name the same winners as the blob's (v_dot4 on our own device).
+    eprintln!("v4 walk: shared on {}, blob on {}", shared.v4_kernel(), blob.v4_kernel());
+    let v4_job = |target_le: [u8; 32]| V4Job {
+        pow_words: p,
+        seed_words: p,
+        timestamp: ts,
+        h10_state: Some([0x0123_4567_89ab_cdef; 25]),
+        target_le,
+    };
+    for msb in [0xFFu8, 0x80, 0x01, 0x00] {
+        let mut target = [0u8; 32];
+        target[31] = msb;
+        if msb == 0xFF {
+            target = [0xFF; 32];
+        }
+        let a = shared.mine_v4(&v4_job(target), start, batch);
+        let b = blob.mine_v4(&v4_job(target), start, batch);
+        assert_eq!(a, b, "v4: winner mismatch at target msb {msb:#x}");
+        eprintln!("v4 target msb {msb:#04x}: shared == blob == {a:?}");
+    }
+
     // 7. Hashrate: prefix-table binary search vs shard shift/mask, no-winner target so every
     //    nonce walks all 256 steps. 8×65536 nonces each, warm. Reported per era: H5's v2 walk does
     //    4 mix64 per chunk instead of 1 and is the measured ~4x hashrate drop on RDNA3.
@@ -121,4 +148,6 @@ fn shared_walk_matches_streamed_blob() {
         timed(&format!("blob   {era}"), &|s: u64| blob.mine(&p, &p, ts, &none, s, batch, walk_v2));
         timed(&format!("shared {era}"), &|s: u64| shared.mine(&p, &p, ts, &none, s, batch, walk_v2));
     }
+    timed(&format!("blob   v4 ({})", blob.v4_kernel()), &|s: u64| blob.mine_v4(&v4_job(none), s, batch));
+    timed(&format!("shared v4 ({})", shared.v4_kernel()), &|s: u64| shared.mine_v4(&v4_job(none), s, batch));
 }

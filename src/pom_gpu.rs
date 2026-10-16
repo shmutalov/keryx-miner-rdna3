@@ -357,10 +357,11 @@ fn ensure_installed_inner(daa: u64, device: u32) -> bool {
     match PomWalkGpu::new_streamed(Some(device as usize), idx.n_chunks, &mut source) {
         Ok(gpu) => {
             info!(
-                "PoM(vulkan): GPU miner ready on {} (device {}) — N={} chunks resident",
+                "PoM(vulkan): GPU miner ready on {} (device {}) — N={} chunks resident, v4 walk on {}",
                 gpu.device_name(),
                 device,
-                idx.n_chunks
+                idx.n_chunks,
+                gpu.v4_kernel()
             );
             install(device, *model_id, Resident::Blob(Arc::new(gpu)));
             true
@@ -421,10 +422,11 @@ fn install_shared(idx: &'static crate::pom::WeightIndex, model_id: &[u8; 32]) ->
 
     info!(
         "PoM(zero-dup): walking inference's resident weights on {} — N={} chunks, {} MB supplemented \
-         (host-side tensors), rest walked in place (sample-verify passed)",
+         (host-side tensors), rest walked in place (sample-verify passed), v4 walk on {}",
         walk.device_name(),
         walk.n_chunks(),
-        supl_bytes / (1024 * 1024)
+        supl_bytes / (1024 * 1024),
+        walk.v4_kernel()
     );
     Ok(Resident::Shared { walk: Arc::new(walk), _engine: engine })
 }
