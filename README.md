@@ -169,6 +169,7 @@ exporting anything. Prebuilt release binaries need none of this.
 |-----|---------|
 | `KERYX_POM_V4_BATCH` | nonces per PoM dispatch (default `32768`) |
 | `KERYX_POW_ONLY` | (testing) `1` = skip OPoI models + inference; every block is PoM, which needs the model, so nothing is mined |
+| `RUST_LOG` | log filter (`-d` = everything at debug). llama.cpp's own output logs under the `llama.cpp` target at debug: `RUST_LOG=info,llama.cpp=debug` brings back just that |
 | `KERYX_LOG_AI` | `1` = log the prompt and answer of every inference, private requests included (same as `--log-ai`) |
 | `KERYX_POM_KEEP_RESIDENT` | `1` = keep the PoM weight blob resident across inference when VRAM fits (skips reload) |
 | `KERYX_INFER_GPU` | raw Vulkan device index inference is pinned to on multi-GPU rigs (default: first discrete GPU) |

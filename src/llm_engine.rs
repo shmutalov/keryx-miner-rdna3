@@ -7,6 +7,7 @@
 //! resident weight buffers instead of keeping a second VRAM copy.
 //!
 
+use std::ffi::{c_char, c_void, CStr};
 use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
@@ -19,6 +20,10 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_sys_2::{
+    ggml_log_level, GGML_LOG_LEVEL_CONT, GGML_LOG_LEVEL_ERROR, GGML_LOG_LEVEL_INFO, GGML_LOG_LEVEL_NONE,
+    GGML_LOG_LEVEL_WARN,
+};
 use log::info;
 
 /// Context cap for a GGUF outside the lineup (tests): the old fixed `-c 4096`.
@@ -66,6 +71,55 @@ fn request_ctx(n_prompt: usize, max_tokens: usize, ctx_cap: u32) -> std::result:
 /// [`LlamaEngine`] (freeing the model's VRAM) but keep the backend alive.
 static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
 
+/// Log target of llama.cpp/ggml's own output: `-d` or `RUST_LOG=llama.cpp=debug` shows it all.
+pub const LLAMA_LOG_TARGET: &str = "llama.cpp";
+
+/// llama.cpp warnings every request triggers by design — each runs a fresh context sized to the
+/// request, far below the model's training context. Logged at debug, not warn.
+const EXPECTED_LLAMA_WARNINGS: &[&str] = &["the full capacity of the model will not be utilized"];
+
+/// llama.cpp/ggml log callback: their output goes to the miner's logger under
+/// [`LLAMA_LOG_TARGET`] instead of raw stderr. INFO (the metadata dump at every model load, the
+/// context setup at every request) becomes debug and DEBUG becomes trace; warnings and errors
+/// keep their level.
+extern "C" fn llama_log_to_log(level: ggml_log_level, text: *const c_char, _: *mut c_void) {
+    // A line can arrive in pieces: CONT carries on the previous piece's level, and text without
+    // a trailing newline waits for the rest.
+    static PENDING: Mutex<(ggml_log_level, String)> = Mutex::new((GGML_LOG_LEVEL_NONE, String::new()));
+    if text.is_null() {
+        return;
+    }
+    // SAFETY: llama.cpp passes a NUL-terminated string that outlives the call.
+    let text = unsafe { CStr::from_ptr(text) }.to_string_lossy();
+    let mut guard = PENDING.lock().unwrap_or_else(|p| p.into_inner());
+    let (pending_level, pending) = &mut *guard;
+    if level != GGML_LOG_LEVEL_CONT {
+        // A new message: an unterminated previous one is complete as it stands.
+        emit_llama_log(*pending_level, pending);
+        pending.clear();
+        *pending_level = level;
+    }
+    pending.push_str(&text);
+    while let Some(end) = pending.find('\n') {
+        emit_llama_log(*pending_level, &pending[..end]);
+        pending.drain(..=end);
+    }
+}
+
+fn emit_llama_log(level: ggml_log_level, line: &str) {
+    let line = line.trim_end();
+    if line.is_empty() {
+        return;
+    }
+    let level = match level {
+        GGML_LOG_LEVEL_ERROR => log::Level::Error,
+        GGML_LOG_LEVEL_WARN if !EXPECTED_LLAMA_WARNINGS.iter().any(|w| line.contains(w)) => log::Level::Warn,
+        GGML_LOG_LEVEL_WARN | GGML_LOG_LEVEL_INFO => log::Level::Debug,
+        _ => log::Level::Trace,
+    };
+    log::log!(target: LLAMA_LOG_TARGET, level, "{line}");
+}
+
 fn backend() -> Result<&'static LlamaBackend> {
     static INIT: Mutex<()> = Mutex::new(());
     if let Some(b) = BACKEND.get() {
@@ -73,6 +127,13 @@ fn backend() -> Result<&'static LlamaBackend> {
     }
     let _g = INIT.lock().unwrap_or_else(|p| p.into_inner());
     if BACKEND.get().is_none() {
+        // Before init: backend registration already logs (the Vulkan device list).
+        // SAFETY: a plain callback without user data. llama_log_set also points ggml's logger at
+        // it; setting ggml's directly keeps that true should the two ever be split.
+        unsafe {
+            llama_cpp_sys_2::llama_log_set(Some(llama_log_to_log), std::ptr::null_mut());
+            llama_cpp_sys_2::ggml_log_set(Some(llama_log_to_log), std::ptr::null_mut());
+        }
         let b = LlamaBackend::init().map_err(|e| anyhow!("llama backend init failed: {e}"))?;
         let _ = BACKEND.set(b);
     }
@@ -388,12 +449,24 @@ impl LlamaEngine {
 mod tests {
     use super::*;
 
+    /// Test logger showing llama.cpp's own output at debug (the dry run reads its buffer plan
+    /// there); `RUST_LOG` overrides.
+    fn init_test_log() {
+        let _ = env_logger::builder()
+            .is_test(true)
+            .filter_level(log::LevelFilter::Info)
+            .filter_module(LLAMA_LOG_TARGET, log::LevelFilter::Debug)
+            .parse_default_env()
+            .try_init();
+    }
+
     /// End-to-end in-process inference on a real GGUF + GPU. Ignored by default (loads a
     /// multi-GB model); run with:
     ///   KERYX_TEST_GGUF=<path to model.gguf> cargo test --release -- --ignored inproc_chat
     #[test]
     #[ignore = "loads a multi-GB GGUF onto the GPU; set KERYX_TEST_GGUF to run"]
     fn inproc_chat_smoke() {
+        init_test_log();
         let Ok(gguf) = std::env::var("KERYX_TEST_GGUF") else {
             eprintln!("SKIP: KERYX_TEST_GGUF not set");
             return;
@@ -420,6 +493,7 @@ mod tests {
     #[test]
     #[ignore = "loads a multi-GB GGUF onto the GPU; set KERYX_TEST_GGUF to run"]
     fn inproc_long_prompt() {
+        init_test_log();
         let Ok(gguf) = std::env::var("KERYX_TEST_GGUF") else {
             eprintln!("SKIP: KERYX_TEST_GGUF not set");
             return;
@@ -451,6 +525,7 @@ mod tests {
     #[test]
     #[ignore = "needs a Vulkan device and a GGUF; set KERYX_TEST_GGUF to run"]
     fn vram_dry_run() {
+        init_test_log();
         let Ok(gguf) = std::env::var("KERYX_TEST_GGUF") else {
             eprintln!("SKIP: KERYX_TEST_GGUF not set");
             return;
