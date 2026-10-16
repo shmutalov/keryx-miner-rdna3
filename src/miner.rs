@@ -320,12 +320,8 @@ impl MinerManager {
                 let mut nonces = vec![0u64; 1];
 
                 let mut state = None;
-                // PoM mining: nonce cursor + per-launch batch. The kernel grinds the whole batch
-                // before returning, so BPS_max = hashrate / POM_BATCH. At 1<<22 this capped a
-                // ~24 MH/s GPU at ~5.8 BPS. 1<<20 lifts the ceiling to ~23 BPS while staying well
-                // above kernel-launch overhead (batch ≈ 43 ms at 24 MH/s).
+                // PoM mining nonce cursor; each launch grinds `pom_gpu::v4_batch()` nonces.
                 let mut pom_nonce: u64 = thread_rng().next_u64();
-                const POM_BATCH: u64 = 1 << 20;
                 // This worker's Vulkan device: keys its resident PoM blob, and decides whether it
                 // shares the GPU with inference (only that worker pauses during OPoI challenges).
                 let pom_device = gpu_work.device_index().unwrap_or(0);
@@ -401,26 +397,15 @@ impl MinerManager {
                         }
                         // Era dispatch on THIS block's own DAA — the same gates
                         // `State::generate_block_if_pom` uses when it re-walks the winner on the host.
-                        let v4 = daa >= keryx_miner::pom::pom_v4_activation_daa();
-                        let v3 = daa >= keryx_miner::pom::pom_v3_activation_daa();
-                        if v3 && !v4 {
-                            // The H6 v3 window is history on every network; never mined here.
-                            warn!("PoM: template DAA {} is in the retired v3 era — not mining it", daa);
+                        // Every pre-v4 era is history on every network: the H6 v3 window, and below
+                        // H6 there is no tier to build a proof for. Never mined here.
+                        if daa < keryx_miner::pom::pom_v4_activation_daa() {
+                            warn!("PoM: template DAA {} is before the v4 era — not mining it", daa);
                             state = None;
                             continue;
                         }
-                        let batch = if v4 { keryx_miner::pom_gpu::v4_batch() } else { POM_BATCH };
-                        let found = if v4 {
-                            keryx_miner::pom_gpu::mine_v4(pom_device, &pph, time, &target_le, pom_nonce, batch, daa)
-                        } else {
-                            let h3 = daa >= keryx_miner::pom::pom_level_activation_daa();
-                            let walk_v2 = daa >= keryx_miner::pom::h5_activation_daa();
-                            let h5_1 = daa >= keryx_miner::pom::h5_1_activation_daa();
-                            let h5_2 = daa >= keryx_miner::pom::h5_2_activation_daa();
-                            keryx_miner::pom_gpu::mine(
-                                pom_device, &pph, time, &target_le, pom_nonce, batch, h3, walk_v2, h5_1, h5_2,
-                            )
-                        };
+                        let batch = keryx_miner::pom_gpu::v4_batch();
+                        let found = keryx_miner::pom_gpu::mine_v4(pom_device, &pph, time, &target_le, pom_nonce, batch, daa);
                         pom_nonce = pom_nonce.wrapping_add(batch);
                         hashes_tried.fetch_add(batch, Ordering::AcqRel);
                         worker_hashes_tried.fetch_add(batch, Ordering::AcqRel);

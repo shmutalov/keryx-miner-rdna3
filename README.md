@@ -167,8 +167,8 @@ exporting anything. Prebuilt release binaries need none of this.
 
 | Var | Meaning |
 |-----|---------|
-| `KERYX_VULKAN_WORKLOAD` | nonces per PoW dispatch (default `1048576`) |
-| `KERYX_POW_ONLY` | `1` = mine kHeavyHash shares only; skip OPoI models + inference (no PoM) |
+| `KERYX_POM_V4_BATCH` | nonces per PoM dispatch (default `32768`) |
+| `KERYX_POW_ONLY` | (testing) `1` = skip OPoI models + inference; every block is PoM, which needs the model, so nothing is mined |
 | `KERYX_POM_KEEP_RESIDENT` | `1` = keep the PoM weight blob resident across inference when VRAM fits (skips reload) |
 | `KERYX_INFER_GPU` | raw Vulkan device index inference is pinned to on multi-GPU rigs (default: first discrete GPU) |
 | `KERYX_MODELS_DIR` | model storage root (default `<exe_dir>/models`); also settable per-run via `--models-dir` |

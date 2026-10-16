@@ -62,11 +62,13 @@ impl Plugin for VulkanPlugin {
                 if d.discrete { ", discrete" } else { "" }
             );
         }
+        // Log the PoM batch, not `self.workload`: every block on every network is PoM, so the
+        // kHeavyHash workload is never dispatched.
         info!(
-            "Vulkan PoW: {} worker(s) on device(s) {:?} (workload {} nonces/dispatch)",
+            "Vulkan mining: {} worker(s) on device(s) {:?} (PoM batch {} nonces/dispatch)",
             self.devices.len(),
             self.devices,
-            self.workload
+            crate::pom_gpu::v4_batch()
         );
         self.devices
             .iter()
