@@ -12,28 +12,32 @@ set "MINING_ADDRESS=keryx:qz4zajm2kecfy5c6qctepdnt4666yz0qhff5alnhyy6jjzfm94svxy
 
 REM --- Pool and worker name (these are also the built-in defaults) ---
 REM set "POOL=stratum+tcp://krx.suprnova.cc:4404"
-REM set "POOL=stratum+tcp://krx.suprnova.cc:4401"
+set "POOL=stratum+tcp://krx.suprnova.cc:4401"
 REM set "POOL=stratum+tcp://krx.baikalmine.com:9020"
 REM set "POOL=stratum+tcp://eu.miningcrib.com:7212"
 REM set "POOL=stratum+tcp://pool.ddsolutions.ai:5555"
 REM set "POOL=stratum+tcp://sg.keryx.dongqn.com:5555"
-set "POOL=stratum+tcp://multipooldd.com:5555"
+REM set "POOL=stratum+tcp://multipooldd.com:5555"
+REM set "POOL=grpc://127.0.0.1:22110"
 
 set "WORKER=rx7900xt"
 
-REM --- GPU PoW batch size (nonces per dispatch). 4194304 (4M) is tuned for the
-REM     7900 XT (~710 MH/s). Lower it if the rig feels unresponsive. ---
-set "KERYX_VULKAN_WORKLOAD=4194304"
+REM --- PoM batch size (nonces per GPU dispatch). The built-in default (32768,
+REM     ~25 ms on the 7900 XT) is fine; uncomment to override. ---
+REM set "KERYX_POM_V4_BATCH=32768"
 
-REM --- PoW-only: mine kHeavyHash shares on the pool WITHOUT OPoI models or
-REM     llama-server. Comment out the next line (REM in front) to run the full
-REM     miner instead (downloads the OPoI model GGUFs and launches llama-server;
-REM     requires target\release\llama\llama-server.exe to be present). ---
+REM --- Testing only: 1 skips the OPoI model download and inference. Every block
+REM     on both networks is PoM, which needs the model, so with 1 nothing is
+REM     mined. Keep 0 to mine. ---
 set "KERYX_POW_ONLY=0"
-set "KERYX_SKIP_LEGACY_MODELS=1"
 
-set RUST_LOG=debug
-set RUST_BACKTRACE=1
+REM set RUST_LOG=debug
+REM set RUST_BACKTRACE=1
+REM --high (Qwen3.8-27B) is gated at 24 GB; the 20 GB 7900 XT needs the gate off to run it.
+set KERYX_SKIP_VRAM_GATE=1
+REM Cap each inference request at 32K tokens. The model allows 64K, which fits the
+REM 7900 XT with only ~0.3 GiB of VRAM to spare.
+set KERYX_LLAMA_CTX=32768
 
 REM ----------------------------------------------------------------------------
 cd /d "%~dp0"
@@ -49,7 +53,6 @@ for /f "usebackq delims=" %%d in (`powershell -NoProfile -Command "try { $t = (c
 if /i "%BUILT%"=="%MINER%" set "BUILT="
 
 call :sync_build
-
 if not exist "%MINER%" (
     echo ERROR: miner binary not found at:
     echo   %MINER%
@@ -67,7 +70,7 @@ echo.
 
 :run
 call :sync_build
-"%MINER%" --mining-address "%MINING_ADDRESS%" --keryxd-address "%POOL%" --worker "%WORKER%"
+"%MINER%" --mining-address "%MINING_ADDRESS%" --keryxd-address "%POOL%" --worker "%WORKER%" --high
 
 echo.
 echo Miner exited (code %errorlevel%). Restarting in 5s -- close this window to stop.
