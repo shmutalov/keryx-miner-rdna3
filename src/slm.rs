@@ -6,6 +6,7 @@
 //! external llama-server child, no CUDA, no CPU inference: everything runs on the GPU via Vulkan.
 use anyhow::{anyhow, Context, Result};
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -54,11 +55,15 @@ fn model_dir(spec: &ModelSpec) -> std::path::PathBuf {
     if let Some(root) = std::env::var_os("KERYX_MODELS_DIR") {
         return std::path::PathBuf::from(root).join(spec.dir_name);
     }
-    let exe_dir = std::env::current_exe()
+    exe_dir().join("models").join(spec.dir_name)
+}
+
+/// The directory of the miner executable (`.` if it cannot be determined).
+fn exe_dir() -> PathBuf {
+    std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    exe_dir.join("models").join(spec.dir_name)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// Path to a model's GGUF file (`<models_root>/<dir_name>/model.gguf`, where the root is
@@ -462,29 +467,92 @@ pub fn ensure_loaded(model_id: &[u8; 32]) -> bool {
     }
 }
 
-/// Whether every inference logs its prompt and answer: `KERYX_LOG_AI` set to anything but empty or
-/// `0` (`--log-ai` sets it). Private requests are logged as opened, in plaintext — hence off by
-/// default.
-pub fn ai_log_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("KERYX_LOG_AI").map(|v| !v.is_empty() && v != "0").unwrap_or(false))
+/// The file every inference's prompt and answer is appended to, from `KERYX_LOG_AI` (which
+/// `--log-ai[=FILE]` sets). None — the default — when unset, empty or `0`: private requests are
+/// logged as opened, in plaintext.
+pub fn ai_log_path() -> Option<&'static Path> {
+    static PATH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| parse_ai_log_setting(&std::env::var("KERYX_LOG_AI").ok()?)).as_deref()
+}
+
+/// `KERYX_LOG_AI`: `1` = `ai-requests.log` next to the exe, any other value but empty or `0` is
+/// the file's path.
+fn parse_ai_log_setting(value: &str) -> Option<PathBuf> {
+    match value.trim() {
+        "" | "0" => None,
+        "1" => Some(exe_dir().join("ai-requests.log")),
+        path => Some(PathBuf::from(path)),
+    }
+}
+
+/// Append one entry to the AI log. The file is opened on first use; if it cannot be, the miner
+/// says so once and runs on without the log.
+fn ai_log(request: &str, entry: std::fmt::Arguments) {
+    static FILE: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    let Some(path) = ai_log_path() else { return };
+    let file = FILE.get_or_init(|| match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        Ok(file) => Some(Mutex::new(file)),
+        Err(e) => {
+            log::error!("AI log: cannot open {}: {e} — not logging AI requests", path.display());
+            None
+        }
+    });
+    let Some(file) = file else { return };
+    let mut file = file.lock().unwrap_or_else(|p| p.into_inner());
+    if let Err(e) = write_ai_log_entry(&mut *file, time::OffsetDateTime::now_utc(), request, entry) {
+        log::warn!("AI log: write to {} failed: {e}", path.display());
+    }
+}
+
+/// One AI log line, written in a single call so entries never interleave.
+fn write_ai_log_entry(
+    out: &mut impl Write,
+    at: time::OffsetDateTime,
+    request: &str,
+    entry: std::fmt::Arguments,
+) -> std::io::Result<()> {
+    let at = at
+        .format(time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]:[second]Z"))
+        .unwrap_or_default();
+    out.write_all(format!("{at} [{request}] {entry}\n").as_bytes())
 }
 
 /// Load the requested model on demand (swapping out a different resident model), then run
 /// inference in-process. Blocking — call from `spawn_blocking`. `request` names the request in the
-/// `--log-ai` log lines; prompt and answer are Debug-escaped there, so each stays one line and a
-/// prompt cannot forge log lines.
+/// `--log-ai` file; prompt and answer are Debug-escaped there, so each entry stays one line and a
+/// prompt cannot forge entries.
 pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize, request: &str) -> Option<String> {
-    if !ai_log_enabled() {
+    if ai_log_path().is_none() {
         return run_inference(model_id, prompt, max_tokens);
     }
-    log::info!("AI [{request}] prompt (max_tokens={max_tokens}): {prompt:?}");
+    let model = SUPPORTED_SPECS
+        .read()
+        .ok()
+        .and_then(|specs| specs.iter().find(|s| &s.model_id == model_id).map(|s| s.name))
+        .unwrap_or("unknown model");
+    ai_log(request, format_args!("prompt ({model}, {}, max_tokens={max_tokens}): {prompt:?}", inference_gpu_label()));
+    // Total time of this inference, including a model (re)load when the model was not resident.
+    let started = std::time::Instant::now();
     let answer = run_inference(model_id, prompt, max_tokens);
+    let elapsed = started.elapsed().as_secs_f64();
     match &answer {
-        Some(text) => log::info!("AI [{request}] answer: {text:?}"),
-        None => log::info!("AI [{request}] no answer"),
+        Some(text) => ai_log(request, format_args!("answer ({elapsed:.2} s): {text:?}")),
+        None => ai_log(request, format_args!("no answer ({elapsed:.2} s)")),
     }
     answer
+}
+
+/// The inference GPU as the AI log names it (`GPU 0 AMD Radeon RX 7900 XT`). Resolved once: the
+/// inference device is fixed for the process, and naming it opens a Vulkan instance.
+fn inference_gpu_label() -> &'static str {
+    static LABEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LABEL.get_or_init(|| {
+        let index = keryx_vulkan::inference_device_index();
+        match keryx_vulkan::enumerate_devices().into_iter().find(|d| d.index == index) {
+            Some(device) => format!("GPU {index} {}", device.name),
+            None => format!("GPU {index}"),
+        }
+    })
 }
 
 fn run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize) -> Option<String> {
@@ -525,7 +593,28 @@ fn run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize) -> Option
 
 #[cfg(test)]
 mod tests {
-    use super::pom_fits;
+    use super::{exe_dir, parse_ai_log_setting, pom_fits, write_ai_log_entry};
+    use std::path::PathBuf;
+
+    #[test]
+    fn ai_log_setting() {
+        assert_eq!(parse_ai_log_setting(""), None);
+        assert_eq!(parse_ai_log_setting("0"), None);
+        assert_eq!(parse_ai_log_setting("1"), Some(exe_dir().join("ai-requests.log")));
+        assert_eq!(parse_ai_log_setting("D:/logs/ai.log"), Some(PathBuf::from("D:/logs/ai.log")));
+    }
+
+    #[test]
+    fn ai_log_entry_is_one_escaped_line() {
+        let at = time::macros::datetime!(2026-10-17 08:30:05 UTC);
+        let mut out = Vec::new();
+        let prompt = "line one\nline two \"quoted\" — Ўзбек";
+        write_ai_log_entry(&mut out, at, "pool chat 7", format_args!("prompt (max_tokens=8): {prompt:?}")).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "2026-10-17 08:30:05Z [pool chat 7] prompt (max_tokens=8): \"line one\\nline two \\\"quoted\\\" — Ўзбек\"\n"
+        );
+    }
 
     const MB: u64 = 1024 * 1024;
     // ~20 GB DEVICE_LOCAL heap a 7900 XT reports (see Vk::device_local_vram_mb doc).

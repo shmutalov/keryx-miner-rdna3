@@ -50,10 +50,14 @@ pub struct Opt {
 
     #[clap(
         long = "log-ai",
-        help = "Log the prompt and answer of every inference, private requests included (also KERYX_LOG_AI=1)",
+        value_name = "FILE",
+        min_values = 0,
+        require_equals = true,
+        default_missing_value = "1",
+        help = "Append the prompt and answer of every inference, private requests included, to FILE (bare --log-ai: ai-requests.log next to the miner; also KERYX_LOG_AI=1 or =FILE)",
         help_heading = "OPoI / Inference"
     )]
-    pub log_ai: bool,
+    pub log_ai: Option<String>,
 
     #[clap(
         long = "models-dir",
@@ -236,5 +240,22 @@ impl Opt {
         } else {
             LevelFilter::Info
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Opt;
+    use clap::Parser;
+
+    #[test]
+    fn log_ai_takes_an_optional_file() {
+        let parse = |args: &[&str]| Opt::try_parse_from([&["keryx-miner"], args].concat()).unwrap();
+        assert_eq!(parse(&[]).log_ai, None);
+        assert_eq!(parse(&["--log-ai"]).log_ai.as_deref(), Some("1"));
+        assert_eq!(parse(&["--log-ai=D:/logs/ai.log"]).log_ai.as_deref(), Some("D:/logs/ai.log"));
+        // A bare --log-ai never swallows the next argument.
+        let opt = parse(&["--log-ai", "--worker", "rig1"]);
+        assert_eq!((opt.log_ai.as_deref(), opt.worker.as_str()), (Some("1"), "rig1"));
     }
 }

@@ -357,13 +357,16 @@ async fn run() -> Result<(), Error> {
     if let Some(dir) = opt.models_dir.as_ref() {
         std::env::set_var("KERYX_MODELS_DIR", dir);
     }
-    // Same for --log-ai: slm::ai_log_enabled reads KERYX_LOG_AI.
-    if opt.log_ai {
-        std::env::set_var("KERYX_LOG_AI", "1");
+    // Same for --log-ai: slm::ai_log_path reads KERYX_LOG_AI.
+    if let Some(file) = opt.log_ai.as_ref() {
+        std::env::set_var("KERYX_LOG_AI", file);
     }
     env_logger::builder().filter_level(opt.log_level()).parse_default_env().init();
-    if keryx_miner::slm::ai_log_enabled() {
-        warn!("AI log on (--log-ai / KERYX_LOG_AI): every inference prompt and answer is logged, private requests included.");
+    if let Some(path) = keryx_miner::slm::ai_log_path() {
+        warn!(
+            "AI log on (--log-ai / KERYX_LOG_AI): every inference prompt and answer, private requests included, is appended to {}",
+            std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()).display()
+        );
     }
     // Shut down cleanly on SIGINT/SIGTERM (Ctrl-C on Windows) — supervisors stop the miner with
     // SIGTERM, which previously had no handler and required SIGKILL.
