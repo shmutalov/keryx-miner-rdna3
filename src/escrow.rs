@@ -1714,20 +1714,6 @@ fn escrow_delegation_message(escrow_pubkey: &[u8; 32]) -> [u8; 32] {
     finalize32(h)
 }
 
-/// Service-ledger identity of a payout address — mirror of the node's `miner_key(spk)`:
-/// blake2b-256 keyed "TransactionHash" over `[version_le(2), p2pk_script]`. This is what the
-/// node reports strikes, burns and suspensions against; the escrow key is only the hot key.
-pub fn service_identity_hex(payout_address: &str) -> Result<String, String> {
-    let (version, payout_key) = decode_address(payout_address)?;
-    if version != 0 {
-        return Err(format!("Payout address version {} has no service identity (schnorr P2PK only)", version));
-    }
-    let mut h = Blake2bParams::new().hash_length(32).key(b"TransactionHash").to_state();
-    h.update(&version.to_le_bytes());
-    h.update(&build_p2pk_script(&payout_key));
-    Ok(hex::encode(finalize32(h)))
-}
-
 /// Verifies a delegation cert exactly the way the node does before accepting a block: schnorr
 /// over the domain-hashed escrow key, by the x-only key of the payout address.
 pub fn verify_escrow_cert(payout_address: &str, escrow_pubkey_hex: &str, cert_hex: &str) -> Result<(), String> {
@@ -1800,18 +1786,6 @@ mod tests {
 
     /// Payout address of the private key `0x11..11`, used as a payout key below.
     const TEST_PAYOUT_ADDRESS: &str = "keryx:qp8n2k7uklxq4aegau7vawtptkgxsja4kt99lpv6krctwpq8tpc65uyeddvzr";
-
-    /// The service identity must equal the node's `miner_key(spk)`. The expected value is derived
-    /// independently of this code: blake2b-256 keyed "TransactionHash" over
-    /// `[version_le(2), 0x20 || key || 0xac]`.
-    #[test]
-    fn service_identity_matches_the_node_miner_key() {
-        assert_eq!(
-            service_identity_hex("keryx:qrxpcusyrxjxghfdumcxm2rqw4dhe3n9hyqpvgn2wfyldltf99w2xhnajuhte").unwrap(),
-            "cb79bef02d429e0fc8bb2335bf43d9d0df4f5bd6a25a39747d700b173e766e20"
-        );
-        assert!(service_identity_hex("not-an-address").is_err());
-    }
 
     /// Cross-implementation vector. This cert was produced by the web wallet (noble schnorr over
     /// noble blake2b) for escrow key `0x22..22` and the address of private key `0x11..11`. The
