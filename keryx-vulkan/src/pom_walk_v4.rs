@@ -6,7 +6,8 @@
 //! entries) + `addrs` (one device address per segment) — so the same kernel serves the miner's
 //! streamed blob (segments = its power-of-two shards) and the zero-dup walk over the inference
 //! engine's tensors (segments = tensors). A host-built bucket LUT turns the per-chunk segment
-//! search into a short forward scan.
+//! search into a short forward scan, and its [`V4_LUT_SCAN`] bit tells the matrix-core walk when
+//! a whole tile lies in the bucket's segment (nearly always), so it skips the scan.
 
 use crate::{GpuBuffer, Kernel, Vk};
 use std::io::Cursor;
@@ -61,6 +62,10 @@ const V4_MAX_DISPATCH_NONCES: u32 = 1 << 15;
 /// Bucket LUT ceiling (u32 entries): 4 MiB covers the largest tier (~0.93 G chunks) with
 /// 1024-chunk buckets.
 const V4_LUT_MAX_ENTRIES: u64 = 1 << 20;
+
+/// LUT entry bit 31 (`V4_LUT_SCAN` in pom_walk_v4.comp): the bucket's segment ends before every
+/// tile starting in the bucket does, so a lookup must scan. Bits 0..30 are the segment.
+const V4_LUT_SCAN: u32 = 1 << 31;
 
 const NO_WINNER: u32 = 0xFFFF_FFFF;
 
@@ -167,7 +172,8 @@ impl PomWalkV4 {
         if n_tiles == 0 {
             return Err(format!("v4 walk: blob too small ({n_chunks} chunks, need >= {V4_TILE_CHUNKS})"));
         }
-        let t_count = u32::try_from(t).map_err(|_| "v4 walk: too many segments")?;
+        // Segment indices share their LUT word with the V4_LUT_SCAN bit.
+        let t_count = u32::try_from(t).ok().filter(|&n| n <= V4_LUT_SCAN).ok_or("v4 walk: too many segments")?;
         let (lut, lut_sh) = build_lut(prefix);
 
         let push_size = std::mem::size_of::<V4Push>() as u32;
@@ -349,7 +355,9 @@ impl PomWalkV4 {
 }
 
 /// Bucket LUT over the canonical chunk range: `lut[b]` = the segment holding chunk `b << sh`,
-/// with `sh` the smallest shift that keeps the table within [`V4_LUT_MAX_ENTRIES`].
+/// with `sh` the smallest shift that keeps the table within [`V4_LUT_MAX_ENTRIES`], plus
+/// [`V4_LUT_SCAN`] where that segment ends inside the bucket — or, when buckets are smaller than
+/// a tile, inside the tile starting at the bucket (the only tile a walk looks up from it).
 fn build_lut(prefix: &[u64]) -> (Vec<u32>, u32) {
     let t = prefix.len() - 1;
     let n_chunks = prefix[t];
@@ -365,7 +373,8 @@ fn build_lut(prefix: &[u64]) -> (Vec<u32>, u32) {
         while s + 1 < t && prefix[s + 1] <= first {
             s += 1;
         }
-        lut.push(s as u32);
+        let end = (first + (1 << sh)).max(first + V4_TILE_CHUNKS).min(n_chunks);
+        lut.push(s as u32 | if prefix[s + 1] < end { V4_LUT_SCAN } else { 0 });
     }
     (lut, sh)
 }
@@ -399,7 +408,7 @@ mod tests {
         let (lut, sh) = build_lut(&prefix);
         let t = prefix.len() - 1;
         for idx in 0..prefix[t] {
-            let mut lo = lut[(idx >> sh) as usize] as usize;
+            let mut lo = (lut[(idx >> sh) as usize] & !V4_LUT_SCAN) as usize;
             while lo + 1 < t && prefix[lo + 1] <= idx {
                 lo += 1;
             }
@@ -408,6 +417,32 @@ mod tests {
             // the next start must be past it.
             assert!(prefix[lo] <= idx && idx < prefix[lo + 1], "chunk {idx}: segment {lo}");
             assert_eq!(prefix[want], prefix[lo], "chunk {idx}");
+        }
+    }
+
+    /// An entry without V4_LUT_SCAN names a segment that holds every tile starting in its bucket —
+    /// with 1-chunk buckets (sh = 0) as well as multi-tile ones — and flags stay rare.
+    #[test]
+    fn lut_scan_bit_marks_every_bucket_a_tile_can_leave() {
+        // 40 K chunks with tiny and empty segments up front (sh = 0, 1-chunk buckets), and a 4 GiB
+        // table with an empty segment and a start on a bucket boundary (sh = 7, 4 tiles a bucket).
+        let small = vec![0u64, 1, 4, 41, 42, 42, 1042, 1047, 5143, 5174, 15_174, 40_000];
+        let wide = vec![0u64, 3_000_000, 3_000_000, 3_000_017, 70_000_000, 134_217_728];
+        for prefix in [small, wide] {
+            let (lut, sh) = build_lut(&prefix);
+            let t = prefix.len() - 1;
+            let n_tiles = prefix[t] / V4_TILE_CHUNKS;
+            let mut flagged = 0;
+            for tile in 0..n_tiles {
+                let t0 = tile * V4_TILE_CHUNKS;
+                let e = lut[(t0 >> sh) as usize];
+                flagged += (e & V4_LUT_SCAN != 0) as u64;
+                if e & V4_LUT_SCAN == 0 {
+                    let lo = e as usize;
+                    assert!(prefix[lo] <= t0 && t0 + V4_TILE_CHUNKS <= prefix[lo + 1], "sh {sh}: tile {tile} leaves segment {lo}");
+                }
+            }
+            assert!(flagged * 100 < n_tiles, "sh {sh}: {flagged} of {n_tiles} tiles flagged");
         }
     }
 

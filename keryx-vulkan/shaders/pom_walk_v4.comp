@@ -31,6 +31,7 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
 #extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
 #endif
 
 // Nonces per workgroup. 1 measured fastest on a 7900 XT (1.12 M/s vs 0.99 at 2, 0.95 at 4, 0.91 at
@@ -78,9 +79,13 @@ layout(std430, binding = 0) buffer Io {
 layout(std430, binding = 1) readonly buffer Prefix { uint64_t p[]; } PREFIX;
 // Binding 2: one GPU device address per segment, in segment order.
 layout(std430, binding = 2) readonly buffer Addrs { uint64_t a[]; } ADDRS;
-// Binding 3: bucket LUT — LUT.s[b] = the segment holding chunk (b << lut_sh). A chunk's segment is
-// found by a short forward scan from its bucket's entry (identical result to a binary search).
+// Binding 3: bucket LUT — bits 0..30 of LUT.s[b] = the segment holding chunk (b << lut_sh). A
+// chunk's segment is found by a short forward scan from its bucket's entry (identical result to a
+// binary search). Bit 31 (V4_LUT_SCAN) is set where that segment ends before the bucket does (or,
+// with buckets smaller than a tile, before the tile starting at the bucket does): a clear bit
+// means every tile starting in the bucket lies in that one segment.
 layout(std430, binding = 3) readonly buffer Lut { uint s[]; } LUT;
+#define V4_LUT_SCAN 0x80000000u
 // Binding 4: per-nonce walk seeds written by the `pom_seed_v4.comp` pre-pass (batch offset index).
 layout(std430, binding = 4) readonly buffer Seeds { uint64_t s[]; } SEEDS;
 
@@ -134,14 +139,13 @@ uint64_t mulhi64(uint64_t a, uint64_t b) {
     return ((uint64_t(h11) << 32) | uint64_t(l11)) + uint64_t(h01) + uint64_t(h10) + (mid >> 32);
 }
 
-// x % n_tiles, exact: q = floor(x * inv / 2^64) never exceeds floor(x / n), so r >= 0, and it
-// undershoots by at most 2, so the correction loop runs at most twice.
+// x % n_tiles, exact: with 2^64 - 1 = inv*n + e (0 <= e < n), x * inv / 2^64 = x/n - x(1 + e) /
+// (n 2^64), which is <= x/n and > x/n - 1, so q = floor(x * inv / 2^64) is floor(x/n) or one less:
+// 0 <= r < 2n, and one conditional subtract (a select; a correction loop stalls on its back-branch)
+// finishes it.
 uint64_t mod_tiles(uint64_t x) {
-    uint64_t r = x - mulhi64(x, pc.inv_n) * pc.n_tiles;
-    while (r >= pc.n_tiles) {
-        r -= pc.n_tiles;
-    }
-    return r;
+    const uint64_t r = x - mulhi64(x, pc.inv_n) * pc.n_tiles;
+    return r >= pc.n_tiles ? r - pc.n_tiles : r;
 }
 
 // rho8 — the murmur-style byte reduction (`pom_v3::rho8`). Only bits 0..7 and 13..20 of the second
@@ -208,7 +212,7 @@ void b3_one_block(uint m[16], uint block_len, out uint h[8]) {
 
 // The 4 u64 words of canonical chunk `idx`: segment from the bucket LUT + forward scan.
 Seg chunk_ptr(uint64_t idx) {
-    uint lo = LUT.s[uint(idx >> pc.lut_sh)];
+    uint lo = LUT.s[uint(idx >> pc.lut_sh)] & ~V4_LUT_SCAN;
     while (lo + 1u < pc.t_count && PREFIX.p[lo + 1u] <= idx) {
         lo++;
     }
@@ -245,6 +249,30 @@ void report(uint64_t fin, uint i) {
 #define CM_A coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
 #define CM_B coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
 #define CM_ELEMS 8u // accumulator elements per invocation: 256 over the host-pinned wave32
+
+// Column x of tile `off` (canonical chunk off*32 + x). off is wave-uniform, so the segment is
+// resolved once on the scalar unit: an entry without V4_LUT_SCAN names the segment holding the
+// whole tile, and the address needs only PREFIX[lo] and ADDRS[lo], both read together. A flagged
+// bucket scans forward (PREFIX[T] = n_chunks is past every tile, so lo stays below T); only a
+// tile that straddles a segment start — a handful per table — takes the per-lane lookup.
+void load_column(uint64_t off, uint x, out uint64_t w0, out uint64_t w1, out uint64_t w2, out uint64_t w3) {
+    const uint64_t t0 = off * 32UL;
+    const uint e = LUT.s[uint(t0 >> pc.lut_sh)];
+    uint lo = e & ~V4_LUT_SCAN;
+    Seg c;
+    if (e < V4_LUT_SCAN) {
+        c = Seg(ADDRS.a[lo] + (t0 - PREFIX.p[lo]) * 32UL + uint64_t(x * 32u));
+    } else {
+        uint64_t p1 = PREFIX.p[lo + 1u];
+        while (p1 <= t0) {
+            lo++;
+            p1 = PREFIX.p[lo + 1u];
+        }
+        c = t0 + 31UL < p1 ? Seg(ADDRS.a[lo] + (t0 - PREFIX.p[lo]) * 32UL + uint64_t(x * 32u))
+                           : chunk_ptr(t0 + uint64_t(x));
+    }
+    w0 = c.words[0]; w1 = c.words[1]; w2 = c.words[2]; w3 = c.words[3];
+}
 
 void main() {
     const uint x = gl_LocalInvocationID.x;     // state row == tile column this invocation loads
@@ -289,30 +317,38 @@ void main() {
     // Prefetch tile 1's column x into registers.
     uint64_t off = mod_tiles(mix64(seed ^ V4_OFFSET_FIRST_SALT));
     uint64_t w0, w1, w2, w3;
-    {
-        Seg c = chunk_ptr(off * 32UL + uint64_t(x));
-        w0 = c.words[0]; w1 = c.words[1]; w2 = c.words[2]; w3 = c.words[3];
-    }
+    load_column(off, x, w0, w1, w2, w3);
     barrier(); // the probe is read before the first tile overwrites it
 
+    uint64_t step_salt = V4_OFFSET_STEP_SALT; // (step + 1) * V4_OFFSET_STEP_SALT once advanced
     for (uint step = 1u; step <= 256u; step++) {
         const uint col = x * CM_TS;
         s_mem[col + 0u] = uint(w0); s_mem[col + 1u] = uint(w0 >> 32);
         s_mem[col + 2u] = uint(w1); s_mem[col + 3u] = uint(w1 >> 32);
         s_mem[col + 4u] = uint(w2); s_mem[col + 5u] = uint(w2 >> 32);
         s_mem[col + 6u] = uint(w3); s_mem[col + 7u] = uint(w3 >> 32);
-        barrier();
 
-        // Next offset from THIS tile's snippet (column 0 = its first 8 words); the next tile's
-        // load is in flight during the transition.
+        // Next offset from THIS tile's snippet — its first 32 bytes: column 0, lane 0's w0..w3
+        // (invocation x is lane x of the one wave32 subgroup) — taken from registers, so the
+        // scalar chain runs while the stores drain instead of after an LDS round trip.
         if (step < 256u) {
+            const uint sn[8] = uint[8](
+                subgroupBroadcastFirst(uint(w0)), subgroupBroadcastFirst(uint(w0 >> 32)),
+                subgroupBroadcastFirst(uint(w1)), subgroupBroadcastFirst(uint(w1 >> 32)),
+                subgroupBroadcastFirst(uint(w2)), subgroupBroadcastFirst(uint(w2 >> 32)),
+                subgroupBroadcastFirst(uint(w3)), subgroupBroadcastFirst(uint(w3 >> 32)));
             uint64_t sf = 0UL;
             [[unroll]] for (uint w = 0u; w < 8u; w++) {
-                sf = mix64(sf ^ uint64_t(s_mem[w]));
+                sf = mix64(sf ^ uint64_t(sn[w]));
             }
-            off = mod_tiles(mix64(seed ^ (uint64_t(step + 1u) * V4_OFFSET_STEP_SALT) ^ sf));
-            Seg c = chunk_ptr(off * 32UL + uint64_t(x));
-            w0 = c.words[0]; w1 = c.words[1]; w2 = c.words[2]; w3 = c.words[3];
+            step_salt += V4_OFFSET_STEP_SALT;
+            off = mod_tiles(mix64(seed ^ step_salt ^ sf));
+        }
+        // Ahead of the next tile's load: after it, the barrier would wait for that load to land.
+        barrier();
+        // The next tile's load is in flight during the transition.
+        if (step < 256u) {
+            load_column(off, x, w0, w1, w2, w3);
         }
 
         // B[kb][jb]: rows k = 16kb.., columns j = 16jb.. — column j is tile column j.
