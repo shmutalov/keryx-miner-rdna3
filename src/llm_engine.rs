@@ -18,7 +18,7 @@ use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 use llama_cpp_sys_2::{
@@ -383,9 +383,7 @@ impl LlamaEngine {
         let _serialize = self.lock.lock().unwrap_or_else(|p| p.into_inner());
         let backend = backend()?;
 
-        // str_to_token parses special tokens (the template's control tokens) and AddBos
-        // lets the tokenizer add BOS iff the model wants one — llama-server semantics.
-        let tokens = self.model.str_to_token(&prompt, AddBos::Always)?;
+        let tokens = self.tokenize(prompt, true);
         if tokens.is_empty() {
             return Err(anyhow!("llm-engine: the prompt tokenized to nothing"));
         }
@@ -419,16 +417,10 @@ impl LlamaEngine {
         for _ in 0..budget {
             let token = sampler.sample(&ctx, batch.n_tokens() - 1);
             sampler.accept(token);
-            if self.model.is_eog_token(token) {
+            if self.model.vocab().is_eog(token) {
                 break;
             }
-            // token_to_piece_bytes errors with the needed size when the hint is too small.
-            let piece = match self.model.token_to_piece_bytes(token, 32, false, None) {
-                Err(llama_cpp_2::TokenToStringError::InsufficientBufferSpace(need)) => {
-                    self.model.token_to_piece_bytes(token, (-need) as usize, false, None)
-                }
-                x => x,
-            }?;
+            let piece = self.model.vocab().token_to_piece(token, false, None);
             out.extend_from_slice(&piece);
             if let Some(cut) = find_stop(&out, piece.len(), stop_strings) {
                 out.truncate(cut);
@@ -487,9 +479,15 @@ impl LlamaEngine {
         self.new_context_batched(backend, n_ctx, TRACE_UBATCH, TRACE_UBATCH)
     }
 
+    /// `text` as tokens: special tokens parsed (the templates' control tokens), and with `bos` a BOS
+    /// added iff the model wants one — llama-server semantics.
+    fn tokenize(&self, text: &str, bos: bool) -> Vec<LlamaToken> {
+        self.model.vocab().tokenize(text.as_bytes(), bos, true)
+    }
+
     /// The token fed as padding: a newline, else the end-of-sequence token.
     fn pad_token(&self) -> LlamaToken {
-        self.model.str_to_token("\n", AddBos::Never).ok().and_then(|t| t.first().copied()).unwrap_or_else(|| self.model.token_eos())
+        self.tokenize("\n", false).first().copied().unwrap_or_else(|| self.model.vocab().eos())
     }
 
     /// Token ids from the miner, checked against the vocabulary.
@@ -518,13 +516,13 @@ impl LlamaEngine {
         answer_bytes_per_position: u32,
         n_ctx: impl Fn(usize) -> u32,
     ) -> Result<TracedGeneration> {
-        let mut toks = self.model.str_to_token(prompt, AddBos::Always)?;
+        let mut toks = self.tokenize(prompt, true);
         if let Some(p) = &prefix {
             if toks.len() != p.head_tokens as usize {
                 return Err(PromptHeadMismatch(format!("the prompt head tokenizes to {} tokens, {} expected", toks.len(), p.head_tokens)).into());
             }
             toks.extend(self.vocab_tokens(p.tokens)?);
-            toks.extend(self.model.str_to_token(p.rest, AddBos::Never)?);
+            toks.extend(self.tokenize(p.rest, false));
         }
         let pad = self.pad_token();
         if toks.len() < min_prompt as usize {
@@ -553,15 +551,10 @@ impl LlamaEngine {
             for _ in 0..budget {
                 let token = sampler.sample(&ctx, batch.n_tokens() - 1);
                 sampler.accept(token);
-                if self.model.is_eog_token(token) {
+                if self.model.vocab().is_eog(token) {
                     break;
                 }
-                let piece = match self.model.token_to_piece_bytes(token, 32, false, None) {
-                    Err(llama_cpp_2::TokenToStringError::InsufficientBufferSpace(need)) => {
-                        self.model.token_to_piece_bytes(token, (-need) as usize, false, None)
-                    }
-                    x => x,
-                }?;
+                let piece = self.model.vocab().token_to_piece(token, false, None);
                 out.extend_from_slice(&piece);
                 fed.push(token);
                 feed_traced(&mut ctx, &mut batch, &[token], fed.len() - 1, Some(fed.len() - 1))?;
@@ -894,7 +887,7 @@ mod tests {
             "<|im_start|>user\n{filler}\nHow many times does the word fox appear above? Answer in one short sentence.<|im_end|>\n\
              <|im_start|>assistant\n<think>\n\n</think>\n\n"
         );
-        let n = engine.model.str_to_token(&prompt, AddBos::Always).unwrap().len();
+        let n = engine.tokenize(&prompt, true).len();
         assert!(n > N_BATCH as usize, "prompt of {n} tokens fits one batch");
         let out = engine.generate(&prompt, 48, &[]).expect("generate over a multi-batch prompt");
         eprintln!("{n}-token prompt → {out:?}");
@@ -932,7 +925,7 @@ mod tests {
             let mut mp = llama_cpp_sys_2::llama_model_default_params();
             mp.n_gpu_layers = i32::MAX;
             mp.no_alloc = true;
-            mp.use_mmap = false; // llama.cpp asserts no_alloc never maps host-pointer buffers
+            mp.load_mode = llama_cpp_sys_2::LLAMA_LOAD_MODE_NONE; // llama.cpp asserts no_alloc never maps host-pointer buffers
             let model = llama_cpp_sys_2::llama_model_load_from_file(path.as_ptr(), mp);
             assert!(!model.is_null(), "metadata load failed for {gguf}");
             eprintln!("DRYRUN model {gguf}: tensors {:.1} MiB", llama_cpp_sys_2::llama_model_size(model) as f64 / 1048576.0);

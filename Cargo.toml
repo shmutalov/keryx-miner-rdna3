@@ -80,17 +80,17 @@ anyhow = "1"
 # the engine's own resident weight buffers (zero-dup). Pulled from our fork branch carrying ONLY
 # the keryx ggml exports (raw handles, tensor BDA, guarded queue submit) and the canonical trace
 # of H15 verifiable inference (ggml_backend_vk_keryx_trace_*, plus the exact q8 sum in the
-# Q4_K/Q5_K mmvq min term) via the patched llama.cpp submodule, rebased onto upstream 0.1.151 —
-# the windows-gnu vulkan build fixes (PR utilityai/llama-cpp-rs#1060) are upstream as of that
-# release and no longer carried here.
+# Q4_K/Q5_K mmvq min term) via the patched llama.cpp submodule, rebased onto upstream 0.1.160
+# (llama.cpp 0.6.0) — the windows-gnu vulkan build fixes (PR utilityai/llama-cpp-rs#1060) are
+# upstream as of 0.1.151 and no longer carried here.
 # default-features = false drops `common` (avoids upstream issue #1059's unlinked build-info
 # objects — we only need core llama: load, chat template, tokenize, greedy decode) and `openmp`
 # (no libgomp runtime dep; all layers run on the GPU anyway).
-# Pinned by rev (branch: keryx-trace-0.1.151): Cargo.lock is gitignored in this repo, so a
+# Pinned by rev (branch: keryx-trace-0.1.160): Cargo.lock is gitignored in this repo, so a
 # branch reference would float — the rev makes release builds reproducible.
-llama-cpp-2 = { git = "https://github.com/shmutalov/llama-cpp-rs", rev = "cd76ed52e133e6d3f9f433b9fa35ad781b5fdd03", default-features = false, features = ["vulkan"] }
+llama-cpp-2 = { git = "https://github.com/shmutalov/llama-cpp-rs", rev = "9a7c47a767c262d2aaa8d045e678bcdc7f587b38", default-features = false, features = ["vulkan"] }
 # Direct sys-crate access for the keryx FFI exports — llama-cpp-2 does not re-export its sys crate.
-llama-cpp-sys-2 = { git = "https://github.com/shmutalov/llama-cpp-rs", rev = "cd76ed52e133e6d3f9f433b9fa35ad781b5fdd03", default-features = false }
+llama-cpp-sys-2 = { git = "https://github.com/shmutalov/llama-cpp-rs", rev = "9a7c47a767c262d2aaa8d045e678bcdc7f587b38", default-features = false }
 time = { version = "0.3", features = ["formatting", "macros"] }
 flate2 = "1.0"
 tar = "0.4"
