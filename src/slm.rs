@@ -1047,33 +1047,42 @@ mod tests {
         assert!(!pom_fits(4_000 * MB, 5_000, 10_023));
     }
 
+    /// The tier and model the GPU trace tests run: `KERYX_TEST_TIER` (default 0), whose model
+    /// `KERYX_TEST_GGUF` must be.
+    fn test_tier() -> (u8, &'static crate::models::ModelSpec) {
+        use crate::models::Tier;
+        let tier: u8 = std::env::var("KERYX_TEST_TIER").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let t = [Tier::VeryLight, Tier::Light, Tier::Default, Tier::High, Tier::VeryHigh][tier as usize];
+        (tier, crate::models::pom_model_for_tier(u64::MAX, t).expect("the tier's model"))
+    }
+
     /// The stage-2 self-check the miner runs before it traces: a traced answer and a block task on
     /// this GPU, replayed, opened under two seeds and verified exactly as the node verifies. Run with:
-    ///   KERYX_TEST_GGUF=<tier-0 model.gguf> cargo test --release --lib -- --ignored --nocapture stage2_trace_self_check
+    ///   [KERYX_TEST_TIER=<0..4>] KERYX_TEST_GGUF=<that tier's model.gguf> cargo test --release --lib -- --ignored --nocapture stage2_trace_self_check
     #[test]
-    #[ignore = "loads the tier-0 GGUF onto the GPU; set KERYX_TEST_GGUF to run"]
+    #[ignore = "loads a tier model onto the GPU; set KERYX_TEST_GGUF (and KERYX_TEST_TIER) to run"]
     fn stage2_trace_self_check() {
         let _ = env_logger::builder().is_test(true).filter_level(log::LevelFilter::Info).parse_default_env().try_init();
         let Ok(gguf) = std::env::var("KERYX_TEST_GGUF") else {
             eprintln!("SKIP: KERYX_TEST_GGUF not set");
             return;
         };
-        let spec = &crate::models::QWEN3_5_9B_ABLITERATED;
+        let (tier, spec) = test_tier();
         let path = gguf.clone();
         assert!(crate::pom::get_or_build_index(&spec.model_id, move || crate::pom::WeightIndex::build_from_gguf(&path)));
         let engine = super::InferenceEngine::launch(&gguf).expect("engine launch");
-        let raw = crate::trace::TierManifest::raw_chain(0).expect("tier-0 manifest");
+        let raw = crate::trace::TierManifest::raw_chain(tier).expect("the tier's manifest");
         engine.trace_configure(raw, 2_048).expect("trace configure");
         let t0 = std::time::Instant::now();
-        super::chain_self_check(spec, &engine, 0).expect("stage-2 self-check");
+        super::chain_self_check(spec, &engine, tier).expect("stage-2 self-check");
         eprintln!("stage-2 self-check passed in {:.1} s", t0.elapsed().as_secs_f64());
     }
 
     /// Openings under many seeds, the way production traces: a shape-padded answer to a long prompt
     /// (so the draws reach generated positions, the head and the padding) and the block task. Run with:
-    ///   KERYX_TEST_GGUF=<tier-0 model.gguf> [KERYX_TEST_SEEDS=48] cargo test --release --lib -- --ignored --nocapture stage2_openings_many_seeds
+    ///   [KERYX_TEST_TIER=<0..4>] KERYX_TEST_GGUF=<that tier's model.gguf> [KERYX_TEST_SEEDS=48] cargo test --release --lib -- --ignored --nocapture stage2_openings_many_seeds
     #[test]
-    #[ignore = "loads the tier-0 GGUF onto the GPU; set KERYX_TEST_GGUF to run"]
+    #[ignore = "loads a tier model onto the GPU; set KERYX_TEST_GGUF (and KERYX_TEST_TIER) to run"]
     fn stage2_openings_many_seeds() {
         use crate::trace::{chain_ctx, prefix_tokens, verify_chain_opening, ResponseTrace, TierManifest, TraceRecord};
         use keryx_verifiable_inference::block_task::{draw_seed, task_bytes, task_prefix, task_tokens, verify_block_task, TASK_LEN};
@@ -1084,14 +1093,14 @@ mod tests {
             return;
         };
         let n_seeds: u32 = std::env::var("KERYX_TEST_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(48);
-        let spec = &crate::models::QWEN3_5_9B_ABLITERATED;
+        let (tier, spec) = test_tier();
         let path = gguf.clone();
         assert!(crate::pom::get_or_build_index(&spec.model_id, move || crate::pom::WeightIndex::build_from_gguf(&path)));
         let index = crate::pom::index_for(&spec.model_id).unwrap();
         let engine = super::InferenceEngine::launch(&gguf).expect("engine launch");
-        let raw = TierManifest::raw_chain(0).unwrap();
-        let m = TierManifest::for_chain(0).unwrap();
-        let (ctx, pctx) = chain_ctx(0).unwrap();
+        let raw = TierManifest::raw_chain(tier).unwrap();
+        let m = TierManifest::for_chain(tier).unwrap();
+        let (ctx, pctx) = chain_ctx(tier).unwrap();
         let tier_ctx = m.tier_ctx(index);
         engine.trace_configure(raw, 4_096).expect("trace configure");
 
@@ -1115,7 +1124,7 @@ mod tests {
         let mut failed = Vec::new();
         for s in 0..n_seeds {
             let seed = *blake3::hash(&s.to_le_bytes()).as_bytes();
-            let res = super::open_chain(&engine, 0, &m, &pctx, &trace, &seed, &request_hash, [0u8; 32], index, n_ctx)
+            let res = super::open_chain(&engine, tier, &m, &pctx, &trace, &seed, &request_hash, [0u8; 32], index, n_ctx)
                 .and_then(|body| verify_chain_opening(&tier_ctx, &ctx, &pctx, &trace.record, &seed, &request_hash, &body));
             if let Err(e) = res {
                 eprintln!("answer seed {s}: {e}");
@@ -1135,7 +1144,7 @@ mod tests {
             let block_hash = *blake3::hash(&(s + 1_000_000).to_le_bytes()).as_bytes();
             let res = super::open_chain(
                 &engine,
-                0,
+                tier,
                 &m,
                 &task_prefix(&pctx),
                 &task,
@@ -1161,7 +1170,7 @@ mod tests {
     /// Diagnostic: every plain/gated product at one position of the block task, x and y captured
     /// by a replay and the y of sampled rows recomputed from the committed x and the weights.
     #[test]
-    #[ignore = "loads the tier-0 GGUF onto the GPU; set KERYX_TEST_GGUF to run"]
+    #[ignore = "loads a tier model onto the GPU; set KERYX_TEST_GGUF (and KERYX_TEST_TIER) to run"]
     fn stage2_product_scan() {
         use keryx_verifiable_inference::{dot::canonical_dot, manifest, q8};
         let _ = env_logger::builder().is_test(true).filter_level(log::LevelFilter::Info).parse_default_env().try_init();
@@ -1170,15 +1179,15 @@ mod tests {
             return;
         };
         let t: u32 = std::env::var("KERYX_TEST_POS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
-        let spec = &crate::models::QWEN3_5_9B_ABLITERATED;
+        let (tier, spec) = test_tier();
         let path = gguf.clone();
         assert!(crate::pom::get_or_build_index(&spec.model_id, move || crate::pom::WeightIndex::build_from_gguf(&path)));
         let index = crate::pom::index_for(&spec.model_id).unwrap();
         let engine = super::InferenceEngine::launch(&gguf).expect("engine launch");
-        let raw = crate::trace::TierManifest::raw_chain(0).expect("tier-0 manifest");
-        let m = crate::trace::TierManifest::for_chain(0).unwrap();
+        let raw = crate::trace::TierManifest::raw_chain(tier).expect("the tier's manifest");
+        let m = crate::trace::TierManifest::for_chain(tier).unwrap();
         engine.trace_configure(raw, 2_048).expect("trace configure");
-        let (_, pctx) = crate::trace::chain_ctx(0).unwrap();
+        let (_, pctx) = crate::trace::chain_ctx(tier).unwrap();
         let task: Vec<i32> = keryx_verifiable_inference::block_task::task_tokens(&pctx.table, &[0x5au8; 32]).into_iter().map(|t| t as i32).collect();
         let n_ctx = crate::llm_engine::TASK_CONTEXT_TOKENS;
         let row_bytes = |e: &manifest::Entry, row: u64| -> Vec<u8> {
@@ -1190,7 +1199,7 @@ mod tests {
             b[off..off + e.row_bytes as usize].to_vec()
         };
         let np = m.n_products;
-        let (cctx, _) = crate::trace::chain_ctx(0).unwrap();
+        let (cctx, _) = crate::trace::chain_ctx(tier).unwrap();
         // Output-only products (the head, a trimmed last layer) have no leaves at a task position.
         let ranks: Vec<u32> = (0..np)
             .filter(|&r| {
@@ -1237,7 +1246,17 @@ mod tests {
                     let (y_hat, scale) = match e.glu_form {
                         manifest::FORM_NONE => {
                             let d = canonical_dot(e.wtype, &row_bytes(e, row), e.k as usize, x, q8::MMVQ).unwrap();
-                            (d.y_hat, d.scale)
+                            // A biased product commits its output after the bias add.
+                            let b = match e.bias {
+                                manifest::NONE => 0.0,
+                                bi => {
+                                    let be = m.entry(bi as u64);
+                                    let c = index.read_chunk_bytes(be.chunk_base + row * 4 / 32);
+                                    let o = (row * 4 % 32) as usize;
+                                    f32::from_le_bytes(c[o..o + 4].try_into().unwrap()) as f64
+                                }
+                            };
+                            (d.y_hat + b, d.scale + b.abs())
                         }
                         _ => {
                             let up = if e.glu_form == manifest::FORM_SPLIT { (e, row + m_out) } else { (m.entry(e.partner as u64), row) };
