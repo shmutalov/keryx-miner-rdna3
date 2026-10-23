@@ -143,7 +143,8 @@ fn shared_walk_matches_streamed_blob() {
     // 6c. PoM v5 (H15): the v4 walk over the weights and the tier's context pad (filled on the
     //     device of each walk), shared vs blob, each winner confirmed by the host walk over the
     //     GGUF: it passes and no nonce before it does. KERYX_TEST_TIER (default 0) picks the pad;
-    //     the model id is tier 0's.
+    //     the model id is tier 0's. The two walks hold their pads in turn: with this test's second
+    //     weight copy, two tier-1 pads would not fit a 20 GB card (the miner holds one of each).
     let tier: usize = std::env::var("KERYX_TEST_TIER").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let pad_seed = v5_pad_seed(tier as u8, &keryx_miner::models::QWEN3_5_9B_ABLITERATED.model_id, &idx.r_t);
     let pad_words = v5_pad_seed_words(&pad_seed);
@@ -160,7 +161,9 @@ fn shared_walk_matches_streamed_blob() {
         let mut target = [0xFFu8; 32];
         target[31] = msb;
         let a = shared.mine_v5(&v5_job(target), start, batch, &pad_words, pad_tiles).expect("shared v5 grind");
+        shared.release_pad();
         let b = blob.mine_v5(&v5_job(target), start, batch, &pad_words, pad_tiles).expect("blob v5 grind");
+        blob.release_pad();
         assert_eq!(a, b, "v5: winner mismatch at target msb {msb:#x}");
         let w = a.expect("a winner inside the batch");
         for n in start..=w {
@@ -191,7 +194,56 @@ fn shared_walk_matches_streamed_blob() {
     }
     timed(&format!("blob   v4 ({})", blob.v4_kernel()), &|s: u64| blob.mine_v4(&v4_job(none), s, batch));
     timed(&format!("shared v4 ({})", shared.v4_kernel()), &|s: u64| shared.mine_v4(&v4_job(none), s, batch));
+    // One pad at a time again, each filled by a one-nonce grind before it is timed.
+    blob.mine_v5(&v5_job(none), start, 1, &pad_words, pad_tiles).unwrap();
     timed("blob   v5", &|s: u64| blob.mine_v5(&v5_job(none), s, batch, &pad_words, pad_tiles).unwrap());
+    let blob_pad = blob.release_pad();
+    // The shared walk is what the miner runs: time it as the miner holds it, without this test's
+    // second weight copy (with it, a tier-1 pad overcommits a 20 GB card and is paged to host RAM).
+    drop(blob);
+    shared.mine_v5(&v5_job(none), start, 1, &pad_words, pad_tiles).unwrap();
     timed("shared v5", &|s: u64| shared.mine_v5(&v5_job(none), s, batch, &pad_words, pad_tiles).unwrap());
-    eprintln!("pads released: shared {} MiB, blob {} MiB", shared.release_pad() >> 20, blob.release_pad() >> 20);
+    eprintln!("pads released: shared {} MiB, blob {} MiB", shared.release_pad() >> 20, blob_pad >> 20);
+}
+
+/// The shared walk's v4/v5 rate with only what the miner holds on the card — the engine, its walk
+/// and one context pad — so no second weight copy can push the pad (or the weights) out of VRAM.
+///   KERYX_TEST_GGUF=<model.gguf> [KERYX_TEST_TIER=<0..4>] cargo test --release --test zero_dup -- --ignored --nocapture shared_walk_rate
+#[test]
+#[ignore = "loads a multi-GB GGUF on the GPU; set KERYX_TEST_GGUF to run"]
+fn shared_walk_rate() {
+    let Ok(gguf) = std::env::var("KERYX_TEST_GGUF") else {
+        eprintln!("SKIP: KERYX_TEST_GGUF not set");
+        return;
+    };
+    let tier: usize = std::env::var("KERYX_TEST_TIER").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let engine = LlamaEngine::launch(&gguf).expect("engine launch");
+    let (shared, _) = engine.build_shared_walk().expect("shared walk");
+    let pad_words = v5_pad_seed_words(&[0x3cu8; 32]);
+    let pad_tiles = POM_V5_PAD_TILES_H14[tier];
+    let pph = [0x5au8; 32];
+    let ts: u64 = 1_790_000_000_000;
+    let job = V4Job {
+        pow_words: pph_words_for_era(&pph, true),
+        seed_words: pph_words_v4(&pph),
+        timestamp: ts,
+        h10_state: pom_seed_state_v4_era(&pph, ts, u64::MAX),
+        target_le: [0u8; 32],
+    };
+    let (start, batch, rounds) = (0x1234_0000_0000u64, 1u32 << 16, 8u64);
+    let rate = |f: &dyn Fn(u64)| {
+        f(start); // warm-up (and, for v5, the pad fill)
+        let t0 = std::time::Instant::now();
+        for r in 1..=rounds {
+            f(start + r * batch as u64);
+        }
+        (rounds * batch as u64) as f64 / t0.elapsed().as_secs_f64() / 1e6
+    };
+    eprintln!("shared v4 ({}): {:.2} MH/s", shared.v4_kernel(), rate(&|s| {
+        shared.mine_v4(&job, s, batch);
+    }));
+    eprintln!("shared v5 (tier {tier} pad, {} tiles): {:.2} MH/s", pad_tiles, rate(&|s| {
+        shared.mine_v5(&job, s, batch, &pad_words, pad_tiles).expect("v5 grind");
+    }));
+    eprintln!("pad released: {} MiB", shared.release_pad() >> 20);
 }
