@@ -89,8 +89,8 @@ on first run (same as upstream).
 which stays in VRAM next to the weights: 0.6 GiB for tier 0, 6.2 GiB for tier 3. Qwen3.8-27B plus
 its pad no longer fits a 20 GB card. `--h15-tier <very-light|light|default|high|very-high>` keeps the
 tier flag until the gate and mines and serves the given tier from it on, e.g.
-`--high --h15-tier light` (tier 1, GLM-4-9B: 10.8 GiB with its pad). The H15 trace and the v5 walk are
-validated on a 7900 XT for tiers 0 and 1 (about 1.65 M nonces/s on both).
+`--high --h15-tier light` (tier 1, GLM-4-9B: 10.8 GiB with its pad). The v5 walk is validated on a
+7900 XT for tiers 0 and 1 (about 1.65 M nonces/s on both).
 
 ### Consensus this build mines
 
@@ -111,17 +111,16 @@ Pool miners get the opened prompt from the pool (`mining.ai_request`), and legac
 inference tasks are ignored past the gate.
 
 **H15 (verifiable inference; mainnet DAA 140,115,000 ≈ 2026-10-30, testnet 3,500)** — the rules of
-keryx-node v1.6.5:
+keryx-node master after v1.6.5 (17aa67ca, the coming 1.6.6):
 - **PoM v5**: the walk also reads the tier's context pad (`pom_v5`), which the GPU fills from its
   seed. A share of the steps lands on pad tiles, and each next offset folds in the walk state.
-- **Block task**: every header commits a `task_root`, the trace of a 32-token task of the tier model
-  (one per 64-DAA window), and the block's proof opens it. Pool jobs arrive as stratum v4 (the full
-  header plus the window seed), and shares carry the task root.
-- **Verifiable inference**: solo answers are traced. They commit per-position BLAKE3 leaves of every weight product,
-  written by a patched ggml-vulkan (8-token batches, the q8_1 MMVQ layout the node recomputes). When
-  an answer is audited, the miner replays it and opens the drawn leaves. Before it traces anything,
-  the miner runs trace → replay → the node's verification once per model and refuses to trace if
-  that fails.
+- **No block task**: the node dropped it from H15 (`block_task_activation: never`). Headers keep the
+  H14 layout, and pool shares and solo blocks need no trace. The block-task code stays dormant.
+- **Verifiable inference** applies to solo AI answers only. The node now requires a prompt to be
+  traced in 512-token batches (CUDA's MMQ layout). This build's Vulkan trace runs 8-token MMVQ
+  batches, so its self-check (trace → replay → the node's verifier, once per model) fails and audited
+  solo requests are left unanswered: no inference reward, and no strikes. Pool mining and pool
+  inference are unaffected.
 
 ### Solo mining: escrow delegation cert (required since H6)
 
