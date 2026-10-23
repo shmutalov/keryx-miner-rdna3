@@ -750,12 +750,10 @@ mod tests {
             252, 68, 196, 245, 124, 248, 247, 162, 186, 65, 10, 112, 208, 173, 73, 6, 3, 85, 185, 222, 185, 112, 18,
             52, 86, 3, 217, 208, 209, 220, 176, 222,
         ];
-        let mut buf = Buf(Vec::with_capacity(1983));
+        let mut buf = Buf(Vec::with_capacity(1951));
         serialize_header(&mut buf, &header, true);
-        // The vector's DAA sits above the block task gate: a zero task root follows the legacy fields.
-        let (legacy, task_root) = buf.0.split_at(expected_res.len());
-        assert_eq!(&expected_res[..], legacy);
-        assert_eq!(task_root, &[0u8; 32][..]);
+        // The block task never activates (the node dropped it from H15): no task root follows.
+        assert_eq!(&expected_res[..], &buf.0);
 
         let expected_hash = Hash::from_le_bytes([
             85, 146, 211, 217, 138, 239, 47, 85, 152, 59, 58, 16, 4, 149, 129, 179, 172, 226, 174, 233, 160, 96, 202,
@@ -795,6 +793,40 @@ mod tests {
         };
         assert_eq!(digest(true), "c850d9d429ed501ce0016297999282297079f3d70c317b9b3aaf933a7868211f");
         assert_eq!(digest(false), "346345442413f856f84442a2866100362d52f7e8426d1e19c9af5c8bae988e3a");
+    }
+
+    /// At and past the H15 gate a header hashes without a task root, as the node hashes it (the
+    /// block task never activates): a `task_root` field changes neither the pre-PoW nor the block hash.
+    #[test]
+    fn h15_header_hashes_without_task_root() {
+        let mut h = RpcBlockHeader {
+            version: 1,
+            parents: vec![RpcBlockLevelParents { parent_hashes: vec!["11".repeat(32)] }],
+            hash_merkle_root: "22".repeat(32),
+            accepted_id_merkle_root: "23".repeat(32),
+            utxo_commitment: "24".repeat(32),
+            timestamp: 1_790_000_000_000,
+            bits: 0x1e7f_ffff,
+            nonce: 7,
+            daa_score: keryx_miner::pom::pom_v5_activation_daa(),
+            blue_work: "0123456789abcdef".into(),
+            blue_score: 98_765,
+            pruning_point: "33".repeat(32),
+            pom_final_state: 0xdead_beef,
+            service_state_hash: "55".repeat(32),
+            pom_tier: 1,
+            ..Default::default()
+        };
+        let digests = |h: &RpcBlockHeader| {
+            [true, false].map(|pre| {
+                let mut hasher = HeaderHasher::new();
+                serialize_header(&mut hasher, h, pre);
+                hasher.finalize().to_le_bytes()
+            })
+        };
+        let without = digests(&h);
+        h.task_root = "44".repeat(32);
+        assert_eq!(digests(&h), without);
     }
 
     /// A v4 pool job hashes its header like the solo template, before and after its task root.

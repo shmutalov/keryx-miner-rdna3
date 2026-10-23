@@ -1553,9 +1553,10 @@ pub fn pom_v5_activation_daa() -> u64 {
 }
 
 /// Block task gate: headers carry `task_root`, hashed into the pre-PoW and block hashes.
-/// MUST equal the node's `block_task_activation`.
+/// MUST equal the node's `block_task_activation`, which is `never` on both networks: the node
+/// dropped the block task from H15 (keryx-node 59e1a040). The machinery stays for a later schedule.
 pub fn block_task_activation_daa() -> u64 {
-    gate(H15_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA)
+    u64::MAX
 }
 
 /// H10 gate: the v4 walk seed switches from the salted mix64 fold to the keccak PowHash front-end
@@ -2304,7 +2305,6 @@ mod h15_gate_tests {
         assert!(!is_testnet());
         for g in [
             pom_v5_activation_daa(),
-            block_task_activation_daa(),
             verifiable_inference_activation_daa(),
             trace_prefix_activation_daa(),
             trace_audit_activation_daa(),
@@ -2315,5 +2315,8 @@ mod h15_gate_tests {
         }
         assert_eq!(H15_ACTIVATION_DAA, 140_115_000);
         assert!(private_inference_activation_daa() < H15_ACTIVATION_DAA);
+        // The node's `block_task_activation` is `never` on both networks.
+        assert_eq!(block_task_activation_daa(), u64::MAX);
+        assert!(!crate::block_task::active(H15_ACTIVATION_DAA));
     }
 }
