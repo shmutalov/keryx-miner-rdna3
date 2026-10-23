@@ -2,9 +2,69 @@
 //! find the lowest nonce in a batch whose `pom_pow_value <= target`. The folds are byte-identical
 //! to `src/pom.rs`, so a nonce found here builds a `PomProof` the node accepts.
 
-use crate::pom_walk_v4::{PomWalkV4, V4Job};
+use crate::pom_walk_v4::{PadV5, PomWalkV4, V4Job};
 use crate::{GpuBuffer, Kernel, Vk};
 use std::io::Cursor;
+use std::sync::Mutex;
+
+/// The PoM v5 walk of a resident miner: its context pad (filled on the device from `seed`) and the
+/// v4 kernel over the weights + pad segment table. Built on the first v5 grind of a pad seed.
+struct V5Walk {
+    seed: [u64; 4],
+    pad: PadV5,
+    walk: PomWalkV4,
+}
+
+impl V5Walk {
+    fn destroy(&self, vk: &Vk) {
+        self.walk.destroy(vk);
+        self.pad.destroy(vk);
+    }
+}
+
+/// The v5 grind over (`prefix`, `addrs`) with the pad of `seed` (`tiles` tiles), rebuilding the
+/// pad when the seed or size changed. Returns the lowest winning nonce.
+#[allow(clippy::too_many_arguments)]
+fn mine_v5_with(
+    vk: &Vk,
+    slot: &Mutex<Option<V5Walk>>,
+    prefix: &[u64],
+    addrs: &[u64],
+    job: &V4Job,
+    start: u64,
+    batch: u32,
+    seed: &[u64; 4],
+    tiles: u64,
+) -> Result<Option<u64>, String> {
+    let mut g = slot.lock().unwrap_or_else(|p| p.into_inner());
+    if g.as_ref().is_none_or(|w| w.seed != *seed || w.pad.tiles() != tiles) {
+        if let Some(old) = g.take() {
+            old.destroy(vk);
+        }
+        let pad = PadV5::fill(vk, seed, tiles)?;
+        let walk = match PomWalkV4::new_v5(vk, prefix, addrs, &pad) {
+            Ok(w) => w,
+            Err(e) => {
+                pad.destroy(vk);
+                return Err(e);
+            }
+        };
+        *g = Some(V5Walk { seed: *seed, pad, walk });
+    }
+    Ok(g.as_ref().and_then(|w| w.walk.mine(vk, job, start, batch)))
+}
+
+/// Frees the context pad in `slot`; the next v5 grind refills it. Returns its size in bytes.
+fn release_pad_in(vk: &Vk, slot: &Mutex<Option<V5Walk>>) -> u64 {
+    match slot.lock().unwrap_or_else(|p| p.into_inner()).take() {
+        Some(w) => {
+            let bytes = w.pad.bytes();
+            w.destroy(vk);
+            bytes
+        }
+        None => 0,
+    }
+}
 
 /// SPIR-V for the PoM walk, compiled from `shaders/pom_walk.comp` by build.rs.
 const POM_WALK_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pom_walk.spv"));
@@ -83,6 +143,10 @@ pub struct PomWalkGpu {
     shard_chunks: u64,
     /// PoM v4 grind over the same shards (segment table = one entry per shard).
     v4: PomWalkV4,
+    /// That segment table, for the v5 walk over the shards + context pad.
+    v4_prefix: Vec<u64>,
+    v4_addrs: Vec<u64>,
+    v5: Mutex<Option<V5Walk>>,
 }
 
 impl PomWalkGpu {
@@ -169,7 +233,7 @@ impl PomWalkGpu {
         let prefix: Vec<u64> = (0..=n_shards).map(|s| (s * shard_chunks).min(n_chunks)).collect();
         let v4 = PomWalkV4::new(&vk, &prefix, &addrs)?;
 
-        Ok(Self { vk, kernel, shards, addr_table, winner, n_chunks, shard_chunks, v4 })
+        Ok(Self { vk, kernel, shards, addr_table, winner, n_chunks, shard_chunks, v4, v4_prefix: prefix, v4_addrs: addrs, v5: Mutex::new(None) })
     }
 
     /// Name of the GPU the miner is running on.
@@ -250,10 +314,22 @@ impl PomWalkGpu {
     pub fn v4_kernel(&self) -> String {
         self.v4.describe()
     }
+
+    /// PoM v5 grind of nonces `[start, start + batch)`: the v4 walk over the blob and the context
+    /// pad of `pad_seed` (`pom_v5::v5_pad_seed_words`, `pad_tiles` tiles), filled on first use.
+    pub fn mine_v5(&self, job: &V4Job, start: u64, batch: u32, pad_seed: &[u64; 4], pad_tiles: u64) -> Result<Option<u64>, String> {
+        mine_v5_with(&self.vk, &self.v5, &self.v4_prefix, &self.v4_addrs, job, start, batch, pad_seed, pad_tiles)
+    }
+
+    /// Frees the context pad (refilled by the next v5 grind); returns the bytes released.
+    pub fn release_pad(&self) -> u64 {
+        release_pad_in(&self.vk, &self.v5)
+    }
 }
 
 impl Drop for PomWalkGpu {
     fn drop(&mut self) {
+        release_pad_in(&self.vk, &self.v5);
         self.v4.destroy(&self.vk);
         self.vk.destroy_buffer(&self.winner);
         self.vk.destroy_buffer(&self.addr_table);
@@ -313,6 +389,10 @@ pub struct PomWalkShared {
     n_tensors: u32,
     /// PoM v4 grind over the same tensor table.
     v4: PomWalkV4,
+    /// That table, for the v5 walk over the tensors + context pad.
+    v4_prefix: Vec<u64>,
+    v4_addrs: Vec<u64>,
+    v5: Mutex<Option<V5Walk>>,
 }
 
 impl PomWalkShared {
@@ -367,6 +447,9 @@ impl PomWalkShared {
             n_chunks: total,
             n_tensors,
             v4,
+            v4_prefix: prefix,
+            v4_addrs: addrs,
+            v5: Mutex::new(None),
         })
     }
 
@@ -442,10 +525,21 @@ impl PomWalkShared {
     pub fn v4_kernel(&self) -> String {
         self.v4.describe()
     }
+
+    /// PoM v5 grind over the engine's tensors and the context pad — see [`PomWalkGpu::mine_v5`].
+    pub fn mine_v5(&self, job: &V4Job, start: u64, batch: u32, pad_seed: &[u64; 4], pad_tiles: u64) -> Result<Option<u64>, String> {
+        mine_v5_with(&self.vk, &self.v5, &self.v4_prefix, &self.v4_addrs, job, start, batch, pad_seed, pad_tiles)
+    }
+
+    /// Frees the context pad (refilled by the next v5 grind); returns the bytes released.
+    pub fn release_pad(&self) -> u64 {
+        release_pad_in(&self.vk, &self.v5)
+    }
 }
 
 impl Drop for PomWalkShared {
     fn drop(&mut self) {
+        release_pad_in(&self.vk, &self.v5);
         self.v4.destroy(&self.vk);
         for b in &self.supplements {
             self.vk.destroy_buffer(b);

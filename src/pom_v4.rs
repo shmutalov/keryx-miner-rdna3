@@ -77,7 +77,7 @@ pub fn v4_state_root(state: &[u8]) -> [u8; 32] {
     merkle_root(&v4_state_leaves(state))
 }
 
-fn v4_tile_subtree_root(tile: &[u8]) -> [u8; 32] {
+pub(crate) fn v4_tile_subtree_root(tile: &[u8]) -> [u8; 32] {
     let leaves: Vec<[u8; 32]> = tile.chunks(POM_V4_CHUNK_BYTES).map(blake).collect();
     merkle_root(&leaves)
 }
@@ -223,6 +223,7 @@ mod tests {
             steps_v2: None,
             v3: None,
             v4: Some(v4),
+            task: None,
         };
         let wire = proof.to_wire_bytes();
         // 264_289 + 8_192 * L bytes with an 11-level tile path (ceil(log2(1025)) = 11).

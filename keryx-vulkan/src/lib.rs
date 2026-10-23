@@ -637,6 +637,39 @@ impl Vk {
         }
     }
 
+    /// A **DEVICE_LOCAL** buffer with a GPU device address and undefined contents, for data a
+    /// kernel writes before any kernel reads it (the PoM v5 context pad).
+    pub fn create_device_local_address_buffer_uninit(&self, size: u64) -> Result<(GpuBuffer, u64), String> {
+        assert!(size > 0, "zero-size buffer");
+        unsafe {
+            let max_alloc = self.max_memory_allocation_size();
+            if max_alloc != 0 && size > max_alloc {
+                return Err(format!("buffer of {size} bytes exceeds maxMemoryAllocationSize {max_alloc} bytes"));
+            }
+            let info = vk::BufferCreateInfo::default()
+                .size(size)
+                .usage(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let buffer = self.device.create_buffer(&info, None).map_err(|e| e.to_string())?;
+            let req = self.device.get_buffer_memory_requirements(buffer);
+            let mt = self.find_memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+            let mut flags = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+            let memory = match self.device.allocate_memory(
+                &vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(mt).push_next(&mut flags),
+                None,
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    self.device.destroy_buffer(buffer, None);
+                    return Err(e.to_string());
+                }
+            };
+            self.device.bind_buffer_memory(buffer, memory, 0).map_err(|e| e.to_string())?;
+            let address = self.device.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer));
+            Ok((GpuBuffer { buffer, memory, size }, address))
+        }
+    }
+
     /// The device's single-allocation ceiling (`maxMemoryAllocationSize`), 0 if unreported.
     unsafe fn max_memory_allocation_size(&self) -> u64 {
         let mut limits11 = vk::PhysicalDeviceVulkan11Properties::default();

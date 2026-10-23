@@ -146,3 +146,94 @@ fn pom_v4_grind_rate() {
         vk.destroy_buffer(b);
     }
 }
+
+/// PoM v5 against v4 over the same weight table: the tier-0 shape by default (Qwen3.5-9B,
+/// 6,358,434 weight tiles + its 638,976-tile context pad). Also times the device pad fill.
+/// Env: POM_BENCH_BLOB_MB (default 6209)  POM_BENCH_PAD_TILES (default 638976)  and the above.
+#[test]
+#[ignore = "GPU throughput diagnostic; run explicitly with --ignored --release"]
+fn pom_v5_grind_rate() {
+    use keryx_vulkan::pom_walk_v4::PadV5;
+    let blob_mb = env("POM_BENCH_BLOB_MB", 6209);
+    let pad_tiles = env("POM_BENCH_PAD_TILES", 638_976);
+    let batch = env("POM_BENCH_NONCES", 65536) as u32;
+    let iters = env("POM_BENCH_ITERS", 5);
+    let n_segments = env("POM_BENCH_SEGMENTS", 300);
+    let n_chunks = blob_mb * 1024 * 1024 / 32;
+    let job = V4Job {
+        pow_words: [1, 2, 3, 4],
+        seed_words: [5, 6, 7, 8],
+        timestamp: 1_788_000_000_000,
+        h10_state: Some([0x0123_4567_89ab_cdef; 25]),
+        target_le: [0u8; 32],
+    };
+    let vk = match Vk::new() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("SKIP: no Vulkan device ({e})");
+            return;
+        }
+    };
+    let per = n_chunks / n_segments;
+    let mut prefix = vec![0u64];
+    let mut addrs = Vec::new();
+    let mut bufs = Vec::new();
+    for s in 0..n_segments {
+        let first = s * per;
+        let len = if s + 1 == n_segments { n_chunks - first } else { per };
+        let (buf, addr) = vk
+            .create_device_local_address_buffer_streamed(len * 32, &mut |off, out| {
+                fill(first + off / 32, out);
+                Ok(())
+            })
+            .expect("segment buffer");
+        bufs.push(buf);
+        addrs.push(addr);
+        prefix.push(first + len);
+    }
+    let t = Instant::now();
+    let pad = PadV5::fill(&vk, &[0x11, 0x22, 0x33, 0x44], pad_tiles).expect("pad fill");
+    eprintln!(
+        "device: {}  weights: {} tiles  pad: {} tiles ({} MiB, filled in {:.2} s)  batch: {}",
+        vk.device_name(),
+        n_chunks / 32,
+        pad_tiles,
+        pad.bytes() >> 20,
+        t.elapsed().as_secs_f64(),
+        batch
+    );
+    let mut walks: Vec<(String, PomWalkV4)> = Vec::new();
+    for kind in [V4Kernel::MatrixCores, V4Kernel::Dot4] {
+        match PomWalkV4::with_kernel(&vk, &prefix, &addrs, kind) {
+            Ok(w) => walks.push((format!("v4, {}", kind.name()), w)),
+            Err(e) => eprintln!("v4 {}: unavailable ({e})", kind.name()),
+        }
+        match PomWalkV4::with_kernel_v5(&vk, &prefix, &addrs, &pad, kind) {
+            Ok(w) => walks.push((format!("v5, {}", kind.name()), w)),
+            Err(e) => eprintln!("v5 {}: unavailable ({e})", kind.name()),
+        }
+    }
+    let warmup = Instant::now();
+    let mut start = 0u64;
+    while warmup.elapsed().as_secs_f64() < env("POM_BENCH_WARMUP_S", 5) as f64 {
+        for (_, walk) in &walks {
+            walk.mine(&vk, &job, start, batch);
+            start += batch as u64;
+        }
+    }
+    let mut rates = vec![Vec::new(); walks.len()];
+    for _ in 0..iters {
+        for (k, (_, walk)) in walks.iter().enumerate() {
+            rates[k].push(rate(batch, || walk.mine(&vk, &job, start, batch)));
+            start += batch as u64;
+        }
+    }
+    for ((label, walk), r) in walks.iter().zip(rates) {
+        report(label, r);
+        walk.destroy(&vk);
+    }
+    pad.destroy(&vk);
+    for b in &bufs {
+        vk.destroy_buffer(b);
+    }
+}

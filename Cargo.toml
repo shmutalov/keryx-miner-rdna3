@@ -9,6 +9,7 @@ description = "A fast CPU & GPU miner for Keryx"
 categories = ["command-line-utilities"]
 keywords = ["blockchain", "cli"]
 include = [
+    "assets/trace-manifests/*.bin",
     "src/**/*.rs",
     "src/**/*.s",
     "proto/**",
@@ -54,6 +55,8 @@ num = "0.4"
 nix = "0.25"
 hex = "0.4"
 keryx-inference = { path = "inference" }
+# H15 verifiable inference: trace openings, block task and their checks (byte-exact mirror of the node crate).
+keryx-verifiable-inference = { path = "verifiable-inference" }
 secp256k1 = { version = "0.29.0", features = ["global-context"] }
 semver = "1.0"
 # Proof-of-Model: possession proof construction (borsh wire-format must match the node).
@@ -75,17 +78,19 @@ base64 = "0.22"
 anyhow = "1"
 # OPoI inference: llama.cpp via FFI with its Vulkan backend, IN-PROCESS — the PoM walk reads
 # the engine's own resident weight buffers (zero-dup). Pulled from our fork branch carrying ONLY
-# the keryx ggml exports (raw handles, tensor BDA, guarded queue submit) via the patched
-# llama.cpp submodule, rebased onto upstream 0.1.151 — the windows-gnu vulkan build fixes
-# (PR utilityai/llama-cpp-rs#1060) are upstream as of that release and no longer carried here.
+# the keryx ggml exports (raw handles, tensor BDA, guarded queue submit) and the canonical trace
+# of H15 verifiable inference (ggml_backend_vk_keryx_trace_*, plus the exact q8 sum in the
+# Q4_K/Q5_K mmvq min term) via the patched llama.cpp submodule, rebased onto upstream 0.1.151 —
+# the windows-gnu vulkan build fixes (PR utilityai/llama-cpp-rs#1060) are upstream as of that
+# release and no longer carried here.
 # default-features = false drops `common` (avoids upstream issue #1059's unlinked build-info
 # objects — we only need core llama: load, chat template, tokenize, greedy decode) and `openmp`
 # (no libgomp runtime dep; all layers run on the GPU anyway).
-# Pinned by rev (branch: keryx-zero-dup-0.1.151): Cargo.lock is gitignored in this repo, so a
+# Pinned by rev (branch: keryx-trace-0.1.151): Cargo.lock is gitignored in this repo, so a
 # branch reference would float — the rev makes release builds reproducible.
-llama-cpp-2 = { git = "https://github.com/shmutalov/llama-cpp-rs", rev = "cfe442f88748fc840ddd738357d4f822ed75f96f", default-features = false, features = ["vulkan"] }
+llama-cpp-2 = { git = "https://github.com/shmutalov/llama-cpp-rs", rev = "cd76ed52e133e6d3f9f433b9fa35ad781b5fdd03", default-features = false, features = ["vulkan"] }
 # Direct sys-crate access for the keryx FFI exports — llama-cpp-2 does not re-export its sys crate.
-llama-cpp-sys-2 = { git = "https://github.com/shmutalov/llama-cpp-rs", rev = "cfe442f88748fc840ddd738357d4f822ed75f96f", default-features = false }
+llama-cpp-sys-2 = { git = "https://github.com/shmutalov/llama-cpp-rs", rev = "cd76ed52e133e6d3f9f433b9fa35ad781b5fdd03", default-features = false }
 time = { version = "0.3", features = ["formatting", "macros"] }
 flate2 = "1.0"
 tar = "0.4"
@@ -119,5 +124,5 @@ sha3 = { git = "https://github.com/elichai/hashes", branch = "cSHAKE" }
 [workspace]
 # RDNA3 fork: the CUDA/OpenCL PoW plugins are gone (replaced by the in-process Vulkan worker);
 # keryx-vulkan joins the workspace. No candle-kernels patch — there is no CUDA kernel build.
-members = ["inference", "keryx-vulkan"]
+members = ["inference", "verifiable-inference", "keryx-vulkan"]
 default-members = ["."]

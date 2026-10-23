@@ -89,6 +89,42 @@ pub struct PomProof {
     pub v3: Option<crate::pom_v3::PomProofV3>,
     /// v4 re-walk witness. Trailing field, same era-exact wire mechanism as `v3`.
     pub v4: Option<crate::pom_v4::PomProofV4>,
+    /// Encoded opening of the block task. Trailing field, same era-exact wire mechanism.
+    pub task: Option<Vec<u8>>,
+}
+
+/// Exact pre-task layout of `PomProof` (through `v4`, no `task`) — mirror of the node's
+/// `PomProofPreTask`.
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+pub struct PomProofPreTask {
+    pub tier: u8,
+    pub trace_root: [u8; 32],
+    pub pow_value: [u8; 32],
+    pub final_state: u64,
+    pub initial_trace_path: Vec<[u8; 32]>,
+    pub final_trace_path: Vec<[u8; 32]>,
+    pub openings: Vec<PomOpening>,
+    pub steps_v2: Option<Vec<PomStep>>,
+    pub v3: Option<crate::pom_v3::PomProofV3>,
+    pub v4: Option<crate::pom_v4::PomProofV4>,
+}
+
+impl From<PomProofPreTask> for PomProof {
+    fn from(p: PomProofPreTask) -> Self {
+        Self {
+            tier: p.tier,
+            trace_root: p.trace_root,
+            pow_value: p.pow_value,
+            final_state: p.final_state,
+            initial_trace_path: p.initial_trace_path,
+            final_trace_path: p.final_trace_path,
+            openings: p.openings,
+            steps_v2: p.steps_v2,
+            v3: p.v3,
+            v4: p.v4,
+            task: None,
+        }
+    }
 }
 
 /// Exact pre-H4 layout of `PomProof` (no `steps_v2`) — mirror of the node's `PomProofPreH4`.
@@ -148,6 +184,7 @@ impl From<PomProofPreV4> for PomProof {
             steps_v2: p.steps_v2,
             v3: p.v3,
             v4: None,
+            task: None,
         }
     }
 }
@@ -165,6 +202,7 @@ impl From<PomProofPreV3> for PomProof {
             steps_v2: p.steps_v2,
             v3: None,
             v4: None,
+            task: None,
         }
     }
 }
@@ -182,6 +220,7 @@ impl From<PomProofPreH4> for PomProof {
             steps_v2: None,
             v3: None,
             v4: None,
+            task: None,
         }
     }
 }
@@ -191,8 +230,22 @@ impl PomProof {
     /// without the v3 extension encodes byte-identically to the pre-H6 layout, and without the v2
     /// extension to the pre-H4 layout. The submit path MUST use this, never `borsh::to_vec`.
     pub fn to_wire_bytes(&self) -> Vec<u8> {
-        if self.v4.is_some() {
+        if self.task.is_some() {
             borsh::to_vec(self).expect("PomProof borsh serialize")
+        } else if self.v4.is_some() {
+            borsh::to_vec(&PomProofPreTask {
+                tier: self.tier,
+                trace_root: self.trace_root,
+                pow_value: self.pow_value,
+                final_state: self.final_state,
+                initial_trace_path: self.initial_trace_path.clone(),
+                final_trace_path: self.final_trace_path.clone(),
+                openings: self.openings.clone(),
+                steps_v2: self.steps_v2.clone(),
+                v3: self.v3.clone(),
+                v4: self.v4.clone(),
+            })
+            .expect("PomProof borsh serialize")
         } else if self.v3.is_some() {
             borsh::to_vec(&PomProofPreV4 {
                 tier: self.tier,
@@ -235,6 +288,7 @@ impl PomProof {
     /// Decode the canonical wire encoding, any era — mirror of the node's `from_wire_bytes`.
     pub fn from_wire_bytes(bytes: &[u8]) -> std::io::Result<Self> {
         borsh::from_slice::<PomProof>(bytes)
+            .or_else(|_| borsh::from_slice::<PomProofPreTask>(bytes).map(PomProof::from))
             .or_else(|_| borsh::from_slice::<PomProofPreV4>(bytes).map(PomProof::from))
             .or_else(|_| borsh::from_slice::<PomProofPreV3>(bytes).map(PomProof::from))
             .or_else(|_| borsh::from_slice::<PomProofPreH4>(bytes).map(PomProof::from))
@@ -720,6 +774,7 @@ where
         steps_v2: None,
         v3: None,
         v4: None,
+        task: None,
     }
 }
 
@@ -766,6 +821,7 @@ where
         steps_v2: Some(steps),
         v3: None,
         v4: None,
+        task: None,
     }
 }
 
@@ -1382,6 +1438,11 @@ pub fn is_testnet() -> bool {
     TESTNET_GATES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Mainnet H15 gate. MUST equal the node's `H15_ACTIVATION_DAA`.
+pub const H15_ACTIVATION_DAA: u64 = 140_115_000;
+/// Testnet H15 gate. MUST equal the node's `TESTNET_H15_ACTIVATION_DAA`.
+const TESTNET_H15_ACTIVATION_DAA: u64 = 3_500;
+
 /// Picks the gate value for the selected network (`--testnet`).
 #[inline(always)]
 fn gate(mainnet: u64, testnet: u64) -> u64 {
@@ -1486,6 +1547,17 @@ pub fn pom_v4_activation_daa() -> u64 {
     gate(79_210_000, 1)
 }
 
+/// Node `pom_v5_activation`: the walk also reads the tier's context pad.
+pub fn pom_v5_activation_daa() -> u64 {
+    gate(H15_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA)
+}
+
+/// Block task gate: headers carry `task_root`, hashed into the pre-PoW and block hashes.
+/// MUST equal the node's `block_task_activation`.
+pub fn block_task_activation_daa() -> u64 {
+    gate(H15_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA)
+}
+
 /// H10 gate: the v4 walk seed switches from the salted mix64 fold to the keccak PowHash front-end
 /// (`pom_block_seed_h10`). Proof format unchanged. MUST equal the node's `h10_activation`:
 /// mainnet 87_360_000, testnet 1.
@@ -1508,9 +1580,37 @@ pub fn reward_routing_activation_daa() -> u64 {
 /// - tier 3 mines and serves Qwen3.8-27B instead of Qwen3.6-27B (`POM_TIERS_H14`).
 ///
 /// MUST equal the node's `private_inference_activation` (`H14_ACTIVATION_DAA`): mainnet
-/// 121_985_000 (targets 2026-10-09 ~14:00 UTC), testnet 6_000.
+/// 121_985_000 (targets 2026-10-09 ~14:00 UTC), testnet 1 (the H15 testnet runs H14 from its first block).
 pub fn private_inference_activation_daa() -> u64 {
-    gate(121_985_000, 6_000)
+    gate(121_985_000, 1)
+}
+
+/// Verifiable-inference gate. At/after this score an AiResponse carries its trace commitment
+/// and the miner opens the points drawn on it. MUST equal the node's
+/// `verifiable_inference_activation`.
+pub fn verifiable_inference_activation_daa() -> u64 {
+    gate(H15_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA)
+}
+
+/// Node `trace_prefix_activation`: responses accepted from this DAA are opened against the
+/// prefix-bound manifests, with the request-bound prefix point.
+pub fn trace_prefix_activation_daa() -> u64 {
+    gate(H15_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA)
+}
+
+/// DAA from which every traced response is audited (mirror of the node's `trace_audit_activation`).
+pub fn trace_audit_activation_daa() -> u64 {
+    gate(H15_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA)
+}
+
+/// Node `trace_chain_activation`: responses accepted from this DAA commit the stage-2 trace.
+pub fn trace_chain_activation_daa() -> u64 {
+    gate(H15_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA)
+}
+
+/// Node `trace_seed_bind_activation`: openings of draws seeded from this DAA name their seed block.
+pub fn trace_seed_bind_activation_daa() -> u64 {
+    gate(H15_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA)
 }
 
 /// Possession indices built in this process, keyed by MODEL. A tier normally mines one model for
@@ -2084,6 +2184,36 @@ mod tests {
         assert_eq!(proof.to_wire_bytes(), legacy);
     }
 
+    /// A proof without a task keeps the pre-task layout byte for byte; one with a task round-trips.
+    #[test]
+    fn task_extension_wire_layout() {
+        let (k, t) = (256u32, 32usize);
+        let idx = synth_index(4096);
+        let pph = blake(b"task-pph");
+        let seed = pom_block_seed(&pph, 1, 7, false, false, false);
+        let proof = build_proof(1, &pph, 7, seed, idx.n_chunks, k, t, |o| idx.read_chunk(o), |o| idx.merkle_path(o), false);
+        let v3 = crate::pom_v3::PomProofV3 { tier: 1, roots: vec![], snippets: vec![], checks: vec![] };
+        let base = PomProof { v3: Some(v3), ..proof };
+        let pre_task = borsh::to_vec(&PomProofPreV4 {
+            tier: base.tier,
+            trace_root: base.trace_root,
+            pow_value: base.pow_value,
+            final_state: base.final_state,
+            initial_trace_path: base.initial_trace_path.clone(),
+            final_trace_path: base.final_trace_path.clone(),
+            openings: base.openings.clone(),
+            steps_v2: base.steps_v2.clone(),
+            v3: base.v3.clone(),
+        })
+        .unwrap();
+        assert_eq!(base.to_wire_bytes(), pre_task);
+        let with_task = PomProof { task: Some(vec![1, 2, 3]), ..base.clone() };
+        let bytes = with_task.to_wire_bytes();
+        assert_eq!(bytes, borsh::to_vec(&with_task).unwrap());
+        assert_eq!(PomProof::from_wire_bytes(&bytes).unwrap().task, Some(vec![1, 2, 3]));
+        assert_eq!(PomProof::from_wire_bytes(&pre_task).unwrap().task, None);
+    }
+
     #[test]
     fn h3_salt_changes_seed_and_pow_and_roundtrips() {
         let (k, t) = (256u32, 32usize);
@@ -2162,5 +2292,28 @@ mod tests {
         let proof =
             build_proof_v2(0, &pph, seed, idx.n_chunks, 256, |o| idx.read_chunk(o), |o| idx.merkle_path(o), true, true);
         assert!(verify_proof_v2(&proof, &pph, seed, idx.n_chunks, 256, &idx.r_t, &[0xff; 32], true, true));
+    }
+}
+
+#[cfg(test)]
+mod h15_gate_tests {
+    use super::*;
+
+    #[test]
+    fn mainnet_h15_gates_match_the_node() {
+        assert!(!is_testnet());
+        for g in [
+            pom_v5_activation_daa(),
+            block_task_activation_daa(),
+            verifiable_inference_activation_daa(),
+            trace_prefix_activation_daa(),
+            trace_audit_activation_daa(),
+            trace_chain_activation_daa(),
+            trace_seed_bind_activation_daa(),
+        ] {
+            assert_eq!(g, H15_ACTIVATION_DAA);
+        }
+        assert_eq!(H15_ACTIVATION_DAA, 140_115_000);
+        assert!(private_inference_activation_daa() < H15_ACTIVATION_DAA);
     }
 }

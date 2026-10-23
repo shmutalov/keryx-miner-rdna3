@@ -41,6 +41,15 @@ pub struct Opt {
     pub very_high: bool,
 
     #[clap(
+        long = "h15-tier",
+        value_name = "TIER",
+        possible_values = &["very-light", "light", "default", "high", "very-high"],
+        help = "Model tier to mine and serve from the H15 gate on; the tier flag holds until then. PoM v5 adds the tier's context pad to VRAM (--high: ~22 GB with it)",
+        help_heading = "OPoI / Inference"
+    )]
+    pub h15_tier: Option<String>,
+
+    #[clap(
         long = "ipfs-url",
         help = "IPFS Kubo API URL for uploading inference results",
         help_heading = "OPoI / Inference",

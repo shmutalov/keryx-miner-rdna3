@@ -33,6 +33,9 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_ballot : require
 #endif
+// v5 (H15): the state fold of the next-offset rule is an XOR over the nonce's 32 rows — a clustered
+// reduction over the nonce's 32 invocations, which also holds with several nonce slots per wave.
+#extension GL_KHR_shader_subgroup_clustered : require
 
 // Nonces per workgroup. 1 measured fastest on a 7900 XT (1.12 M/s vs 0.99 at 2, 0.95 at 4, 0.91 at
 // 8): with one nonce per workgroup the per-step barrier couples no other walk. The host pins
@@ -91,13 +94,19 @@ layout(std430, binding = 4) readonly buffer Seeds { uint64_t s[]; } SEEDS;
 
 layout(push_constant) uniform Push {
     uint64_t p0, p1, p2, p3;   // POW-fold pph words (H3-salted)
-    uint64_t n_tiles;          // floor(n_chunks / 32)
+    uint64_t n_tiles;          // weight tiles: floor(n_chunks / 32)
     uint64_t inv_n;            // u64::MAX / n_tiles — Barrett reciprocal for % n_tiles
     uint batch;                // nonces in this dispatch
     uint t_count;              // number of segments (T)
     uint lut_sh;               // LUT bucket shift
     uint zero;                 // always 0 — see rho8
-} pc;                          // 48 + 16 = 64 B
+    // v5 (H15) context pad: pad tile i is tile n_tiles + i, its chunks the segments after the
+    // weights. n_pad == 0 walks v4.
+    uint64_t n_pad;            // pad tiles
+    uint64_t inv_p;            // u64::MAX / n_pad (0 when n_pad == 0)
+    uint k_pad;                // pad steps per walk (`pom_v5::v5_pad_steps`)
+    uint _pad1;
+} pc;                          // 64 + 24 = 88 B
 
 #ifdef POM_V4_CM
 // Words per tile column and bytes per state row; 8 and 32 are unpadded (2 KB per nonce, the same
@@ -146,6 +155,26 @@ uint64_t mulhi64(uint64_t a, uint64_t b) {
 uint64_t mod_tiles(uint64_t x) {
     const uint64_t r = x - mulhi64(x, pc.inv_n) * pc.n_tiles;
     return r >= pc.n_tiles ? r - pc.n_tiles : r;
+}
+
+// x % n_pad, the same Barrett form as mod_tiles.
+uint64_t mod_pad(uint64_t x) {
+    const uint64_t r = x - mulhi64(x, pc.inv_p) * pc.n_pad;
+    return r >= pc.n_pad ? r - pc.n_pad : r;
+}
+
+// v5 tile offset of step `step + 1` from `raw_in` = seed ^ step salt ^ snippet fold ^ state fold
+// (`pom_v5::v5_next_offset`): a pad tile on the walk's pad steps, else a weight tile.
+uint64_t v5_offset(uint64_t raw_in, uint step) {
+    const uint64_t raw = mix64(raw_in);
+    return ((step + 1u) * pc.k_pad) >> 8 != (step * pc.k_pad) >> 8 ? pc.n_tiles + mod_pad(raw) : mod_tiles(raw);
+}
+
+// `pom_v5::v5_state_fold` from this invocation's row `x`, whose first 8 state bytes are lo, hi:
+// XOR over the rows of mix64(row word ^ row index), reduced across the nonce's subgroup.
+uint64_t v5_state_fold(uint lo, uint hi, uint x) {
+    const uint64_t h = mix64((uint64_t(hi) << 32 | uint64_t(lo)) ^ uint64_t(x));
+    return uint64_t(subgroupClusteredXor(uint(h), 32u)) | (uint64_t(subgroupClusteredXor(uint(h >> 32), 32u)) << 32);
 }
 
 // rho8 — the murmur-style byte reduction (`pom_v3::rho8`). Only bits 0..7 and 13..20 of the second
@@ -342,7 +371,17 @@ void main() {
                 sf = mix64(sf ^ uint64_t(sn[w]));
             }
             step_salt += V4_OFFSET_STEP_SALT;
-            off = mod_tiles(mix64(seed ^ step_salt ^ sf));
+            if (pc.n_pad != 0UL) {
+                // v5: the fold of S_{step-1}, still in s_state — the transition below writes it.
+                uint lo = 0u, hi = 0u;
+                [[unroll]] for (uint b = 0u; b < 4u; b++) {
+                    lo |= (uint(int(s_state[x * CM_SS + b])) & 0xffu) << (8u * b);
+                    hi |= (uint(int(s_state[x * CM_SS + 4u + b])) & 0xffu) << (8u * b);
+                }
+                off = v5_offset(seed ^ step_salt ^ sf ^ v5_state_fold(lo, hi, x), step);
+            } else {
+                off = mod_tiles(mix64(seed ^ step_salt ^ sf));
+            }
         }
         // Ahead of the next tile's load: after it, the barrier would wait for that load to land.
         barrier();
@@ -458,7 +497,9 @@ void main() {
             [[unroll]] for (uint w = 0u; w < 8u; w++) {
                 sf = mix64(sf ^ uint64_t(s_mem[buf + w]));
             }
-            off = mod_tiles(mix64(seed ^ (uint64_t(step + 1u) * V4_OFFSET_STEP_SALT) ^ sf));
+            const uint64_t raw_in = seed ^ (uint64_t(step + 1u) * V4_OFFSET_STEP_SALT) ^ sf;
+            // v5: row4 still holds S_{step-1}; the transition below replaces it.
+            off = pc.n_pad != 0UL ? v5_offset(raw_in ^ v5_state_fold(row4[0], row4[1], x), step) : mod_tiles(mix64(raw_in));
             Seg c = chunk_ptr(off * 32UL + uint64_t(x));
             w0 = c.words[0]; w1 = c.words[1]; w2 = c.words[2]; w3 = c.words[3];
         }

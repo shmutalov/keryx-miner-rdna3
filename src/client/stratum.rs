@@ -223,11 +223,11 @@ impl Client for StratumHandler {
                         // suprnova's bridge version-gates PoM shares by the reported keryx-miner-supr
                         // version, raising the floor at every hardfork (H4 >= 0.7.0, H5.2 >= 0.9.2,
                         // H10 >= 0.12.0 — the mandatory one-way-seed release, H14 >= 0.14.0). This
-                        // build mines the live consensus: PoM v4 (D=32 re-walk) with the H14 seed, the
-                        // H6 header fields, and stratum-v3 notifies (supr >= 0.13.0) — so advertise
-                        // the current supr release. Bump this single string if the pool raises the
-                        // floor again. (Real build: keryx-miner/CARGO_PKG_VERSION.)
-                        "keryx-miner-supr/0.14.1.0".to_string(),
+                        // build mines the H15 consensus: PoM v5 (context pad), the block task and
+                        // stratum-v4 notifies/submits (supr's H15 release is 0.15.0), and H14 before
+                        // the gate — so advertise the current supr release. Bump this single string if
+                        // the pool raises the floor again. (Real build: keryx-miner/CARGO_PKG_VERSION.)
+                        "keryx-miner-supr/0.15.0".to_string(),
                         KERYX_STRATUM_DAA_CAPABILITY.into(),
                     )),
                 )),
@@ -402,8 +402,8 @@ impl StratumHandler {
         let handle = tokio::spawn(async move {
             let mut recv_stream = ReceiverStream::new(recv);
             while let Some(seed) = recv_stream.next().await {
-                let (nonce, job_id, pom_proof) = match seed {
-                    BlockSeed::PartialBlock { nonce, id, pom_proof, .. } => (nonce, id, pom_proof),
+                let (nonce, job_id, pom_proof, task_root) = match seed {
+                    BlockSeed::PartialBlock { nonce, id, pom_proof, task_root, .. } => (nonce, id, pom_proof, task_root),
                     BlockSeed::FullBlock(_) => unreachable!(),
                 };
                 let msg_id = last_stratum_id.fetch_add(1, Ordering::SeqCst);
@@ -426,7 +426,27 @@ impl StratumHandler {
                     }
                 };
 
-                let line = if !pom_proof.is_empty() {
+                let line = if let (false, Some(root)) = (pom_proof.is_empty(), task_root) {
+                    // H15: the 6-slot PoM submit plus the block task root the share's header commits.
+                    let cid = cid_opt.unwrap_or_default();
+                    info!("PoM: submitting share with proof ({} B) and block task for job {}", pom_proof.len(), job_id);
+                    StratumLine {
+                        id: Some(msg_id),
+                        payload: StratumLinePayload::StratumCommand(StratumCommand::MiningSubmit(
+                            MiningSubmit::MiningSubmitWithPomTask((
+                                submit_username.clone(),
+                                job_id,
+                                nonce_hex,
+                                opoi_tag,
+                                cid,
+                                hex::encode(&pom_proof),
+                                hex::encode(root),
+                            )),
+                        )),
+                        jsonrpc: None,
+                        error: None,
+                    }
+                } else if !pom_proof.is_empty() {
                     // PoM (post-fork): fixed 6-slot submit — proof always at params[5], CID-or-empty
                     // at params[4]. The pool relays params[5] -> RpcBlock.pomProof (it does not verify).
                     let proof_hex = hex::encode(&pom_proof);
@@ -530,6 +550,11 @@ impl StratumHandler {
                             ref nonce_size,
                         ))) => self.set_extranonce(extranonce.as_str(), nonce_size),
                         StratumCommand::MiningSetDifficulty((ref difficulty,)) => self.set_difficulty(difficulty),
+                        // H15 (keryx-stratum-v4): the full template header and the window seed of its
+                        // block task. The worker commits its own task root in the header it hashes.
+                        StratumCommand::MiningNotify(MiningNotify::MiningNotifyV4((id, header_hex, timestamp, daa_score, bits, seed_hex))) => {
+                            self.handle_notify_v4(id, header_hex, timestamp, daa_score, bits, seed_hex, miner).await
+                        }
                         // Every notify form that carries the real DAA score: v3 (with the block's compact
                         // bits) and v2, each with or without an AiRequest task (Phase 2 OPoI).
                         StratumCommand::MiningNotify(
@@ -562,6 +587,13 @@ impl StratumHandler {
                                 if self.block_template_ctr.load(Ordering::SeqCst) % 200 == 0 {
                                     warn!("OPoI: no models ready — mining suspended (no inference = no mining)");
                                 }
+                                return miner.process_block(None).await;
+                            }
+                            // Past the block task gate a v3/v2 job cannot become a valid block.
+                            if keryx_miner::block_task::active(daa_score) {
+                                keryx_miner::pom_gpu::log_throttled(u32::MAX, "pool-no-task", || {
+                                    warn!("Block task: the pool sends jobs without a block task (header and window seed) — no block can be valid, job skipped")
+                                });
                                 return miner.process_block(None).await;
                             }
                             let target = effective_target(self.target_pool, block_bits)?;
@@ -600,6 +632,8 @@ impl StratumHandler {
                                         nonce_fixed: self.nonce_fixed,
                                         hash: None,
                                         pom_proof: Vec::new(),
+                                        header: None,
+                                        task_root: None,
                                     }))
                                     .await
                             }
@@ -634,6 +668,8 @@ impl StratumHandler {
                                     nonce_fixed: self.nonce_fixed,
                                     hash: None,
                                     pom_proof: Vec::new(),
+                                    header: None,
+                                    task_root: None,
                                 }))
                                 .await
                         }
@@ -979,6 +1015,72 @@ impl StratumHandler {
                 warn!("OPoI challenge: send_channel closed, could not deliver response");
             }
         });
+    }
+
+    /// A v4 job: decode its header, record the window seed of its block task, and mine it.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_notify_v4(
+        &mut self,
+        id: String,
+        header_hex: String,
+        timestamp: u64,
+        daa_score: u64,
+        bits: u32,
+        seed_hex: String,
+        miner: &mut MinerManager,
+    ) -> Result<(), Error> {
+        let bytes = hex::decode(&header_hex).map_err(|e| format!("mining.notify header is not hex: {e}"))?;
+        let header = <crate::proto::RpcBlockHeader as prost::Message>::decode(bytes.as_slice())
+            .map_err(|e| format!("mining.notify header does not decode: {e}"))?;
+        let window_seed = match seed_hex.as_str() {
+            "" => None,
+            s => {
+                let mut seed = [0u8; 32];
+                hex::decode_to_slice(s, &mut seed).map_err(|e| format!("mining.notify window seed is not 32-byte hex: {e}"))?;
+                Some(seed)
+            }
+        };
+        self.block_template_ctr.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v + 1) % 10_000)).unwrap();
+        LAST_DAA_SCORE.store(daa_score, Ordering::Relaxed);
+        keryx_miner::slm::note_chain_daa(daa_score);
+        // OPoI hard gate (mirrors solo grpc.rs): no models ready = no mining.
+        if !keryx_miner::pow_only() && keryx_miner::slm::loaded_model_ids().is_empty() {
+            if self.block_template_ctr.load(Ordering::SeqCst) % 200 == 0 {
+                warn!("OPoI: no models ready — mining suspended (no inference = no mining)");
+            }
+            return miner.process_block(None).await;
+        }
+        *self.current_task_slot.lock().await = None;
+        if keryx_miner::block_task::active(daa_score) {
+            let window = keryx_verifiable_inference::block_task::window(daa_score);
+            let parents = header.parents.first().map(|p| keryx_miner::block_task::parents_key(&p.parent_hashes));
+            match (window, parents, window_seed) {
+                (Some(w), Some(p), Some(seed)) => keryx_miner::block_task::set_seed(w, &p, seed),
+                _ => {
+                    keryx_miner::pom_gpu::log_throttled(u32::MAX, "pool-no-task", || {
+                        warn!("Block task: the pool sends jobs without a block task (header and window seed) — no block can be valid, job skipped")
+                    });
+                    return miner.process_block(None).await;
+                }
+            }
+        }
+        let target = effective_target(self.target_pool, Some(bits))?;
+        miner
+            .process_block(Some(PartialBlock {
+                id,
+                header_hash: [0; 4],
+                timestamp,
+                daa_score,
+                nonce: 0,
+                target,
+                nonce_mask: self.nonce_mask,
+                nonce_fixed: self.nonce_fixed,
+                hash: None,
+                pom_proof: Vec::new(),
+                header: Some(Box::new(header)),
+                task_root: None,
+            }))
+            .await
     }
 
     /// Parse the task JSON from a `MiningNotifyWithTask`, store it in `current_task_slot`,

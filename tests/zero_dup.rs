@@ -6,9 +6,19 @@
 //!   KERYX_TEST_GGUF=<path to model.gguf> cargo test --release --test zero_dup -- --ignored --nocapture
 
 use keryx_miner::llm_engine::LlamaEngine;
-use keryx_miner::pom::WeightIndex;
+use keryx_miner::pom::{pom_block_seed_v4_era, pom_pow_value, pom_seed_state_v4_era, pph_words_for_era, pph_words_v4, WeightIndex};
+use keryx_miner::pom_v5::{v5_pad_seed, v5_pad_seed_words, walk_final_v5, POM_V5_PAD_TILES_H14};
 use keryx_vulkan::pom_walk::{words4, PomWalkGpu};
 use keryx_vulkan::pom_walk_v4::V4Job;
+
+fn le_leq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    for i in (0..32).rev() {
+        if a[i] != b[i] {
+            return a[i] < b[i];
+        }
+    }
+    true
+}
 
 fn splitmix(x: &mut u64) -> u64 {
     *x = x.wrapping_add(0x9E3779B97F4A7C15);
@@ -130,6 +140,37 @@ fn shared_walk_matches_streamed_blob() {
         eprintln!("v4 target msb {msb:#04x}: shared == blob == {a:?}");
     }
 
+    // 6c. PoM v5 (H15): the v4 walk over the weights and the tier's context pad (filled on the
+    //     device of each walk), shared vs blob, each winner confirmed by the host walk over the
+    //     GGUF: it passes and no nonce before it does. KERYX_TEST_TIER (default 0) picks the pad;
+    //     the model id is tier 0's.
+    let tier: usize = std::env::var("KERYX_TEST_TIER").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let pad_seed = v5_pad_seed(tier as u8, &keryx_miner::models::QWEN3_5_9B_ABLITERATED.model_id, &idx.r_t);
+    let pad_words = v5_pad_seed_words(&pad_seed);
+    let pad_tiles = POM_V5_PAD_TILES_H14[tier];
+    let ts5: u64 = 1_790_000_000_000;
+    let v5_job = |target_le: [u8; 32]| V4Job {
+        pow_words: pph_words_for_era(&pph, true),
+        seed_words: pph_words_v4(&pph),
+        timestamp: ts5,
+        h10_state: pom_seed_state_v4_era(&pph, ts5, u64::MAX),
+        target_le,
+    };
+    for msb in [0x80u8, 0x01, 0x00] {
+        let mut target = [0xFFu8; 32];
+        target[31] = msb;
+        let a = shared.mine_v5(&v5_job(target), start, batch, &pad_words, pad_tiles).expect("shared v5 grind");
+        let b = blob.mine_v5(&v5_job(target), start, batch, &pad_words, pad_tiles).expect("blob v5 grind");
+        assert_eq!(a, b, "v5: winner mismatch at target msb {msb:#x}");
+        let w = a.expect("a winner inside the batch");
+        for n in start..=w {
+            let seed = pom_block_seed_v4_era(&pph, ts5, n, u64::MAX);
+            let pow = pom_pow_value(walk_final_v5(seed, &idx, &pad_seed, pad_tiles).expect("host v5 walk"), &pph, true);
+            assert_eq!(le_leq(&pow, &target), n == w, "v5: host disagrees at nonce {n:#x} (GPU winner {w:#x})");
+        }
+        eprintln!("v5 target msb {msb:#04x}: shared == blob == host == {w:#x} ({} nonces in)", w - start);
+    }
+
     // 7. Hashrate: prefix-table binary search vs shard shift/mask, no-winner target so every
     //    nonce walks all 256 steps. 8×65536 nonces each, warm. Reported per era: H5's v2 walk does
     //    4 mix64 per chunk instead of 1 and is the measured ~4x hashrate drop on RDNA3.
@@ -150,4 +191,7 @@ fn shared_walk_matches_streamed_blob() {
     }
     timed(&format!("blob   v4 ({})", blob.v4_kernel()), &|s: u64| blob.mine_v4(&v4_job(none), s, batch));
     timed(&format!("shared v4 ({})", shared.v4_kernel()), &|s: u64| shared.mine_v4(&v4_job(none), s, batch));
+    timed("blob   v5", &|s: u64| blob.mine_v5(&v5_job(none), s, batch, &pad_words, pad_tiles).unwrap());
+    timed("shared v5", &|s: u64| shared.mine_v5(&v5_job(none), s, batch, &pad_words, pad_tiles).unwrap());
+    eprintln!("pads released: shared {} MiB, blob {} MiB", shared.release_pad() >> 20, blob.release_pad() >> 20);
 }

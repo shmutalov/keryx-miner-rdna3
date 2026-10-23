@@ -20,6 +20,7 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::token::LlamaToken;
 use llama_cpp_sys_2::{
     ggml_log_level, GGML_LOG_LEVEL_CONT, GGML_LOG_LEVEL_ERROR, GGML_LOG_LEVEL_INFO, GGML_LOG_LEVEL_NONE,
     GGML_LOG_LEVEL_WARN,
@@ -57,7 +58,7 @@ impl std::error::Error for PromptTooLong {}
 /// Context window for one request: the prompt plus its token budget, rounded up to [`CTX_STEP`]
 /// and bounded by the model's `ctx_cap`. Each request gets a fresh context, so a short chat never
 /// pays for the cap's KV cache while a long private prompt still fits.
-fn request_ctx(n_prompt: usize, max_tokens: usize, ctx_cap: u32) -> std::result::Result<u32, PromptTooLong> {
+pub fn request_ctx(n_prompt: usize, max_tokens: usize, ctx_cap: u32) -> std::result::Result<u32, PromptTooLong> {
     if n_prompt as u64 + PROMPT_MARGIN as u64 > ctx_cap as u64 {
         return Err(PromptTooLong { tokens: n_prompt, ctx_cap });
     }
@@ -150,6 +151,145 @@ pub struct LlamaEngine {
     /// Largest context (tokens) a request may allocate: the lineup model's `ctx_cap`, or
     /// `KERYX_LLAMA_CTX` when set.
     ctx_cap: u32,
+    /// The canonical trace the GPU is configured with, if any.
+    trace: Mutex<Option<TraceConfig>>,
+}
+
+impl Drop for LlamaEngine {
+    fn drop(&mut self) {
+        if self.trace.get_mut().map_or(false, |t| t.is_some()) {
+            // SAFETY: plain call into the backend; nothing traced runs once the engine drops.
+            unsafe { llama_cpp_sys_2::ggml_backend_vk_keryx_trace_release(TRACE_DEVICE) };
+        }
+    }
+}
+
+// ── Canonical trace (H15 verifiable inference) ───────────────────────────────
+
+/// Most captures one replay takes.
+pub const REPLAY_MAX_CAPTURES: usize = 32;
+/// Tokens per traced decode: the q8_1 mat-vec width of the Vulkan backend, so every product commits
+/// its input in the MMVQ layout the verifier recomputes it from (`verify::layout_for` reads this
+/// batch size back from each position's meta leaf).
+pub const TRACE_UBATCH: u32 = 8;
+/// Context of a block task trace and of its replays: the attention view spans the context, so a
+/// replay must run in the same one to reproduce the trace.
+pub const TASK_CONTEXT_TOKENS: u32 = 64;
+/// Largest captured leaf the engine hands back.
+const CAPTURE_CAP: usize = 4 << 20;
+/// ggml device index of the inference GPU: the pinned, only visible one on a multi-GPU rig.
+const TRACE_DEVICE: usize = 0;
+
+/// The manifest (BLAKE3 of its bytes) and position capacity the GPU trace is configured with.
+struct TraceConfig {
+    manifest: [u8; 32],
+    max_pos: u32,
+    leaves: usize,
+}
+
+/// The request-bound prefix of a traced prompt: its token ids, the token count of the prompt head
+/// they follow, and the rest of the prompt after them.
+pub struct PromptPrefix<'a> {
+    pub tokens: &'a [i32],
+    pub head_tokens: u32,
+    pub rest: &'a str,
+}
+
+/// The prompt head does not tokenize to the prefix offset the consensus pins for the model.
+#[derive(Debug)]
+pub struct PromptHeadMismatch(pub String);
+
+impl std::fmt::Display for PromptHeadMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PromptHeadMismatch {}
+
+/// A traced response: its text and everything needed to commit to and replay it.
+#[derive(Debug, Clone, Default)]
+pub struct TracedGeneration {
+    pub text: String,
+    /// Every token fed to the model: the prompt, then each decoded token, then answer padding.
+    pub tokens: Vec<i32>,
+    pub n_prompt: u32,
+    /// Traced positions (`tokens.len()`).
+    pub n_pos: u32,
+    pub ubatch: Vec<u32>,
+    pub leaves: Vec<[u8; 32]>,
+}
+
+/// A traced evaluation of raw tokens: the batch size and leaves of every position.
+pub struct TracedTokens {
+    pub ubatch: Vec<u32>,
+    pub leaves: Vec<[u8; 32]>,
+}
+
+/// The backend's explanation of the last traced evaluation's failure, or `fallback`.
+fn trace_error(fallback: &str) -> anyhow::Error {
+    // SAFETY: returns a NUL-terminated string valid until the next call on this thread.
+    let detail = unsafe { CStr::from_ptr(llama_cpp_sys_2::ggml_backend_vk_keryx_trace_error(TRACE_DEVICE)) }
+        .to_string_lossy()
+        .into_owned();
+    if detail.is_empty() {
+        anyhow!("{fallback}")
+    } else {
+        anyhow!("{fallback}: {detail}")
+    }
+}
+
+/// Feeds `tokens` at positions `start..` in batches of at most [`TRACE_UBATCH`], announcing each
+/// batch to the trace before its decode; only position `logits_at` produces logits.
+fn feed_traced(ctx: &mut LlamaContext<'_>, batch: &mut LlamaBatch, tokens: &[LlamaToken], start: usize, logits_at: Option<usize>) -> Result<()> {
+    for (c, chunk) in tokens.chunks(TRACE_UBATCH as usize).enumerate() {
+        let base = start + c * TRACE_UBATCH as usize;
+        batch.clear();
+        for (j, &tok) in chunk.iter().enumerate() {
+            batch.add(tok, (base + j) as i32, &[0], Some(base + j) == logits_at)?;
+        }
+        // SAFETY: plain call into the backend.
+        if unsafe { llama_cpp_sys_2::ggml_backend_vk_keryx_trace_ubatch(TRACE_DEVICE, base as u32, chunk.len() as u32) } != 0 {
+            return Err(trace_error("trace batch refused"));
+        }
+        ctx.decode(batch)?;
+    }
+    Ok(())
+}
+
+/// Ends the traced evaluation and reads back its leaves and per-position batch sizes.
+fn read_trace(n_leaves: usize, expect_pos: usize) -> Result<(Vec<u32>, Vec<[u8; 32]>)> {
+    // SAFETY: plain calls into the backend; the buffers are sized from the reported position count.
+    unsafe {
+        let ended = llama_cpp_sys_2::ggml_backend_vk_keryx_trace_end(TRACE_DEVICE);
+        let mut n_pos = 0u32;
+        if ended != 0 || llama_cpp_sys_2::ggml_backend_vk_keryx_trace_read(TRACE_DEVICE, std::ptr::null_mut(), 0, std::ptr::null_mut(), 0, &mut n_pos) != 0 {
+            return Err(trace_error("traced evaluation failed"));
+        }
+        if n_pos as usize != expect_pos {
+            return Err(anyhow!("{n_pos} positions traced for {expect_pos} fed"));
+        }
+        let mut leaves = vec![[0u8; 32]; n_pos as usize * n_leaves];
+        let mut ubatch = vec![0u32; n_pos as usize];
+        let rc = llama_cpp_sys_2::ggml_backend_vk_keryx_trace_read(
+            TRACE_DEVICE,
+            leaves.as_mut_ptr() as *mut u8,
+            leaves.len() * 32,
+            ubatch.as_mut_ptr(),
+            ubatch.len(),
+            &mut n_pos,
+        );
+        if rc != 0 {
+            return Err(trace_error("trace read failed"));
+        }
+        Ok((ubatch, leaves))
+    }
+}
+
+/// Disarms a traced evaluation left behind by an error.
+fn abandon_trace() {
+    // SAFETY: plain call into the backend.
+    unsafe { llama_cpp_sys_2::ggml_backend_vk_keryx_trace_end(TRACE_DEVICE) };
 }
 
 impl LlamaEngine {
@@ -181,14 +321,25 @@ impl LlamaEngine {
             .filter(|&c| c >= CTX_STEP)
             .unwrap_or_else(|| crate::models::spec_for_gguf(gguf_path).map_or(DEFAULT_CTX_CAP, |m| m.ctx_cap));
         info!("llm-engine: model resident, ready to serve (context up to {ctx_cap} tokens per request, q8_0 KV + flash attention)");
-        Ok(Self { model, lock: Mutex::new(()), ctx_cap })
+        Ok(Self { model, lock: Mutex::new(()), ctx_cap, trace: Mutex::new(None) })
+    }
+
+    /// Largest context a request may allocate, in tokens.
+    pub fn ctx_cap(&self) -> u32 {
+        self.ctx_cap
     }
 
     /// A fresh `n_ctx`-token context: 8-bit KV cache with flash attention (half the per-token VRAM
     /// of f16, as upstream), falling back to the default f16 cache for an architecture the fast
     /// path cannot serve.
     fn new_context(&self, backend: &LlamaBackend, n_ctx: u32) -> Result<LlamaContext<'_>> {
-        let n_batch = N_BATCH.min(n_ctx);
+        self.new_context_batched(backend, n_ctx, N_BATCH.min(n_ctx), N_UBATCH)
+    }
+
+    /// [`new_context`](Self::new_context) with explicit batch sizes (a traced evaluation decodes
+    /// [`TRACE_UBATCH`] tokens at a time).
+    fn new_context_batched(&self, backend: &LlamaBackend, n_ctx: u32, n_batch: u32, n_ubatch: u32) -> Result<LlamaContext<'_>> {
+        let n_batch = n_batch.min(n_ctx);
         // swa_full off: sliding-window layers keep only their window (+ one ubatch) of KV instead of
         // the whole context. llama.cpp's full-size default exists for prompt-cache reuse, which a
         // fresh single-sequence context never does — Gemma-4 at 32K: 0.6 GiB of KV instead of 5.6.
@@ -196,7 +347,7 @@ impl LlamaEngine {
             LlamaContextParams::default()
                 .with_n_ctx(NonZeroU32::new(n_ctx))
                 .with_n_batch(n_batch)
-                .with_n_ubatch(N_UBATCH.min(n_batch))
+                .with_n_ubatch(n_ubatch.min(n_batch))
                 .with_swa_full(false)
         };
         let fast = params()
@@ -289,6 +440,245 @@ impl LlamaEngine {
             ctx.decode(&mut batch)?;
         }
         Ok(String::from_utf8_lossy(&out).into_owned())
+    }
+}
+
+impl LlamaEngine {
+    /// Configures the canonical trace of the products named by `manifest` (a serialized tier
+    /// manifest) for evaluations of up to `max_pos` positions; returns the leaves per position. A
+    /// no-op when the GPU already traces this manifest with enough room.
+    pub fn trace_configure(&self, manifest: &[u8], max_pos: u32) -> Result<usize> {
+        let digest = *blake3::hash(manifest).as_bytes();
+        let mut g = self.trace.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(c) = g.as_ref().filter(|c| c.manifest == digest && c.max_pos >= max_pos) {
+            return Ok(c.leaves);
+        }
+        let _serialize = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: the manifest outlives the call; the backend copies what it keeps.
+        let rc = unsafe {
+            llama_cpp_sys_2::ggml_backend_vk_keryx_trace_configure(TRACE_DEVICE, manifest.as_ptr() as *const c_void, manifest.len(), max_pos)
+        };
+        if rc != 0 {
+            *g = None;
+            return Err(anyhow!("trace configuration failed ({rc}) for {max_pos} positions"));
+        }
+        // SAFETY: plain call into the backend.
+        let nl = unsafe { llama_cpp_sys_2::ggml_backend_vk_keryx_trace_leaf_count(TRACE_DEVICE) };
+        if nl <= 0 {
+            return Err(anyhow!("trace configured without leaves"));
+        }
+        *g = Some(TraceConfig { manifest: digest, max_pos, leaves: nl as usize });
+        Ok(nl as usize)
+    }
+
+    /// Leaves per position of the configured trace, if it traces `manifest`.
+    fn trace_leaves(&self, manifest: &[u8], n_pos: usize) -> Result<usize> {
+        let digest = *blake3::hash(manifest).as_bytes();
+        let g = self.trace.lock().unwrap_or_else(|p| p.into_inner());
+        match g.as_ref() {
+            Some(c) if c.manifest == digest && c.max_pos as usize >= n_pos => Ok(c.leaves),
+            _ => Err(anyhow!("the trace is not configured for this manifest and {n_pos} positions")),
+        }
+    }
+
+    /// A context for a traced evaluation: [`TRACE_UBATCH`]-token batches, the KV cache of
+    /// [`new_context`](Self::new_context).
+    fn new_trace_context(&self, backend: &LlamaBackend, n_ctx: u32) -> Result<LlamaContext<'_>> {
+        self.new_context_batched(backend, n_ctx, TRACE_UBATCH, TRACE_UBATCH)
+    }
+
+    /// The token fed as padding: a newline, else the end-of-sequence token.
+    fn pad_token(&self) -> LlamaToken {
+        self.model.str_to_token("\n", AddBos::Never).ok().and_then(|t| t.first().copied()).unwrap_or_else(|| self.model.token_eos())
+    }
+
+    /// Token ids from the miner, checked against the vocabulary.
+    fn vocab_tokens(&self, ids: &[i32]) -> Result<Vec<LlamaToken>> {
+        let n_vocab = self.model.n_vocab();
+        ids.iter()
+            .map(|&id| if (0..n_vocab).contains(&id) { Ok(LlamaToken(id)) } else { Err(anyhow!("token {id} is outside the vocabulary")) })
+            .collect()
+    }
+
+    /// Traced generation under the trace configured for `manifest`: the text, the fed tokens and
+    /// the leaves of every position. With `prefix`, `prompt` is the head alone (it must tokenize to
+    /// `head_tokens` tokens, else [`PromptHeadMismatch`]), followed by the prefix ids and then
+    /// `rest`. The prompt is padded to `min_prompt` positions, and after the answer padding tokens
+    /// are decoded until `answer bytes / answer_bytes_per_position` (at most `max_tokens`) positions
+    /// were generated (0 = no answer padding). `n_ctx` sizes the context from the fed prompt
+    /// length; a replay must use the same.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_traced(
+        &self,
+        manifest: &[u8],
+        prompt: &str,
+        prefix: Option<PromptPrefix<'_>>,
+        max_tokens: usize,
+        min_prompt: u32,
+        answer_bytes_per_position: u32,
+        n_ctx: impl Fn(usize) -> u32,
+    ) -> Result<TracedGeneration> {
+        let mut toks = self.model.str_to_token(prompt, AddBos::Always)?;
+        if let Some(p) = &prefix {
+            if toks.len() != p.head_tokens as usize {
+                return Err(PromptHeadMismatch(format!("the prompt head tokenizes to {} tokens, {} expected", toks.len(), p.head_tokens)).into());
+            }
+            toks.extend(self.vocab_tokens(p.tokens)?);
+            toks.extend(self.model.str_to_token(p.rest, AddBos::Never)?);
+        }
+        let pad = self.pad_token();
+        if toks.len() < min_prompt as usize {
+            toks.resize(min_prompt as usize, pad);
+        }
+        let n_prompt = toks.len();
+        let n_ctx = n_ctx(n_prompt);
+        if n_prompt as u64 + PROMPT_MARGIN as u64 > n_ctx as u64 {
+            return Err(PromptTooLong { tokens: n_prompt, ctx_cap: n_ctx }.into());
+        }
+        let nl = self.trace_leaves(manifest, n_ctx as usize)?;
+        let _serialize = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        let backend = backend()?;
+        let mut ctx = self.new_trace_context(backend, n_ctx)?;
+        let mut batch = LlamaBatch::new(TRACE_UBATCH as usize, 1);
+        // SAFETY: plain call into the backend.
+        if unsafe { llama_cpp_sys_2::ggml_backend_vk_keryx_trace_begin(TRACE_DEVICE) } != 0 {
+            return Err(anyhow!("the trace could not be started"));
+        }
+        let mut run = || -> Result<(Vec<LlamaToken>, Vec<u8>)> {
+            let mut fed = toks.clone();
+            feed_traced(&mut ctx, &mut batch, &toks, 0, Some(n_prompt - 1))?;
+            let mut sampler = LlamaSampler::greedy();
+            let mut out = Vec::<u8>::new();
+            let budget = max_tokens.min((n_ctx as usize).saturating_sub(n_prompt + 1));
+            for _ in 0..budget {
+                let token = sampler.sample(&ctx, batch.n_tokens() - 1);
+                sampler.accept(token);
+                if self.model.is_eog_token(token) {
+                    break;
+                }
+                let piece = match self.model.token_to_piece_bytes(token, 32, false, None) {
+                    Err(llama_cpp_2::TokenToStringError::InsufficientBufferSpace(need)) => {
+                        self.model.token_to_piece_bytes(token, (-need) as usize, false, None)
+                    }
+                    x => x,
+                }?;
+                out.extend_from_slice(&piece);
+                fed.push(token);
+                feed_traced(&mut ctx, &mut batch, &[token], fed.len() - 1, Some(fed.len() - 1))?;
+            }
+            if answer_bytes_per_position > 0 {
+                let need = (out.len() / answer_bytes_per_position as usize).min(max_tokens);
+                while fed.len() - n_prompt < need && fed.len() + 1 < n_ctx as usize {
+                    fed.push(pad);
+                    feed_traced(&mut ctx, &mut batch, &[pad], fed.len() - 1, Some(fed.len() - 1))?;
+                }
+            }
+            Ok((fed, out))
+        };
+        let (fed, out) = match run() {
+            Ok(r) => r,
+            Err(e) => {
+                abandon_trace();
+                return Err(e);
+            }
+        };
+        let (ubatch, leaves) = read_trace(nl, fed.len())?;
+        Ok(TracedGeneration {
+            text: String::from_utf8_lossy(&out).into_owned(),
+            tokens: fed.iter().map(|t| t.0).collect(),
+            n_prompt: n_prompt as u32,
+            n_pos: fed.len() as u32,
+            ubatch,
+            leaves,
+        })
+    }
+
+    /// Traces `tokens` fed as a prompt, with nothing generated, in an `n_ctx`-token context.
+    pub fn trace_tokens(&self, manifest: &[u8], tokens: &[i32], n_ctx: u32) -> Result<TracedTokens> {
+        if tokens.is_empty() || tokens.len() > n_ctx as usize {
+            return Err(anyhow!("{} tokens do not fit a {n_ctx}-token traced context", tokens.len()));
+        }
+        let toks = self.vocab_tokens(tokens)?;
+        let nl = self.trace_leaves(manifest, n_ctx as usize)?;
+        let _serialize = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        let backend = backend()?;
+        let mut ctx = self.new_trace_context(backend, n_ctx)?;
+        let mut batch = LlamaBatch::new(TRACE_UBATCH as usize, 1);
+        // SAFETY: plain call into the backend.
+        if unsafe { llama_cpp_sys_2::ggml_backend_vk_keryx_trace_begin(TRACE_DEVICE) } != 0 {
+            return Err(anyhow!("the trace could not be started"));
+        }
+        if let Err(e) = feed_traced(&mut ctx, &mut batch, &toks, 0, Some(toks.len() - 1)) {
+            abandon_trace();
+            return Err(e);
+        }
+        let (ubatch, leaves) = read_trace(nl, toks.len())?;
+        Ok(TracedTokens { ubatch, leaves })
+    }
+
+    /// Replays a traced evaluation (`tokens`, the first `n_prompt` fed as its prompt) with the
+    /// batching of the original run, in an `n_ctx`-token context as it ran in, up to the last
+    /// requested position, and returns the bytes of each `(position, leaf)` capture, in order.
+    /// `slot_bytes` bounds every captured leaf.
+    pub fn replay_multi(&self, manifest: &[u8], tokens: &[i32], n_prompt: u32, caps: &[(u32, u32)], slot_bytes: usize, n_ctx: u32) -> Result<Vec<Vec<u8>>> {
+        if caps.is_empty() || caps.len() > REPLAY_MAX_CAPTURES || slot_bytes == 0 || slot_bytes > CAPTURE_CAP || slot_bytes % 4 != 0 {
+            return Err(anyhow!("invalid replay request"));
+        }
+        let n_prompt = n_prompt as usize;
+        if n_prompt == 0 || tokens.len() < n_prompt || tokens.len() > n_ctx as usize {
+            return Err(anyhow!("a replay of {} tokens ({n_prompt} prompt) does not fit a {n_ctx}-token context", tokens.len()));
+        }
+        let last = caps.iter().map(|c| c.0 as usize).max().unwrap_or(0);
+        if last >= tokens.len() {
+            return Err(anyhow!("capture past the traced positions"));
+        }
+        let toks = self.vocab_tokens(tokens)?;
+        let nl = self.trace_leaves(manifest, n_ctx as usize)?;
+        let _serialize = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        let backend = backend()?;
+        let mut ctx = self.new_trace_context(backend, n_ctx)?;
+        let mut batch = LlamaBatch::new(TRACE_UBATCH as usize, 1);
+        let pos: Vec<u32> = caps.iter().map(|c| c.0).collect();
+        let leaf: Vec<u32> = caps.iter().map(|c| c.1).collect();
+        if leaf.iter().any(|&l| l as usize >= nl) {
+            return Err(anyhow!("capture of a leaf past the {nl} leaves of a position"));
+        }
+        // SAFETY: plain calls into the backend; the arrays outlive them.
+        unsafe {
+            if llama_cpp_sys_2::ggml_backend_vk_keryx_trace_begin(TRACE_DEVICE) != 0 {
+                return Err(anyhow!("the trace could not be started"));
+            }
+            if llama_cpp_sys_2::ggml_backend_vk_keryx_trace_arm_captures(TRACE_DEVICE, pos.as_ptr(), leaf.as_ptr(), caps.len() as u32, slot_bytes as u32) != 0 {
+                abandon_trace();
+                return Err(anyhow!("the replay captures could not be armed"));
+            }
+        }
+        let mut run = || -> Result<()> {
+            // The prompt is fed in the same TRACE_UBATCH chunks as the original run, through the
+            // chunk holding the last capture; generated positions one by one.
+            let step = TRACE_UBATCH as usize;
+            let prompt_end = if last < n_prompt { n_prompt.min((last / step + 1) * step) } else { n_prompt };
+            feed_traced(&mut ctx, &mut batch, &toks[..prompt_end], 0, Some(n_prompt - 1))?;
+            for p in n_prompt..=last {
+                feed_traced(&mut ctx, &mut batch, &toks[p..=p], p, Some(p))?;
+            }
+            Ok(())
+        };
+        if let Err(e) = run() {
+            abandon_trace();
+            return Err(e);
+        }
+        let mut out = vec![0u8; caps.len() * slot_bytes];
+        let mut lens = vec![0u32; caps.len()];
+        // SAFETY: plain calls into the backend; the buffers hold `caps.len()` slots.
+        unsafe {
+            let ended = llama_cpp_sys_2::ggml_backend_vk_keryx_trace_end(TRACE_DEVICE);
+            let rc = llama_cpp_sys_2::ggml_backend_vk_keryx_trace_read_captures(TRACE_DEVICE, out.as_mut_ptr(), out.len(), lens.as_mut_ptr(), caps.len() as u32);
+            if ended != 0 || rc != 0 {
+                return Err(trace_error(&format!("replay failed ({rc})")));
+            }
+        }
+        Ok(out.chunks(slot_bytes).zip(&lens).map(|(c, &l)| c[..(l as usize).min(slot_bytes)].to_vec()).collect())
     }
 }
 

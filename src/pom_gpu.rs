@@ -66,6 +66,22 @@ impl Resident {
         }
     }
 
+    /// PoM v5 grind over the weights and the context pad of `pad_seed` (filled on first use).
+    fn mine_v5(&self, job: &keryx_vulkan::pom_walk_v4::V4Job, start: u64, batch: u32, pad_seed: &[u64; 4], tiles: u64) -> Result<Option<u64>, String> {
+        match self {
+            Resident::Blob(m) => m.mine_v5(job, start, batch, pad_seed, tiles),
+            Resident::Shared { walk, .. } => walk.mine_v5(job, start, batch, pad_seed, tiles),
+        }
+    }
+
+    /// Frees the context pad; returns the bytes released.
+    fn release_pad(&self) -> u64 {
+        match self {
+            Resident::Blob(m) => m.release_pad(),
+            Resident::Shared { walk, .. } => walk.release_pad(),
+        }
+    }
+
     /// EXTRA VRAM the miner itself holds for this entry: the blob's n_chunks*32, or 0 for the
     /// shared walk (weights belong to the inference engine either way).
     fn extra_vram_bytes(&self) -> u64 {
@@ -94,9 +110,11 @@ pub fn set_mining_tier(tier: crate::models::Tier) {
     let _ = MINING_TIER.set(tier);
 }
 
-/// The model this miner mines for a block at `daa`: the configured tier's model in that era.
+/// The model this miner mines for a block at `daa`: the configured tier's model in that era (the
+/// `--h15-tier` one from the H15 gate on).
 pub fn mining_model(daa: u64) -> Option<&'static crate::models::ModelSpec> {
-    crate::models::pom_model_for_tier(daa, *MINING_TIER.get()?)
+    let tier = *MINING_TIER.get()?;
+    crate::models::pom_model_for_tier(daa, crate::models::mined_tier(daa, tier))
 }
 
 /// Whether a PoM index/blob load is in progress on any device (worker intentionally paused).
@@ -196,10 +214,48 @@ pub fn v4_batch() -> u64 {
     })
 }
 
+/// Runs `log` at most once every 30 s per device and `kind`.
+pub fn log_throttled(device_id: u32, kind: &'static str, log: impl FnOnce()) {
+    static LAST: OnceLock<Mutex<HashMap<(u32, &'static str), std::time::Instant>>> = OnceLock::new();
+    let mut g = LAST.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|p| p.into_inner());
+    let now = std::time::Instant::now();
+    if g.get(&(device_id, kind)).is_some_and(|t| now.duration_since(*t).as_secs() < 30) {
+        return;
+    }
+    g.insert((device_id, kind), now);
+    drop(g);
+    log();
+}
+
+/// The PoM v5 context pad of the tier mined at `daa`: its fill seed words and its tile count.
+/// None before the v5 gate, or while the mining model's index is not built yet.
+fn v5_pad(daa: u64) -> Option<([u64; 4], u64)> {
+    if daa < crate::pom::pom_v5_activation_daa() {
+        return None;
+    }
+    let spec = mining_model(daa)?;
+    let tier = crate::models::pom_tier_index(&spec.model_id, daa)?;
+    let index = crate::pom::index_for(&spec.model_id)?;
+    let tiles = crate::pom_v5::POM_V5_PAD_TILES_H14.get(tier as usize).copied().filter(|&n| n > 0)?;
+    let seed = crate::pom_v5::v5_pad_seed(tier, &spec.model_id, &index.r_t);
+    Some((crate::pom_v5::v5_pad_seed_words(&seed), tiles))
+}
+
+/// Frees the context pad of `device` (inference needs the VRAM); the next v5 grind refills it.
+pub fn release_pad(device: u32) {
+    if let Some(m) = miner_on(device) {
+        let bytes = m.release_pad();
+        if bytes > 0 {
+            info!("PoM v5: context pad released on device {} ({} MiB)", device, bytes >> 20);
+        }
+    }
+}
+
 /// PoM v4 search of nonces `[start, start + batch)` on `device` for a block at `daa` (>= the v4
 /// gate). The seed era (H14-tagged / H10 keccak vs the pre-H10 v4-salted fold) comes from `daa`
 /// through the same `pom` helpers the host proof build uses, so a GPU winner always re-walks to
-/// the same `final_state` on the host. None if not installed or no winner.
+/// the same `final_state` on the host. From the v5 gate on the walk also reads the tier's context
+/// pad. None if not installed or no winner.
 pub fn mine_v4(
     device: u32,
     pre_pow_hash: &[u8; 32],
@@ -217,7 +273,31 @@ pub fn mine_v4(
         h10_state: crate::pom::pom_seed_state_v4_era(pre_pow_hash, timestamp, daa),
         target_le: *target_le,
     };
-    m.mine_v4(&job, start, batch.min(u32::MAX as u64) as u32)
+    let batch = batch.min(u32::MAX as u64) as u32;
+    if daa < crate::pom::pom_v5_activation_daa() {
+        return m.mine_v4(&job, start, batch);
+    }
+    let Some((pad_seed, tiles)) = v5_pad(daa) else {
+        log_throttled(device, "no-pad", || {
+            log::warn!("PoM v5: no context pad for the tier mined at DAA {} (model or index not ready)", daa)
+        });
+        return None;
+    };
+    let t0 = std::time::Instant::now();
+    match m.mine_v5(&job, start, batch, &pad_seed, tiles) {
+        Ok(found) => {
+            if t0.elapsed().as_secs_f64() > 1.0 {
+                info!("PoM v5: {} MiB context pad ready on device {} ({:.1} s)", (tiles * 1024) >> 20, device, t0.elapsed().as_secs_f64());
+            }
+            found
+        }
+        Err(e) => {
+            log_throttled(device, "pad", || {
+                log::warn!("PoM v5: grind failed on device {} — {} (needs {} MiB more VRAM for the context pad)", device, e, (tiles * 1024) >> 20)
+            });
+            None
+        }
+    }
 }
 
 /// Ensure the GPU PoM miner on `device` walks the model a block at `daa` needs; build that model's

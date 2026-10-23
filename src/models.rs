@@ -294,7 +294,7 @@ pub fn pinned_pom_anchor(model_id: &[u8; 32]) -> Option<&'static PomAnchor> {
     POM_ANCHORS.iter().find(|a| &a.model_id == model_id)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tier {
     VeryLight,
     Light,
@@ -340,6 +340,28 @@ pub fn pom_model_for_tier(daa: u64, tier: Tier) -> Option<&'static ModelSpec> {
     })
 }
 
+/// The tier mined from the H15 gate on, when it is not the launch tier (`--h15-tier`). PoM v5 adds
+/// the tier's context pad to the walk's VRAM, so a card that fits a tier's model may not fit it
+/// past H15 (tier 3 on a 20 GB card) and steps down at the gate.
+static H15_TIER: std::sync::OnceLock<Tier> = std::sync::OnceLock::new();
+
+/// Record the tier to mine from the H15 gate on. Set once at startup.
+pub fn set_h15_tier(tier: Tier) {
+    let _ = H15_TIER.set(tier);
+}
+
+/// The hardware tier a miner launched on `tier` mines at `daa`.
+pub fn mined_tier(daa: u64, tier: Tier) -> Tier {
+    tier_at(daa, tier, H15_TIER.get().copied())
+}
+
+fn tier_at(daa: u64, tier: Tier, h15: Option<Tier>) -> Tier {
+    match h15 {
+        Some(t) if daa >= crate::pom::pom_v5_activation_daa() => t,
+        _ => tier,
+    }
+}
+
 /// Every PoM model a `tier` may still mine — the current-era model and, once a later era is
 /// scheduled, its model too. Prefetched together at startup so the era crossing hot-swaps the
 /// resident mining model without stalling on a mid-run download.
@@ -348,13 +370,20 @@ pub fn pom_model_for_tier(daa: u64, tier: Tier) -> Option<&'static ModelSpec> {
 /// below the tip can still be mined, so an era the chain has already left needs no model. `None`
 /// (node unreachable, or pool mining) keeps every scheduled era.
 pub fn pom_models_all_eras(tier: Tier, chain_daa: Option<u64>) -> Vec<&'static ModelSpec> {
+    models_all_eras(tier, H15_TIER.get().copied(), chain_daa)
+}
+
+fn models_all_eras(tier: Tier, h15: Option<Tier>, chain_daa: Option<u64>) -> Vec<&'static ModelSpec> {
     let mut gates = vec![crate::pom::pom_v3_activation_daa(), staging_daa()];
     if crate::pom::private_inference_activation_daa() != u64::MAX {
         gates.push(crate::pom::private_inference_activation_daa());
     }
+    if h15.is_some() && crate::pom::pom_v5_activation_daa() != u64::MAX {
+        gates.push(crate::pom::pom_v5_activation_daa());
+    }
     let mut out: Vec<&'static ModelSpec> = Vec::new();
     for gate in reachable_gates(gates, chain_daa) {
-        let Some(s) = pom_model_for_tier(gate, tier) else { continue };
+        let Some(s) = pom_model_for_tier(gate, tier_at(gate, tier, h15)) else { continue };
         if !out.iter().any(|x| x.model_id == s.model_id) {
             out.push(s);
         }
@@ -501,5 +530,22 @@ mod tests {
             assert_eq!(pom_tier_index(&QWEN3_5_9B_ABLITERATED.model_id, gate - 1), None);
             assert!(pom_model_for_tier(gate - 1, Tier::Default).is_none());
         }
+    }
+
+    /// `--h15-tier`: the launch tier holds below the H15 gate, the H15 tier from it on, and both
+    /// models are staged until the chain passes the gate.
+    #[test]
+    fn h15_tier_takes_over_at_the_gate() {
+        let v5 = crate::pom::pom_v5_activation_daa();
+        assert_eq!(tier_at(v5 - 1, Tier::High, Some(Tier::VeryLight)), Tier::High);
+        assert_eq!(tier_at(v5, Tier::High, Some(Tier::VeryLight)), Tier::VeryLight);
+        assert_eq!(tier_at(v5, Tier::High, None), Tier::High);
+        let names = |h15, chain| models_all_eras(Tier::High, h15, chain).iter().map(|s| s.name).collect::<Vec<_>>();
+        assert_eq!(names(Some(Tier::VeryLight), Some(staging_daa())), vec!["qwen3.8-27b", "qwen3.5-9b-abliterated"]);
+        assert_eq!(names(Some(Tier::VeryLight), Some(v5 - 1)), vec!["qwen3.8-27b", "qwen3.5-9b-abliterated"]);
+        assert_eq!(names(Some(Tier::VeryLight), Some(v5)), vec!["qwen3.5-9b-abliterated"]);
+        assert_eq!(names(None, Some(staging_daa())), vec!["qwen3.8-27b"]);
+        // The launch tier again at H15 stages nothing extra.
+        assert_eq!(models_all_eras(Tier::VeryLight, Some(Tier::VeryLight), Some(staging_daa())).len(), 1);
     }
 }

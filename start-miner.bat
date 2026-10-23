@@ -39,6 +39,9 @@ REM target\release\ai-requests.log (same as --log-ai). Put a file path instead o
 REM to log elsewhere.
 set "KERYX_LOG_AI=1"
 REM --high (Qwen3.8-27B) is gated at 24 GB; the 20 GB 7900 XT needs the gate off to run it.
+REM From the H15 gate (mainnet DAA 140,115,000) PoM v5 adds tier 3's 6.2 GiB context pad, which
+REM no longer fits next to Qwen3.8 on 20 GB: --h15-tier very-light switches to tier 0
+REM (Qwen3.5-9B) at the gate by itself.
 set KERYX_SKIP_VRAM_GATE=1
 REM Cap each inference request at 32K tokens. The model allows 64K, which fits the
 REM 7900 XT with only ~0.3 GiB of VRAM to spare.
@@ -75,7 +78,7 @@ echo.
 
 :run
 call :sync_build
-"%MINER%" --mining-address "%MINING_ADDRESS%" --keryxd-address "%POOL%" --worker "%WORKER%" --very-light
+"%MINER%" --mining-address "%MINING_ADDRESS%" --keryxd-address "%POOL%" --worker "%WORKER%" --high --h15-tier very-light
 
 echo.
 echo Miner exited (code %errorlevel%). Restarting in 5s -- close this window to stop.

@@ -106,6 +106,11 @@ impl From<StratumErrorRepr> for StratumError {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(untagged)]
 pub(crate) enum MiningNotify {
+    // keryx-stratum-v4 (H15 block task): job_id, protobuf RpcBlockHeader (hex), timestamp,
+    // daa_score, bits, window_seed (hex, "" when the pool has none). The worker hashes the header
+    // itself, so it can commit its own task root. Listed first: untagged decoding tries in order,
+    // and the v3 forms carry an array where this one carries the header string.
+    MiningNotifyV4((String, String, u64, u64, u32, String)),
     // keryx-stratum-v3: the block's compact `bits` ride along (6-element with an AiRequest task,
     // 5-element without) so a share that meets the block target is never discarded when the pool
     // difficulty is set above the network's. Listed first: untagged decoding tries in order.
@@ -121,6 +126,9 @@ pub(crate) enum MiningNotify {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(untagged)]
 pub enum MiningSubmit {
+    // 7-element (H15): address, job_id, nonce, opoi_tag, ipfs_cid (or ""), pom_proof_hex,
+    // task_root_hex — the block task root the share's header commits.
+    MiningSubmitWithPomTask((String, String, String, String, String, String, String)),
     // 6-element (PoM, post-fork): address, job_id, nonce, opoi_tag, ipfs_cid (or ""), pom_proof_hex.
     // Fixed slot layout — CID stays at params[4] even when empty so the proof is always params[5].
     // Pool relays params[5] -> RpcBlock.pomProof (it does NOT verify; the node does).

@@ -17,6 +17,8 @@ use std::io::Cursor;
 const POM_WALK_V4_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pom_walk_v4.spv"));
 const POM_WALK_V4_CM_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pom_walk_v4_cm.spv"));
 const POM_SEED_V4_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pom_seed_v4.spv"));
+/// SPIR-V for the PoM v5 context pad fill (`shaders/pom_v5_pad_fill.comp`).
+const POM_V5_PAD_FILL_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pom_v5_pad_fill.spv"));
 
 /// How the walk computes its 32x32x32 int8 state transition. Both are byte-identical.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,7 +72,7 @@ const V4_LUT_SCAN: u32 = 1 << 31;
 const NO_WINNER: u32 = 0xFFFF_FFFF;
 
 /// Walk push-constant block — layout MUST match `Push` in pom_walk_v4.comp (std430: six u64 at
-/// 0..48, four u32 at 48..64; 64 bytes).
+/// 0..48, four u32 at 48..64, two u64 at 64..80, two u32 at 80..88; 88 bytes).
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct V4Push {
@@ -82,6 +84,136 @@ struct V4Push {
     lut_sh: u32,
     /// Always 0: the shader's rho8 uses it as a bit-field offset the compiler can't fold.
     zero: u32,
+    /// v5 pad tiles (0 walks v4), its Barrett reciprocal and the pad steps per walk.
+    n_pad: u64,
+    inv_p: u64,
+    k_pad: u32,
+    _pad1: u32,
+}
+
+/// Walk steps per nonce (`pom_v4::POM_V4_K`).
+const V4_K: u64 = 256;
+
+/// ARX rounds per pad entry — MUST equal `pom_v5::POM_V5_P_ROUNDS`.
+pub const V5_PAD_ROUNDS: u32 = 1_920;
+
+/// Pad entries per fill dispatch: a couple of ms on a 7900 XT, far inside the TDR watchdog.
+const V5_FILL_SLICE: u64 = 1 << 20;
+
+/// Pad entries (one 32 B chunk each) per pad buffer: 1 GiB, like the weight shards.
+const V5_PAD_SHARD_ENTRIES: u64 = 1 << 25;
+
+/// Fill push-constant block — layout MUST match `Push` in pom_v5_pad_fill.comp (56 bytes).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FillPush {
+    base: u64,
+    first: u64,
+    w: [u64; 4],
+    count: u32,
+    rounds: u32,
+}
+
+/// Pad steps of a v5 walk over `weight_tiles` weight and `pad_tiles` pad tiles — MUST equal
+/// `pom_v5::v5_pad_steps`.
+pub fn v5_pad_steps(weight_tiles: u64, pad_tiles: u64) -> u32 {
+    let n = weight_tiles + pad_tiles;
+    ((V4_K * pad_tiles + n / 2) / n).clamp(1, V4_K - 1) as u32
+}
+
+/// The PoM v5 context pad of a tier, resident on the device: entry `e` (32 B) is canonical chunk
+/// `weight_tiles * 32 + e` of the v5 walk. Filled by the device from its seed words, so none of it
+/// crosses the bus. Released through [`destroy`](Self::destroy) before the owning `Vk` drops.
+pub struct PadV5 {
+    shards: Vec<GpuBuffer>,
+    /// (device address, entries) of each shard, in pad order.
+    segs: Vec<(u64, u64)>,
+    tiles: u64,
+}
+
+impl PadV5 {
+    /// Allocates a pad of `tiles` tiles and fills it from `seed_words`
+    /// (`pom_v5::v5_pad_seed_words`, IV already folded in).
+    pub fn fill(vk: &Vk, seed_words: &[u64; 4], tiles: u64) -> Result<Self, String> {
+        if tiles == 0 {
+            return Err("v5 pad: zero tiles".into());
+        }
+        let spirv = ash::util::read_spv(&mut Cursor::new(POM_V5_PAD_FILL_SPV)).map_err(|e| e.to_string())?;
+        let kernel = vk.make_kernel(&spirv, 0, std::mem::size_of::<FillPush>() as u32)?;
+        let mut pad = Self { shards: Vec::new(), segs: Vec::new(), tiles };
+        let entries = tiles * V4_TILE_CHUNKS;
+        let mut fill_all = || -> Result<(), String> {
+            let mut first = 0u64;
+            while first < entries {
+                let n = (entries - first).min(V5_PAD_SHARD_ENTRIES);
+                let (buf, addr) = vk.create_device_local_address_buffer_uninit(n * 32)?;
+                pad.shards.push(buf);
+                pad.segs.push((addr, n));
+                let mut off = 0u64;
+                while off < n {
+                    let count = (n - off).min(V5_FILL_SLICE);
+                    let push = FillPush {
+                        base: addr + off * 32,
+                        first: first + off,
+                        w: *seed_words,
+                        count: count as u32,
+                        rounds: V5_PAD_ROUNDS,
+                    };
+                    vk.dispatch(&kernel, &[], struct_bytes(&push), count.div_ceil(64) as u32);
+                    off += count;
+                }
+                first += n;
+            }
+            Ok(())
+        };
+        let res = fill_all();
+        vk.destroy_kernel(&kernel);
+        if let Err(e) = res {
+            pad.destroy(vk);
+            return Err(e);
+        }
+        Ok(pad)
+    }
+
+    pub fn tiles(&self) -> u64 {
+        self.tiles
+    }
+
+    /// VRAM the pad holds.
+    pub fn bytes(&self) -> u64 {
+        self.tiles * V4_TILE_CHUNKS * 32
+    }
+
+    /// The v5 segment table: the weights of (`prefix`, `addrs`) up to their last whole tile, then
+    /// this pad's shards. Returns the table and the weight tile count.
+    fn tables(&self, prefix: &[u64], addrs: &[u64]) -> (Vec<u64>, Vec<u64>, u64) {
+        let t = addrs.len();
+        let weight_tiles = prefix[t] / V4_TILE_CHUNKS;
+        let cap = weight_tiles * V4_TILE_CHUNKS;
+        let mut p = vec![0u64];
+        let mut a = Vec::with_capacity(t + self.segs.len());
+        for i in 0..t {
+            if prefix[i] >= cap {
+                break;
+            }
+            a.push(addrs[i]);
+            p.push(prefix[i + 1].min(cap));
+        }
+        let mut end = cap;
+        for &(addr, n) in &self.segs {
+            a.push(addr);
+            end += n;
+            p.push(end);
+        }
+        (p, a, weight_tiles)
+    }
+
+    /// Release the pad buffers. Must run before the owning `Vk` drops.
+    pub fn destroy(&self, vk: &Vk) {
+        for b in &self.shards {
+            vk.destroy_buffer(b);
+        }
+    }
 }
 
 /// Seed pre-pass push-constant block — layout MUST match `Push` in pom_seed_v4.comp (std430: six
@@ -140,6 +272,9 @@ pub struct PomWalkV4 {
     t_count: u32,
     n_tiles: u64,
     inv_n: u64,
+    /// v5: pad tiles after the `n_tiles` weight tiles (0 = a v4 walk), and the pad steps per walk.
+    n_pad: u64,
+    k_pad: u32,
 }
 
 impl PomWalkV4 {
@@ -148,10 +283,21 @@ impl PomWalkV4 {
     /// The transition runs on the matrix cores where they pass their checks, else (or with
     /// `KERYX_POM_V4_KERNEL=dot`) on v_dot4; a refusal is explained by [`describe`](Self::describe).
     pub fn new(vk: &Vk, prefix: &[u64], addrs: &[u64]) -> Result<Self, String> {
+        Self::pick_kernel(|kind| Self::with_kernel(vk, prefix, addrs, kind))
+    }
+
+    /// The PoM v5 walk over the weights of (`prefix`, `addrs`) and `pad`. Like [`new`](Self::new),
+    /// the matrix-core kernel must agree with v_dot4 over this very table, pad included.
+    pub fn new_v5(vk: &Vk, prefix: &[u64], addrs: &[u64], pad: &PadV5) -> Result<Self, String> {
+        Self::pick_kernel(|kind| Self::with_kernel_v5(vk, prefix, addrs, pad, kind))
+    }
+
+    /// The requested transition, falling back from refused matrix cores to v_dot4.
+    fn pick_kernel(build: impl Fn(V4Kernel) -> Result<Self, String>) -> Result<Self, String> {
         match requested_kernel() {
-            V4Kernel::Dot4 => Self::with_kernel(vk, prefix, addrs, V4Kernel::Dot4),
-            V4Kernel::MatrixCores => Self::with_kernel(vk, prefix, addrs, V4Kernel::MatrixCores).or_else(|e| {
-                let mut walk = Self::with_kernel(vk, prefix, addrs, V4Kernel::Dot4)?;
+            V4Kernel::Dot4 => build(V4Kernel::Dot4),
+            V4Kernel::MatrixCores => build(V4Kernel::MatrixCores).or_else(|e| {
+                let mut walk = build(V4Kernel::Dot4)?;
                 walk.fallback = Some(e);
                 Ok(walk)
             }),
@@ -160,6 +306,21 @@ impl PomWalkV4 {
 
     /// [`new`](Self::new) with an explicit transition; an unusable matrix-core kernel is an error.
     pub fn with_kernel(vk: &Vk, prefix: &[u64], addrs: &[u64], kind: V4Kernel) -> Result<Self, String> {
+        let n_tiles = prefix.last().copied().unwrap_or(0) / V4_TILE_CHUNKS;
+        Self::with_tables(vk, prefix, addrs, kind, n_tiles, 0)
+    }
+
+    /// [`new_v5`](Self::new_v5) with an explicit transition.
+    pub fn with_kernel_v5(vk: &Vk, prefix: &[u64], addrs: &[u64], pad: &PadV5, kind: V4Kernel) -> Result<Self, String> {
+        if addrs.is_empty() || prefix.len() != addrs.len() + 1 {
+            return Err(format!("v5 walk: malformed segment table ({} starts, {} addresses)", prefix.len(), addrs.len()));
+        }
+        let (p, a, weight_tiles) = pad.tables(prefix, addrs);
+        Self::with_tables(vk, &p, &a, kind, weight_tiles, pad.tiles)
+    }
+
+    /// The walk over a segment table holding `n_tiles` weight tiles, then `n_pad` pad tiles.
+    fn with_tables(vk: &Vk, prefix: &[u64], addrs: &[u64], kind: V4Kernel, n_tiles: u64, n_pad: u64) -> Result<Self, String> {
         let t = addrs.len();
         if t == 0 || prefix.len() != t + 1 || prefix[0] != 0 {
             return Err(format!("v4 walk: malformed segment table ({} starts, {} addresses)", prefix.len(), t));
@@ -168,9 +329,11 @@ impl PomWalkV4 {
             return Err("v4 walk: segment starts are not ascending".into());
         }
         let n_chunks = prefix[t];
-        let n_tiles = n_chunks / V4_TILE_CHUNKS;
         if n_tiles == 0 {
             return Err(format!("v4 walk: blob too small ({n_chunks} chunks, need >= {V4_TILE_CHUNKS})"));
+        }
+        if (n_tiles + n_pad) * V4_TILE_CHUNKS > n_chunks {
+            return Err(format!("v4 walk: {n_tiles} + {n_pad} tiles do not fit {n_chunks} chunks"));
         }
         // Segment indices share their LUT word with the V4_LUT_SCAN bit.
         let t_count = u32::try_from(t).ok().filter(|&n| n <= V4_LUT_SCAN).ok_or("v4 walk: too many segments")?;
@@ -217,6 +380,8 @@ impl PomWalkV4 {
             t_count,
             n_tiles,
             inv_n: u64::MAX / n_tiles,
+            n_pad,
+            k_pad: if n_pad == 0 { 0 } else { v5_pad_steps(n_tiles, n_pad) },
         };
         if kind == V4Kernel::MatrixCores {
             if let Err(e) = walk.check_wave32(vk).and_then(|()| walk.check_against_dot4(vk)) {
@@ -240,9 +405,14 @@ impl PomWalkV4 {
         }
     }
 
-    /// Tiles the walk addresses (`floor(n_chunks / 32)`).
+    /// Weight tiles the walk addresses (`floor(n_chunks / 32)`).
     pub fn n_tiles(&self) -> u64 {
         self.n_tiles
+    }
+
+    /// Pad tiles after the weight tiles: 0 for a v4 walk.
+    pub fn n_pad(&self) -> u64 {
+        self.n_pad
     }
 
     /// The matrix-core kernel is only correct at wave32: walk one nonce and read back the subgroup
@@ -314,6 +484,10 @@ impl PomWalkV4 {
             t_count: self.t_count,
             lut_sh: self.lut_sh,
             zero: 0,
+            n_pad: self.n_pad,
+            inv_p: if self.n_pad == 0 { 0 } else { u64::MAX / self.n_pad },
+            k_pad: self.k_pad,
+            _pad1: 0,
         };
         // Seeds first, then the walk that reads them — one submit, barrier in between.
         let seed_bufs: [&GpuBuffer; 2] = [&self.io, &self.seeds];
@@ -446,6 +620,21 @@ mod tests {
         }
     }
 
+    /// The v5 table caps the weights at their last whole tile and appends the pad shards.
+    #[test]
+    fn v5_tables_cap_the_weights_and_append_the_pad() {
+        let pad = PadV5 { shards: Vec::new(), segs: vec![(0xA000, 64), (0xB000, 32)], tiles: 3 };
+        // 2 tiles + 5 tail chunks over three segments; the last one starts past the cap.
+        let (p, a, w) = pad.tables(&[0, 40, 64, 69], &[0x10, 0x20, 0x30]);
+        assert_eq!(w, 2);
+        assert_eq!(p, vec![0, 40, 64, 128, 160]);
+        assert_eq!(a, vec![0x10, 0x20, 0xA000, 0xB000]);
+        // pom_v5::v5_pad_steps: round(256 * P / (W + P)), clamped to [1, 255].
+        assert_eq!(v5_pad_steps(16_384, 638), ((256 * 638 + 17_022 / 2) / 17_022) as u32);
+        assert_eq!((v5_pad_steps(10, 1), v5_pad_steps(1, 1_000)), (23, 255));
+        assert_eq!(v5_pad_steps(1_000_000, 1), 1);
+    }
+
     #[test]
     fn lut_stays_within_its_ceiling() {
         let prefix: Vec<u64> = vec![0, 927_994_064];
@@ -456,7 +645,8 @@ mod tests {
 
     #[test]
     fn push_and_io_layouts_match_the_shader() {
-        assert_eq!(std::mem::size_of::<V4Push>(), 64);
+        assert_eq!(std::mem::size_of::<V4Push>(), 88);
+        assert_eq!(std::mem::size_of::<FillPush>(), 56);
         assert_eq!(std::mem::size_of::<SeedPush>(), 56);
         assert_eq!(std::mem::size_of::<V4Io>(), 240);
     }

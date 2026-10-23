@@ -512,6 +512,18 @@ impl EscrowWatcher {
         keryx_inference::AiResponder { escrow_pubkey: self.pubkey_bytes, signature: *sig.as_ref() }
     }
 
+    /// Signed trace opening payload: `body ‖ escrow_pubkey ‖ schnorr(blake2b-256("KeryxTraceOpeningV1" ‖ body))`.
+    pub fn sign_opening(&self, body: &[u8]) -> Vec<u8> {
+        let msg = secp256k1::Message::from_digest(keryx_miner::trace::opening_signature_message(body));
+        let keypair = secp256k1::Keypair::from_secret_key(&self.secp, &self.secret_key);
+        let sig = self.secp.sign_schnorr_no_aux_rand(&msg, &keypair);
+        let mut payload = Vec::with_capacity(body.len() + 96);
+        payload.extend_from_slice(body);
+        payload.extend_from_slice(&self.pubkey_bytes);
+        payload.extend_from_slice(sig.as_ref());
+        payload
+    }
+
     /// Scan a confirmed block for the miner's escrow output and check for mature claims.
     /// Returns a claim TX to submit if one is ready; `None` otherwise.
     pub fn handle_block(&mut self, block: &crate::proto::RpcBlock) -> Option<RpcTransaction> {
@@ -1712,6 +1724,20 @@ fn escrow_delegation_message(escrow_pubkey: &[u8; 32]) -> [u8; 32] {
     h.update(ESCROW_DELEGATION_DOMAIN);
     h.update(escrow_pubkey);
     finalize32(h)
+}
+
+/// Service-ledger identity of a payout address — mirror of the node's `miner_key(spk)`:
+/// blake2b-256 keyed "TransactionHash" over `[version_le(2), p2pk_script]`. This is what the
+/// node reports strikes, burns and suspensions against; the escrow key is only the hot key.
+pub fn service_identity_hex(payout_address: &str) -> Result<String, String> {
+    let (version, payout_key) = decode_address(payout_address)?;
+    if version != 0 {
+        return Err(format!("Payout address version {} has no service identity (schnorr P2PK only)", version));
+    }
+    let mut h = Blake2bParams::new().hash_length(32).key(b"TransactionHash").to_state();
+    h.update(&version.to_le_bytes());
+    h.update(&build_p2pk_script(&payout_key));
+    Ok(hex::encode(finalize32(h)))
 }
 
 /// Verifies a delegation cert exactly the way the node does before accepting a block: schnorr

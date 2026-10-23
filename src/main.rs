@@ -556,6 +556,16 @@ async fn run() -> Result<(), Error> {
     } else {
         keryx_miner::models::Tier::Default
     };
+    if let Some(name) = &opt.h15_tier {
+        let h15 = match name.as_str() {
+            "very-light" => keryx_miner::models::Tier::VeryLight,
+            "light" => keryx_miner::models::Tier::Light,
+            "high" => keryx_miner::models::Tier::High,
+            "very-high" => keryx_miner::models::Tier::VeryHigh,
+            _ => keryx_miner::models::Tier::Default,
+        };
+        keryx_miner::models::set_h15_tier(h15);
+    }
     // H14 is live on mainnet (DAA 121,985,000) and testnet (6,000): no pre-H14 block can be mined
     // any more, so stage only the current era's model. Without a known tip every scheduled era would
     // be staged, and a fresh --high install would also fetch the retired Qwen3.6-27B (16.5 GB) —

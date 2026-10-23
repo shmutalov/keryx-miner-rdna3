@@ -70,6 +70,18 @@ impl From<GetBlockRequestMessage> for KaspadMessage {
     }
 }
 
+impl From<crate::proto::GetBlockDagInfoRequestMessage> for KaspadMessage {
+    fn from(a: crate::proto::GetBlockDagInfoRequestMessage) -> Self {
+        KaspadMessage { payload: Some(Payload::GetBlockDagInfoRequest(a)) }
+    }
+}
+
+impl From<crate::proto::GetVirtualSelectedParentChainFromBlockRequestMessage> for KaspadMessage {
+    fn from(a: crate::proto::GetVirtualSelectedParentChainFromBlockRequestMessage) -> Self {
+        KaspadMessage { payload: Some(Payload::GetVirtualSelectedParentChainFromBlockRequest(a)) }
+    }
+}
+
 impl From<NotifyNewBlockTemplateRequestMessage> for KaspadMessage {
     fn from(a: NotifyNewBlockTemplateRequestMessage) -> Self {
         KaspadMessage { payload: Some(Payload::NotifyNewBlockTemplateRequest(a)) }

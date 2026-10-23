@@ -326,6 +326,9 @@ impl MinerManager {
                 // shares the GPU with inference (only that worker pauses during OPoI challenges).
                 let pom_device = gpu_work.device_index().unwrap_or(0);
                 let on_inference_gpu = pom_device == keryx_vulkan::inference_device_index() as u32;
+                // H15: the template id and task root last applied, that template with its task root,
+                // and the task (its trace opens the block task of a winner).
+                let mut task_state: Option<(usize, [u8; 32], Box<pow::State>, Arc<keryx_miner::block_task::DeviceTask>)> = None;
 
                 loop {
                     nonces[0] = 0;
@@ -366,13 +369,7 @@ impl MinerManager {
                             }
                             continue;
                         }
-                        let (pph, time, target_le, daa) = {
-                            let s = state.as_ref().unwrap();
-                            let mut pph = [0u8; 32];
-                            pph.copy_from_slice(&s.pow_hash_header[0..32]);
-                            let time = u64::from_le_bytes(s.pow_hash_header[32..40].try_into().unwrap());
-                            (pph, time, s.target.to_le_bytes(), s.daa_score)
-                        };
+                        let daa = state.as_ref().unwrap().daa_score;
                         // An inference may have evicted the mining model (inference has priority), or
                         // an era gate changed the model this tier mines (tier 3 at H14). Rebuild the
                         // walk (reloads the model resident) before mining resumes.
@@ -404,6 +401,60 @@ impl MinerManager {
                             state = None;
                             continue;
                         }
+                        // H15 block task: the header commits the task trace of its window, which
+                        // this GPU traces on the first template of a window seed (blocking). A
+                        // template without its task cannot become a valid block: wait for the next.
+                        if keryx_miner::block_task::active(daa) && state.as_ref().unwrap().has_template_header() {
+                            let s = state.as_ref().unwrap();
+                            let task = keryx_miner::pom_gpu::mining_model(daa)
+                                .zip(keryx_miner::pom_gpu::current_tier(daa))
+                                .zip(s.parents_key())
+                                .and_then(|((spec, tier), parents)| {
+                                    keryx_miner::block_task::task_for(pom_device, &spec.model_id, tier, daa, &parents)
+                                });
+                            match task {
+                                Some(t) if task_state.as_ref().is_some_and(|ts| ts.0 == s.id && ts.1 == t.root()) => {}
+                                Some(t) => match s.with_task_root(&t.root()) {
+                                    Ok(ns) => task_state = Some((s.id, t.root(), Box::new(ns), t)),
+                                    Err(e) => {
+                                        warn!("{}: block task not applied: {}", gpu_work.id(), e);
+                                        task_state = None;
+                                    }
+                                },
+                                None => {
+                                    task_state = None;
+                                    let w = keryx_verifiable_inference::block_task::window(daa);
+                                    let seed_known = w
+                                        .zip(s.parents_key())
+                                        .is_some_and(|(w, p)| keryx_miner::block_task::seed(w, &p).is_some());
+                                    keryx_miner::pom_gpu::log_throttled(pom_device, "no-task", || {
+                                        info!("PoM: no block task yet (DAA {}, window {:?}, seed known {})", daa, w, seed_known)
+                                    });
+                                }
+                            }
+                            if task_state.as_ref().is_none_or(|ts| ts.0 != s.id) {
+                                if let Some(cmd) = block_channel.get_changed()? {
+                                    state = match cmd {
+                                        Some(WorkerCommand::Job(ns)) => Some(ns),
+                                        Some(WorkerCommand::Close) => return Ok(()),
+                                        None => None,
+                                    };
+                                } else {
+                                    std::thread::sleep(Duration::from_millis(50));
+                                }
+                                continue;
+                            }
+                        } else {
+                            task_state = None;
+                        }
+                        // The template as mined: with its task root once the block task applies.
+                        let (pph, time, target_le) = {
+                            let s: &pow::State = task_state.as_ref().map_or(state.as_ref().unwrap(), |ts| &ts.2);
+                            let mut pph = [0u8; 32];
+                            pph.copy_from_slice(&s.pow_hash_header[0..32]);
+                            let time = u64::from_le_bytes(s.pow_hash_header[32..40].try_into().unwrap());
+                            (pph, time, s.target.to_le_bytes())
+                        };
                         let batch = keryx_miner::pom_gpu::v4_batch();
                         let found = keryx_miner::pom_gpu::mine_v4(pom_device, &pph, time, &target_le, pom_nonce, batch, daa);
                         pom_nonce = pom_nonce.wrapping_add(batch);
@@ -413,9 +464,11 @@ impl MinerManager {
                             // Emit the tier for THIS block's DAA (not the frozen build-time tier) so the
                             // index reindexing at H2 is applied at the exact boundary — else the node
                             // rejects the proof (BadWeightPath).
-                            let built = state.as_ref().and_then(|s| {
+                            let task = task_state.as_ref().map(|ts| Arc::clone(&ts.3));
+                            let mined: Option<&pow::State> = task_state.as_ref().map(|ts| &*ts.2).or(state.as_deref());
+                            let built = mined.and_then(|s| {
                                 let (idx, tier) = keryx_miner::pom_gpu::mining_index(s.daa_score)?;
-                                s.generate_block_if_pom(nonce, idx, tier)
+                                s.generate_block_if_pom(nonce, idx, tier, task.as_deref())
                             });
                             if let Some(block_seed) = built {
                                 match send_channel.blocking_send(block_seed.clone()) {
@@ -575,8 +628,10 @@ impl MinerManager {
                     // recomputed from this block's DAA (per-block, not the frozen build-time tier) so
                     // the H2 reindex is applied at the boundary — else the node rejects (BadWeightPath).
                     let found = if state_ref.daa_score >= keryx_miner::pom::pom_activation_daa() {
+                        // No block task on the CPU path: a pre-H15 template only.
                         keryx_miner::pom_gpu::mining_index(state_ref.daa_score)
-                            .and_then(|(idx, tier)| state_ref.generate_block_if_pom(nonce.0, idx, tier))
+                            .filter(|_| !keryx_miner::block_task::active(state_ref.daa_score))
+                            .and_then(|(idx, tier)| state_ref.generate_block_if_pom(nonce.0, idx, tier, None))
                     } else {
                         state_ref.generate_block_if_pow(nonce.0)
                     };
