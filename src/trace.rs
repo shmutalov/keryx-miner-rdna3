@@ -774,8 +774,8 @@ impl ChainDraw {
         }
         add(r.t, 2 * r.rank as u32 + 1);
         if let Some(moe) = &r.moe {
+            // The attention residual (the router input's source) is the point's src leaf above.
             add(r.t, 2 * moe.down_exps + 1);
-            add(r.t, 2 * moe.gate_exps);
             add(r.t, chain::router_leaf(np, self.n_layers, r.layer) as u32);
         }
         out
@@ -948,7 +948,8 @@ pub fn chain_opening_body(
         let slots = (0..n_used).map(|sl| leaf_chunk(rec, r.t, down_leaf, down_y, sl * per_slot + r.c)).collect::<Option<Vec<_>>>()?;
         let router_leaf = chain::router_leaf(np, ctx.n_layers as u64, r.layer) as u32;
         let row = draw::point(seed, chain::RESID_POINT)[3] % n_exp;
-        let gate_leaf = 2 * moe.gate_exps;
+        // The router input is recomputed from the layer's attention residual (the point's source).
+        let attn_leaf = chain::resid_leaf(np, r.layer, Resid::Attn) as u32;
         ResidAdd::Moe(Box::new(MoeAdd {
             scores: leaf_bytes(rec, r.t, router_leaf, cap(r.t, router_leaf)?),
             bias: bytes_range(m, index, moe.probs_bias as u64, 0, 4 * n_exp)?,
@@ -956,8 +957,8 @@ pub fn chain_opening_body(
             slots,
             shexp: leaf_chunk(rec, r.t, y_leaf, y, r.c)?,
             router_row: bytes_range(m, index, moe.router as u64, row * 4 * dim, 4 * dim)?,
-            gate: m.entry_opening(moe.gate_exps as u64),
-            gate_x: leaf_bytes(rec, r.t, gate_leaf, cap(r.t, gate_leaf)?),
+            resid: leaf_bytes(rec, r.t, attn_leaf, cap(r.t, attn_leaf)?),
+            norm: bytes_range(m, index, moe.ffn_norm as u64, 0, 4 * dim)?,
         }))
     } else if post == manifest::NONE {
         ResidAdd::Chunk(leaf_chunk(rec, r.t, y_leaf, y, r.c)?)
@@ -1215,7 +1216,9 @@ mod tests {
                 if let Some(mo) = &r.moe {
                     assert_eq!(r.kind, Resid::Out);
                     assert!(caps.contains(&(r.t as u32, chain::router_leaf(np, ctx.n_layers as u64, r.layer) as u32)));
-                    assert!(caps.contains(&(r.t as u32, 2 * mo.gate_exps)));
+                    // The router input is recomputed from the layer's whole attention residual.
+                    assert!(caps.contains(&(r.t as u32, chain::resid_leaf(np, r.layer, Resid::Attn) as u32)));
+                    assert!(caps.contains(&(r.t as u32, 2 * mo.down_exps + 1)));
                     moe += 1;
                 }
             }

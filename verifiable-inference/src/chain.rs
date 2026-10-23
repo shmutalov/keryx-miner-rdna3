@@ -113,7 +113,7 @@ pub fn block_deviation(x: &[u8], layout: u8, k: usize, first_block: usize, v: &[
     let mut worst = 0f64;
     for (b, (d, q)) in blocks.get(first_block..first_block.checked_add(n)?)?.iter().enumerate() {
         let vals = &v[b * 32..((b + 1) * 32).min(v.len())];
-        if !d.is_finite() || vals.iter().any(|a| !a.is_finite()) {
+        if !d.is_finite() || !q8::canonical(*d, q) || vals.iter().any(|a| !a.is_finite()) {
             return None;
         }
         if *d == 0.0 {
@@ -275,7 +275,9 @@ pub fn verify_chain_point(
             let h = whole_leaf(&o.pos_root, &shape, leaf, src, 4 * k)?;
             let (b0, n) = norm_fragment(seed, i, k);
             let w = f32_weights(tier, norm, pl.norm, k, b0 * 32, (n * 32).min(k - b0 * 32))?;
-            fragment_link(&p.x, o.layout, k as usize, &rms_scaled(&h, ctx.eps, 1.0), &w, b0, n)?;
+            let x_one = crate::verify::x_len(k, o.layout) as usize;
+            let xs = if p.x.len() == x_one { &p.x[..] } else { p.x.get(o.slot as usize * x_one..(o.slot as usize + 1) * x_one).ok_or(Fail::Shape)? };
+            fragment_link(xs, o.layout, k as usize, &rms_scaled(&h, ctx.eps, 1.0), &w, b0, n)?;
         }
         (manifest::LINK_GLU, LinkOpening::Source { src, y, ids: Some(ids) }) if o.input.n_exp > 1 => {
             let se = open_entry(tier, src, pl.src as u64)?;
@@ -375,8 +377,8 @@ pub fn route_weights(scores: &[f32], bias: &[f32], ids: &[u32], w_scale: f64) ->
 
 /// Relative tolerance of the router scores and of the routed sum.
 pub const EPS_MOE: f64 = 1e-5;
-/// Largest quantization error of a committed Q8_1 value, in units of its block scale.
-const ROUTER_Q8_SLACK: f64 = 0.7;
+/// Relative tolerance of a recomputed router score.
+pub const EPS_ROUTER: f64 = 1.0 / 512.0;
 
 struct MoeCheck<'a> {
     tier: &'a TierCtx,
@@ -388,8 +390,6 @@ struct MoeCheck<'a> {
     dim: u64,
     c: u64,
     seed: &'a Hash,
-    n_ubatch: u32,
-    trimmed: bool,
 }
 
 impl MoeCheck<'_> {
@@ -421,32 +421,17 @@ impl MoeCheck<'_> {
         let ids: Vec<u32> = m.ids.chunk.get(..4 * n_used as usize).ok_or(Fail::Shape)?.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
         let w = route_weights(&scores, &bias, &ids, f32::from_bits(moe.w_scale) as f64).ok_or(Fail::Mismatch)?;
 
-        let ge = open_entry(tier, &m.gate, moe.gate_exps as u64)?;
-        if !layer_role(ge.role, self.trimmed) || ge.k != self.dim || ge.n_exp as u64 != n_exp {
-            return Err(Fail::Manifest);
-        }
-        let layout = if ge.role == manifest::ROLE_OUTPUT { q8::MMVQ } else { crate::verify::layout_for(self.n_ubatch, ge.wtype) };
-        if m.gate_x.bytes.len() as u64 != crate::verify::x_len(self.dim, layout) {
-            return Err(Fail::Shape);
-        }
-        if !b3_verify(self.pos_root, self.shape.n_leaves, 2 * moe.gate_exps as u64, blake3::hash(&m.gate_x.bytes).as_bytes(), &m.gate_x.leaf_path) {
-            return Err(Fail::Trace);
-        }
-        let blocks = q8::blocks(&m.gate_x.bytes, layout, self.dim as usize).ok_or(Fail::Shape)?;
+        let h = whole_leaf(self.pos_root, self.shape, resid_leaf(np, self.layer, Resid::Attn), &m.resid, 4 * self.dim)?;
+        let w_norm = f32_weights(tier, &m.norm, moe.ffn_norm, self.dim, 0, self.dim)?;
+        let v = rms_norm(&h, &w_norm, ctx.eps);
         let row = draw::point(self.seed, RESID_POINT)[3] % n_exp;
         let wr = f32s(&open_bytes(tier, &re, &m.router_row.1, row * 4 * self.dim, 4 * self.dim)?);
-        let (mut dot, mut mag, mut slack) = (0f64, 0f64, 0f64);
-        for (j, &wj) in wr.iter().enumerate() {
-            let (d, q) = &blocks[j / 32];
-            if !d.is_finite() {
-                return Err(Fail::Mismatch);
-            }
-            let xj = q[j % 32] as f64 * *d as f64;
-            dot += wj as f64 * xj;
-            mag += (wj as f64 * xj).abs();
-            slack += (wj as f64).abs() * ROUTER_Q8_SLACK * (*d as f64).abs();
+        let (mut dot, mut mag) = (0f64, 0f64);
+        for (&wj, &vj) in wr.iter().zip(&v) {
+            dot += wj as f64 * vj;
+            mag += (wj as f64 * vj).abs();
         }
-        if !((scores[row as usize] as f64 - dot).abs() <= slack + EPS_MOE * mag + f32::MIN_POSITIVE as f64) {
+        if !((scores[row as usize] as f64 - dot).abs() <= EPS_ROUTER * mag + f32::MIN_POSITIVE as f64) {
             return Err(Fail::Mismatch);
         }
 
@@ -516,6 +501,9 @@ pub fn verify_resid_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, se
 
     let dst_leaf = chunk_leaf(&p.dst, total, c)?;
     let pos_root = b3_fold(shape.n_leaves, resid_leaf(np, layer, kind), &dst_leaf, &p.dst.leaf_path).ok_or(Fail::Trace)?;
+    if p.n_ubatch != crate::verify::expected_ubatch(t, resp.n_prompt) {
+        return Err(Fail::Mismatch);
+    }
     if !b3_verify(&resp.trace_root, resp.n_pos as u64, t, &pos_root, &p.pos_path)
         || !b3_verify(&pos_root, shape.n_leaves, shape.meta_index, &shape.meta_hash(t, p.n_ubatch), &p.meta_path)
     {
@@ -534,9 +522,12 @@ pub fn verify_resid_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, se
         _ => return Err(Fail::Shape),
     };
     let post = if kind == Resid::Attn { ll.post_attn } else { ll.post_ffn };
+    if ll.moe.is_some() && kind == Resid::Out && post == manifest::NONE && !matches!(p.add, ResidAdd::Moe(_)) {
+        return Err(Fail::Shape);
+    }
     if let ResidAdd::Moe(m) = &p.add {
         let moe = ll.moe.filter(|_| kind == Resid::Out && post == manifest::NONE).ok_or(Fail::Shape)?;
-        let ctx2 = MoeCheck { tier, ctx, shape: &shape, pos_root: &pos_root, layer, down: rank, dim, c, seed, n_ubatch: p.n_ubatch, trimmed };
+        let ctx2 = MoeCheck { tier, ctx, shape: &shape, pos_root: &pos_root, layer, down: rank, dim, c, seed };
         return ctx2.verify(&moe, m, &dst, &src, off, n);
     }
     let add: Vec<f64> = match (post, &p.add) {
@@ -602,6 +593,26 @@ mod tests {
         let h = vec_of(1, 3.0);
         let x = vec![0u8; D / 32 * 36];
         assert_eq!(norm_link(&x, q8::MMVQ, &h, &norm_w(), EPS), Err(Fail::Mismatch));
+    }
+
+    #[test]
+    fn a_non_canonical_scale_fails() {
+        let h = vec_of(1, 3.0);
+        let honest = honest_input(&h);
+        let rescaled = |f: f32, flip: bool| -> Vec<u8> {
+            let mut x = honest.clone();
+            for blk in x.chunks_exact_mut(36) {
+                let d = crate::f16::read(blk, 0) * f;
+                blk[..2].copy_from_slice(&crate::f16::from_f32(if flip { -d } else { d }).to_le_bytes());
+                for j in 0..32 {
+                    let q = libm::roundf(blk[4 + j] as i8 as f32 / f) as i8;
+                    blk[4 + j] = (if flip { -q } else { q }) as u8;
+                }
+            }
+            x
+        };
+        assert_eq!(norm_link(&rescaled(64.0, false), q8::MMVQ, &h, &norm_w(), EPS), Err(Fail::Mismatch));
+        assert_eq!(norm_link(&rescaled(1.0, true), q8::MMVQ, &h, &norm_w(), EPS), Err(Fail::Mismatch));
     }
 
     #[test]

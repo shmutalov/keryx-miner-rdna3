@@ -781,8 +781,10 @@ fn arm_trace(spec: &ModelSpec, engine: &InferenceEngine, tier: u8, max_pos: u32)
         }
         Err(e) => {
             TRACE_FAILED.lock().unwrap_or_else(|p| p.into_inner()).push((spec.model_id, KIND));
-            log::error!(
-                "SlmEngine '{}': the stage-2 trace self-check FAILED on this GPU ({e}) — no traced answers or block tasks: past H15 this miner cannot produce valid blocks",
+            // Expected since keryx-node 368f5fe1: a prompt must be traced in 512-token batches (CUDA's
+            // MMQ layout), and this engine traces 8-token MMVQ batches.
+            log::warn!(
+                "SlmEngine '{}': the stage-2 trace self-check failed on this GPU ({e}) — audited (solo) AI requests are left unanswered; mining and pool inference are unaffected",
                 spec.name
             );
             false
