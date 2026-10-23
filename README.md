@@ -89,7 +89,8 @@ on first run (same as upstream).
 which stays in VRAM next to the weights: 0.6 GiB for tier 0, 6.2 GiB for tier 3. Qwen3.8-27B plus
 its pad no longer fits a 20 GB card. `--h15-tier <very-light|light|default|high|very-high>` keeps the
 tier flag until the gate and mines and serves the given tier from it on, e.g.
-`--high --h15-tier very-light`.
+`--high --h15-tier light` (tier 1, GLM-4-9B: 10.8 GiB with its pad). The H15 trace and the v5 walk are
+validated on a 7900 XT for tiers 0 and 1 (about 1.65 M nonces/s on both).
 
 ### Consensus this build mines
 
