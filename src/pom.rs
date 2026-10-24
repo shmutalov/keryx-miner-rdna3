@@ -1614,6 +1614,13 @@ pub fn trace_seed_bind_activation_daa() -> u64 {
     gate(H15_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA)
 }
 
+/// Node `attention_activation`: traces commit sequence leaves and audits open attention and
+/// recurrent points from this DAA. Testnet only (keryx-node 2cd9a23d); this miner does not build
+/// those openings.
+pub fn attention_activation_daa() -> u64 {
+    gate(u64::MAX, TESTNET_H15_ACTIVATION_DAA)
+}
+
 /// Possession indices built in this process, keyed by MODEL. A tier normally mines one model for
 /// the life of the process, but tier 3 swaps models at the H14 gate, so it can need a second index
 /// after the crossing. Each index is built once and leaked to `&'static` (at most one per lineup
@@ -2318,5 +2325,7 @@ mod h15_gate_tests {
         // The node's `block_task_activation` is `never` on both networks.
         assert_eq!(block_task_activation_daa(), u64::MAX);
         assert!(!crate::block_task::active(H15_ACTIVATION_DAA));
+        // The attention rule is dormant on mainnet.
+        assert_eq!(attention_activation_daa(), u64::MAX);
     }
 }

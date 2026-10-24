@@ -111,7 +111,7 @@ Pool miners get the opened prompt from the pool (`mining.ai_request`), and legac
 inference tasks are ignored past the gate.
 
 **H15 (verifiable inference; mainnet DAA 140,115,000 ≈ 2026-10-30, testnet 3,500)** — the rules of
-keryx-node master after v1.6.5 (17aa67ca, the coming 1.6.6):
+keryx-node master after v1.6.5 (2e16ee75, the coming 1.6.6):
 - **PoM v5**: the walk also reads the tier's context pad (`pom_v5`), which the GPU fills from its
   seed. A share of the steps lands on pad tiles, and each next offset folds in the walk state.
 - **No block task**: the node dropped it from H15 (`block_task_activation: never`). Headers keep the
@@ -121,6 +121,8 @@ keryx-node master after v1.6.5 (17aa67ca, the coming 1.6.6):
   batches, so its self-check (trace → replay → the node's verifier, once per model) fails and audited
   solo requests are left unanswered: no inference reward, and no strikes. Pool mining and pool
   inference are unaffected.
+- **Attention rule** (sequence leaves, attention and recurrent openings): testnet only, from its H15
+  gate; dormant on mainnet (`attention_activation: never`). This build does not implement it.
 
 ### Solo mining: escrow delegation cert (required since H6)
 

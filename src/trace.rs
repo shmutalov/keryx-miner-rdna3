@@ -156,11 +156,11 @@ const CHAIN_MANIFESTS: [&[u8]; 5] = [
 /// Stage-2 chain context of each tier, with the prefix embedding and norm entries of its
 /// manifest. MUST equal the node's `TRACE_CHAINS_H15`.
 const CHAIN_CTX: [Option<(ChainCtx, u32, u32)>; 5] = [
-    Some((ChainCtx { n_layers: 32, layer_base: 315, embd_entry: 249, eps: 9.999999974752427e-07, embd_scale: 1.0, trim_last: false, n_used: 0 }, 249, 250)),
-    Some((ChainCtx { n_layers: 40, layer_base: 523, embd_entry: 361, eps: 9.999999747378752e-06, embd_scale: 1.0, trim_last: true, n_used: 0 }, 361, 362)),
-    Some((ChainCtx { n_layers: 48, layer_base: 523, embd_entry: 329, eps: 9.999999974752427e-07, embd_scale: 61.967735290527344, trim_last: false, n_used: 0 }, 329, 330)),
-    Some((ChainCtx { n_layers: 64, layer_base: 627, embd_entry: 497, eps: 9.999999974752427e-07, embd_scale: 1.0, trim_last: false, n_used: 0 }, 497, 498)),
-    Some((ChainCtx { n_layers: 27, layer_base: 503, embd_entry: 395, eps: 9.999999747378752e-06, embd_scale: 1.0, trim_last: true, n_used: 8 }, 395, 396)),
+    Some((ChainCtx { n_layers: 32, layer_base: 315, embd_entry: 249, eps: 9.999999974752427e-07, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 249, 250)),
+    Some((ChainCtx { n_layers: 40, layer_base: 523, embd_entry: 361, eps: 9.999999747378752e-06, embd_scale: 1.0, trim_last: true, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 361, 362)),
+    Some((ChainCtx { n_layers: 48, layer_base: 523, embd_entry: 329, eps: 9.999999974752427e-07, embd_scale: 61.967735290527344, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 329, 330)),
+    Some((ChainCtx { n_layers: 64, layer_base: 627, embd_entry: 497, eps: 9.999999974752427e-07, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 497, 498)),
+    Some((ChainCtx { n_layers: 27, layer_base: 503, embd_entry: 395, eps: 9.999999747378752e-06, embd_scale: 1.0, trim_last: true, n_used: 8, n_attn: 0, n_recur: 0, seq_heads: 0 }, 395, 396)),
 ];
 
 /// Entries of the stage-2 manifest of `tier` and its product count.
@@ -667,7 +667,7 @@ pub fn build_prefix_point(m: &TierManifest, rec: &TraceRecord, ctx: &PrefixCtx, 
 
 /// Encoded opening body, `None` above the consensus size cap.
 pub fn opening_body(response_txid: [u8; 32], points: Vec<Point>, prefix: Option<PrefixPoint>) -> Option<Vec<u8>> {
-    let body = Opening { response_txid, points, prefix, links: Vec::new(), experts: Vec::new(), resid: None }.encode();
+    let body = Opening { response_txid, points, prefix, links: Vec::new(), experts: Vec::new(), resid: None, roots: None }.encode();
     (body.len() <= opening::MAX_BODY_LEN).then_some(body)
 }
 
@@ -981,7 +981,7 @@ pub fn chain_opening_body(
     };
     let n = points.len();
     debug_assert_eq!(experts.len(), n);
-    let body = Opening { response_txid, points, prefix: Some(prefix), links, experts, resid: Some(resid) }.encode();
+    let body = Opening { response_txid, points, prefix: Some(prefix), links, experts, resid: Some(resid), roots: None }.encode();
     (body.len() <= opening::MAX_BODY_LEN).then_some(body)
 }
 
