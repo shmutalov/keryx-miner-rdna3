@@ -111,18 +111,22 @@ Pool miners get the opened prompt from the pool (`mining.ai_request`), and legac
 inference tasks are ignored past the gate.
 
 **H15 (verifiable inference; mainnet DAA 140,115,000 ≈ 2026-10-30, testnet 3,500)** — the rules of
-keryx-node master after v1.6.5 (2e16ee75, the coming 1.6.6):
+keryx-node master after v1.6.5 (d1ab79b3, the coming 1.6.6):
 - **PoM v5**: the walk also reads the tier's context pad (`pom_v5`), which the GPU fills from its
   seed. A share of the steps lands on pad tiles, and each next offset folds in the walk state.
 - **No block task**: the node dropped it from H15 (`block_task_activation: never`). Headers keep the
   H14 layout, and pool shares and solo blocks need no trace. The block-task code stays dormant.
 - **Verifiable inference** applies to solo AI answers only. The node now requires a prompt to be
   traced in 512-token batches (CUDA's MMQ layout). This build's Vulkan trace runs 8-token MMVQ
-  batches, so its self-check (trace → replay → the node's verifier, once per model) fails and audited
-  solo requests are left unanswered: no inference reward, and no strikes. Pool mining and pool
-  inference are unaffected.
-- **Attention rule** (sequence leaves, attention and recurrent openings): testnet only, from its H15
-  gate; dormant on mainnet (`attention_activation: never`). This build does not implement it.
+  batches, so its self-check (trace → replay → the node's verifier, once per model) fails.
+- **Attention rule** (sequence leaves, attention and recurrent openings), from the same H15 gate on
+  both networks. This build does not implement it, so past the gate it skips solo AI requests outright
+  (unreadable private requests still get the fixed error answer).
+- **Solo mining past the gate is not viable with this build.** Every request is audited against the
+  whole cohort of its tier (each identity with a proven block of that tier in the last ~5 minutes),
+  and every member that does not answer in time takes a service strike, at most one an hour: 5 escrow
+  claims burned, then all pending escrow, then a 24 h suspension of the miner cut (blocks stay valid
+  but pay nothing). Mine through a pool: the pool is the cohort identity there, and answers for it.
 
 ### Solo mining: escrow delegation cert (required since H6)
 

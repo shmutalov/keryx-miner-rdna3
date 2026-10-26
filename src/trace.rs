@@ -12,7 +12,7 @@ use keryx_verifiable_inference::opening::{
     ResidSrc,
 };
 use keryx_verifiable_inference::prefix::{self, PrefixCtx};
-use keryx_verifiable_inference::verify::{ResponseCtx, TierCtx};
+use keryx_verifiable_inference::verify::{self, ResponseCtx, TierCtx};
 use std::collections::BTreeMap;
 
 use crate::pom::WeightIndex;
@@ -197,6 +197,12 @@ pub fn prefix_active(accepted_daa: u64) -> bool {
 /// Whether a response generated at `daa` commits the stage-2 trace.
 pub fn chain_active(daa: u64) -> bool {
     daa >= crate::pom::trace_chain_activation_daa()
+}
+
+/// Whether a response generated at `daa` commits sequence leaves and is opened under the
+/// attention rule.
+pub fn attention_active(daa: u64) -> bool {
+    daa >= crate::pom::attention_activation_daa()
 }
 
 /// Whether every traced response accepted at `accepted_daa` is audited.
@@ -668,7 +674,7 @@ pub fn build_prefix_point(m: &TierManifest, rec: &TraceRecord, ctx: &PrefixCtx, 
 /// Encoded opening body, `None` above the consensus size cap.
 pub fn opening_body(response_txid: [u8; 32], points: Vec<Point>, prefix: Option<PrefixPoint>) -> Option<Vec<u8>> {
     let body = Opening { response_txid, points, prefix, links: Vec::new(), experts: Vec::new(), resid: None, roots: None }.encode();
-    (body.len() <= opening::MAX_BODY_LEN).then_some(body)
+    (body.len() + 33 <= opening::MAX_BODY_LEN).then_some(body)
 }
 
 /// The residual point of a stage-2 draw.
@@ -814,9 +820,9 @@ fn row_opening(m: &TierManifest, index: &WeightIndex, entry: u64, row: u64) -> O
     Some((m.entry_opening(entry), range_proof(index, first, last)?))
 }
 
-fn norm_fragment(m: &TierManifest, index: &WeightIndex, entry: u64, seed: &Hash, point: u32) -> Option<(EntryOpening, ChunkRange)> {
+fn norm_fragment(m: &TierManifest, index: &WeightIndex, entry: u64, block: u64) -> Option<(EntryOpening, ChunkRange)> {
     let k = m.entry(entry).k;
-    let (b0, n) = chain::norm_fragment(seed, point, k);
+    let (b0, n) = chain::norm_fragment(block, k);
     bytes_range(m, index, entry, 4 * b0 * 32, 4 * (n * 32).min(k - b0 * 32))
 }
 
@@ -876,11 +882,16 @@ pub fn chain_opening_body(
         let point = build_point(m, rec, p, cap(p.t, p.leaf_x())?.to_vec(), y, index)?;
         experts.push(if p.experts { Some(expert_ids(y, p.n_used)?) } else { None });
         let Chain::Product(pl) = m.entry(p.g_rank).chain else { return None };
+        let g = m.entry(p.g_rank);
+        let layout = verify::input_layout(g.role, point.n_ubatch, g.wtype);
+        let x_one = verify::x_len(g.k, layout) as usize;
+        let xs = if point.x.len() == x_one { &point.x[..] } else { point.x.get(p.slot as usize * x_one..(p.slot as usize + 1) * x_one)? };
+        let block = chain::link_block(seed, i, xs, layout, g.k);
         let link = match (pl.link, link_leaf) {
             (manifest::LINK_NONE, None) => LinkOpening::None,
             (manifest::LINK_ATTN_IN, None) => LinkOpening::Token {
                 embd: row_opening(m, index, ctx.embd_entry as u64, tok(p.t)? as u64)?,
-                norm: norm_fragment(m, index, pl.norm as u64, seed, i)?,
+                norm: norm_fragment(m, index, pl.norm as u64, block?)?,
             },
             (manifest::LINK_GLU, Some(l)) if p.experts => {
                 let y = cap(p.t, *l)?;
@@ -888,15 +899,15 @@ pub fn chain_opening_body(
                 if per_slot == 0 {
                     return None;
                 }
-                let c = p.slot * per_slot + draw::point(seed, i)[3] % per_slot;
+                let c = p.slot * per_slot + block? / chain::CHUNK_BLOCKS;
                 LinkOpening::Source { src: m.entry_opening(pl.src as u64), y: leaf_chunk(rec, p.t, *l, y, c)?, ids: Some(expert_ids(y, p.n_used)?) }
             }
             (manifest::LINK_GLU | manifest::LINK_DIRECT, Some(l)) => {
                 let y = cap(p.t, *l)?;
-                let c = draw::point(seed, i)[3] % y.len().div_ceil(B3_CHUNK).max(1) as u64;
+                let c = block? / chain::CHUNK_BLOCKS;
                 LinkOpening::Source { src: m.entry_opening(pl.src as u64), y: leaf_chunk(rec, p.t, *l, y, c)?, ids: None }
             }
-            (_, Some(l)) => LinkOpening::Norm { src: leaf_bytes(rec, p.t, *l, cap(p.t, *l)?), norm: norm_fragment(m, index, pl.norm as u64, seed, i)? },
+            (_, Some(l)) => LinkOpening::Norm { src: leaf_bytes(rec, p.t, *l, cap(p.t, *l)?), norm: norm_fragment(m, index, pl.norm as u64, block?)? },
             _ => return None,
         };
         points.push(point);
@@ -909,6 +920,9 @@ pub fn chain_opening_body(
     }
     let pos_leaves = rec.leaves_at(t);
     let ptok = prefix::expected_token(pctx, request_hash, t)?;
+    let px = cap(t, 0)?;
+    let e0 = m.entry(0);
+    let pblock = chain::link_block(seed, prefix::PREFIX_POINT, px, verify::input_layout(e0.role, rec.ubatch[t as usize], e0.wtype), e0.k)?;
     let prefix = PrefixPoint {
         n_ubatch: rec.ubatch[t as usize],
         pos_path: b3_path(&rec.pos_roots, t as usize),
@@ -917,7 +931,7 @@ pub fn chain_opening_body(
         x: cap(t, 0)?.to_vec(),
         x_path: b3_path(pos_leaves, 0),
         embd: row_opening(m, index, pctx.embd_entry as u64, ptok as u64)?,
-        norm: norm_fragment(m, index, pctx.norm_entry as u64, seed, prefix::PREFIX_POINT)?,
+        norm: norm_fragment(m, index, pctx.norm_entry as u64, pblock)?,
     };
 
     let r = &d.resid;
@@ -982,7 +996,7 @@ pub fn chain_opening_body(
     let n = points.len();
     debug_assert_eq!(experts.len(), n);
     let body = Opening { response_txid, points, prefix: Some(prefix), links, experts, resid: Some(resid), roots: None }.encode();
-    (body.len() <= opening::MAX_BODY_LEN).then_some(body)
+    (body.len() + 33 <= opening::MAX_BODY_LEN).then_some(body)
 }
 
 /// Checks a stage-2 opening body as the node does; `Err` names the failing part.

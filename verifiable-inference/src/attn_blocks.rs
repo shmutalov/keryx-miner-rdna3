@@ -7,6 +7,15 @@ use crate::merkle::{Hash, b3_path, b3_root, b3_verify};
 pub const BLOCK_BUDGET: usize = 96 * 1024;
 /// Largest difference of the log-sum-exp of two partials of the same positions.
 pub const LSE_TOL: f64 = 1.0 / 256.0;
+/// Largest difference of the outputs of two partials of the same positions, in Q8 steps.
+pub const PARTIAL_STEPS: f64 = 0.25;
+/// Difference of one output value left out of the steps of a leaf: one f16 rounding of the
+/// smallest values.
+const LEAF_FLOOR: f64 = 1.0 / (1u64 << 24) as f64;
+/// The same for a node, whose children and parent are rounded each.
+const NODE_FLOOR: f64 = 2.0 * LEAF_FLOOR;
+/// Largest difference between the log-sum-exp of the opened children and the committed one.
+pub const LSE_ROOT_TOL: f64 = 1.0 / 64.0;
 
 #[cfg(test)]
 thread_local! {
@@ -162,28 +171,38 @@ pub fn combine(parts: &[Partial]) -> Option<Partial> {
     (m.is_finite() && l.is_finite() && o.iter().all(|a| a.is_finite())).then_some(Partial { o, m, l })
 }
 
-/// Largest difference between `a` and `b`, in Q8 steps of each block of 32 values of `b`.
-fn steps(a: &[f64], b: &[f64]) -> Option<f64> {
-    if a.len() != b.len() || !b.len().is_multiple_of(32) {
+/// Largest difference between `a` and `b` beyond `floor` per value, in Q8 steps of each block of
+/// 32 values of `scale`.
+fn steps_on(a: &[f64], b: &[f64], scale: &[f64], floor: f64) -> Option<f64> {
+    if a.len() != b.len() || a.len() != scale.len() || !b.len().is_multiple_of(32) {
         return None;
     }
     let mut dev = 0f64;
-    for (x, y) in a.chunks_exact(32).zip(b.chunks_exact(32)) {
-        let step = (y.iter().fold(0f64, |m, v| m.max(v.abs())) / 127.0).max(f64::MIN_POSITIVE);
-        dev = x.iter().zip(y).fold(dev, |m, (p, q)| m.max((p - q).abs() / step));
+    for ((x, y), z) in a.chunks_exact(32).zip(b.chunks_exact(32)).zip(scale.chunks_exact(32)) {
+        let step = (z.iter().fold(0f64, |m, v| m.max(v.abs())) / 127.0).max(f64::MIN_POSITIVE);
+        dev = x.iter().zip(y).fold(dev, |m, (p, q)| m.max(((p - q).abs() - floor).max(0.0) / step));
     }
     Some(dev)
 }
 
+/// Log of the softmax mass of a partial.
+pub fn lse(p: &Partial) -> f64 {
+    p.m + libm::log(p.l)
+}
+
 /// Whether `a` and `b`, two partials of the same positions, agree.
 pub fn same_partial(a: &Partial, b: &Partial) -> bool {
-    let lse = |p: &Partial| p.m + libm::log(p.l);
-    (lse(a) - lse(b)).abs() <= LSE_TOL && steps(&a.o, &b.o).is_some_and(|d| d <= ATTN_THRESHOLD)
+    (lse(a) - lse(b)).abs() <= LSE_TOL && steps_on(&a.o, &b.o, &b.o, LEAF_FLOOR).is_some_and(|d| d <= PARTIAL_STEPS)
 }
 
 /// Whether `children` combine into `parent`.
 pub fn check_node(parent: &Partial, children: &[Partial]) -> bool {
-    combine(children).is_some_and(|c| same_partial(&c, parent))
+    let Some(c) = combine(children) else { return false };
+    let w: Vec<f64> = children.iter().map(|p| p.l * libm::exp(p.m - c.m) / c.l).collect();
+    let scale: Vec<f64> = (0..c.o.len())
+        .map(|k| children.iter().zip(&w).map(|(p, wi)| wi * p.o[k].abs()).sum::<f64>().max(parent.o.get(k).map_or(0.0, |x| x.abs())))
+        .collect();
+    (lse(&c) - lse(parent)).abs() <= LSE_TOL && steps_on(&c.o, &parent.o, &scale, NODE_FLOOR).is_some_and(|d| d <= PARTIAL_STEPS)
 }
 
 /// Whether the committed attention-output input `x` (`n_out` values, Q8_1 in `layout`) carries
@@ -200,6 +219,60 @@ pub fn check_root(x: &[u8], layout: u8, n_out: usize, head: usize, children: &[P
         return false;
     }
     crate::chain::block_deviation(x, layout, n_out, head * d / 32, &o).is_some_and(|dv| dv <= ATTN_THRESHOLD)
+}
+
+/// [`check_root`] with the softmax mass of `children` matching the committed `lse` of the head.
+pub fn check_root_lse(x: &[u8], layout: u8, n_out: usize, head: usize, children: &[Partial], gate: Option<&[f32]>, committed: f32) -> bool {
+    committed.is_finite()
+        && combine(children).is_some_and(|c| (lse(&c) - committed as f64).abs() <= LSE_ROOT_TOL)
+        && check_root(x, layout, n_out, head, children, gate)
+}
+
+/// Share of the uniform draw among children, out of 8.
+const UNIFORM_EIGHTHS: u8 = 4;
+
+/// Draw weights of `parts`: each child's mass times its largest output value, floored at
+/// `2^-10` of the mass-weighted mean of those values, quantized to `u16` with every weight at
+/// least one; uniform when every output is zero.
+pub fn child_weights(parts: &[Partial]) -> Option<Vec<u16>> {
+    let m = parts.iter().map(|p| p.m).fold(f64::NEG_INFINITY, f64::max);
+    if parts.is_empty() || !m.is_finite() {
+        return None;
+    }
+    let mass: Vec<f64> = parts.iter().map(|p| p.l * libm::exp(p.m - m)).collect();
+    let peak: Vec<f64> = parts.iter().map(|p| p.o.iter().fold(0f64, |a, x| a.max(x.abs()))).collect();
+    let total_mass: f64 = mass.iter().sum();
+    let tau = mass.iter().zip(&peak).map(|(w, o)| w * o).sum::<f64>() / total_mass / 1024.0;
+    let c: Vec<f64> = mass.iter().zip(&peak).map(|(w, &o)| w * (o + tau)).collect();
+    let total: f64 = c.iter().sum();
+    if !total_mass.is_finite() || total_mass <= 0.0 || !total.is_finite() {
+        return None;
+    }
+    if total <= 0.0 {
+        return Some(vec![1; parts.len()]);
+    }
+    Some(c.iter().map(|&x| ((x / total * 65535.0) as u64).clamp(1, 65535) as u16).collect())
+}
+
+/// Child drawn by the chain randomness `rand` among children of draw `weights`: uniformly with
+/// probability 1/8, else in proportion to the weights.
+pub fn draw_weighted_child(rand: &Hash, weights: &[u16]) -> u64 {
+    let h = blake3::hash(&[rand.as_slice(), b"attn-child-w"].concat());
+    let b = h.as_bytes();
+    let n = weights.len().max(1) as u64;
+    let r = u64::from_le_bytes(b[8..16].try_into().unwrap());
+    if b[0] & 7 < UNIFORM_EIGHTHS {
+        return r % n;
+    }
+    let total: u64 = weights.iter().map(|&w| w as u64).sum();
+    let mut at = r % total.max(1);
+    for (i, &w) in weights.iter().enumerate() {
+        if at < w as u64 {
+            return i as u64;
+        }
+        at -= w as u64;
+    }
+    n - 1
 }
 
 /// Whether `claimed` is the partial of query `q` (unscaled) over the rows of a leaf under one of
@@ -434,11 +507,85 @@ mod tests {
         let o: Vec<f64> = vecf(77, D).iter().map(|v| v * 0.3).collect();
         lie[2] = decode_partials(&encode_partial(&Partial { o, m: honest[2].m + 60.0, l: 1.0 }), D).unwrap().remove(0);
         assert!(check_root(&forged_x, q8::MMVQ, 2 * D, 1, &lie, None));
+        let mass = lse(&k.run((0, 256), Arith::Exact)) as f32;
+        assert!(!check_root_lse(&forged_x, q8::MMVQ, 2 * D, 1, &lie, None, mass), "a dominating child moves the committed mass");
         assert!(!check_node(&lie[2], &k.decoded(&[2], Arith::Exact)));
         for j in 0..4u64 {
             let (kr, vr) = k.leaf_rows(&[2, j]);
             assert!(check_leaf(&k.q, SCALE, &kr, &vr, &k.decoded(&[2], Arith::Exact)[j as usize]));
         }
+    }
+
+    #[test]
+    fn the_committed_mass_binds_the_root() {
+        let k = case(0, 256, 16, 4);
+        for a in ARITHS {
+            let honest = k.decoded(&[], a);
+            let x = k.x(a);
+            let mass = lse(&k.run((0, 256), a)) as f32;
+            assert!(check_root_lse(&x, q8::MMVQ, 2 * D, 1, &honest, None, mass), "{a:?}");
+            assert!(!check_root_lse(&x, q8::MMVQ, 2 * D, 1, &honest, None, mass + (2.0 * LSE_ROOT_TOL) as f32), "{a:?}");
+            assert!(!check_root_lse(&x, q8::MMVQ, 2 * D, 1, &honest, None, f32::NAN), "{a:?}");
+        }
+        let honest = k.decoded(&[], Arith::Exact);
+        let top = (0..honest.len()).max_by(|&i, &j| lse(&honest[i]).total_cmp(&lse(&honest[j]))).unwrap();
+        let mut suppressed = honest.clone();
+        suppressed[top].m -= 8.0;
+        let c = combine(&suppressed).unwrap();
+        let mut all = vec![0.0; D];
+        all.extend(c.o.iter().copied());
+        let forged_x = q8_1_row(&all);
+        assert!(check_root(&forged_x, q8::MMVQ, 2 * D, 1, &suppressed, None), "the output alone lets a suppression through");
+        let mass = lse(&k.run((0, 256), Arith::Exact)) as f32;
+        assert!(!check_root_lse(&forged_x, q8::MMVQ, 2 * D, 1, &suppressed, None, mass), "a suppressed child moves the committed mass");
+    }
+
+    #[test]
+    fn weighted_draws_follow_the_contribution_with_a_uniform_floor() {
+        let n = 10_000u32;
+        let count = |w: &[u16], i: u64| (0..n).filter(|s| draw_weighted_child(blake3::hash(&s.to_le_bytes()).as_bytes(), w) == i).count() as f64 / n as f64;
+        let heavy = [1u16, 1, 65533];
+        let u = UNIFORM_EIGHTHS as f64 / 8.0;
+        assert!((count(&heavy, 2) - (1.0 - u + u / 3.0)).abs() < 0.02);
+        assert!((count(&heavy, 0) - u / 3.0).abs() < 0.015, "the uniform share reaches a near-zero child");
+        let even = [100u16; 4];
+        for i in 0..4 {
+            assert!((count(&even, i) - 0.25).abs() < 0.02);
+        }
+        assert!((0..n).all(|s| draw_weighted_child(blake3::hash(&s.to_le_bytes()).as_bytes(), &[7, 9, 11]) < 3));
+        assert_eq!(draw_weighted_child(&[0; 32], &[]), 0);
+    }
+
+    #[test]
+    fn a_dominating_child_draws_the_bulk_of_the_weight() {
+        let k = case(0, 256, 16, 4);
+        let honest = k.decoded(&[], Arith::Exact);
+        let w = child_weights(&honest).unwrap();
+        assert_eq!(w.len(), honest.len());
+        assert!(w.iter().all(|&x| x >= 1));
+        let mut lie = honest.clone();
+        lie[2].m += 60.0;
+        let w = child_weights(&lie).unwrap();
+        assert!(w[2] as f64 / w.iter().map(|&x| x as f64).sum::<f64>() > 0.99);
+        assert_eq!(child_weights(&[]), None);
+        let mut nan = honest.clone();
+        nan[0].m = f64::NAN;
+        assert_eq!(child_weights(&nan), None);
+        let mut zero = honest.clone();
+        zero.iter_mut().for_each(|p| p.o.iter_mut().for_each(|x| *x = 0.0));
+        assert_eq!(child_weights(&zero), Some(vec![1; honest.len()]));
+    }
+
+    #[test]
+    fn a_negligible_child_cannot_raise_the_floor() {
+        let k = case(0, 256, 16, 4);
+        let honest = k.decoded(&[], Arith::Exact);
+        let low = honest.iter().map(|p| p.m).fold(f64::INFINITY, f64::min);
+        let mut quiet = honest.clone();
+        quiet[0] = Partial { o: vec![0.0; honest[0].o.len()], m: low - 40.0, l: 1.0 };
+        let mut loud = quiet.clone();
+        loud[0].o.iter_mut().for_each(|x| *x = 65504.0);
+        assert_eq!(child_weights(&loud), child_weights(&quiet));
     }
 
     #[test]
@@ -463,6 +610,50 @@ mod tests {
         let mut swapped = children.clone();
         swapped.swap(0, 3);
         assert!(check_node(parent, &swapped));
+    }
+
+    #[test]
+    fn a_leaf_off_by_less_than_a_step_is_refused() {
+        let k = case(0, 256, 16, 4);
+        let (kr, vr) = k.leaf_rows(&[1, 3]);
+        let leaf = &k.decoded(&[1], Arith::Exact)[3];
+        assert!(check_leaf(&k.q, SCALE, &kr, &vr, leaf));
+        let step = leaf.o[..32].iter().fold(0f64, |m, v| m.max(v.abs())) / 127.0;
+        let i = (0..32).min_by(|&a, &b| leaf.o[a].abs().total_cmp(&leaf.o[b].abs())).unwrap();
+        let mut off = leaf.clone();
+        off.o[i] += 0.4 * step;
+        let off = decode_partials(&encode_partial(&off), D).unwrap().remove(0);
+        assert!(!check_leaf(&k.q, SCALE, &kr, &vr, &off));
+    }
+
+    #[test]
+    fn honest_children_that_cancel_still_combine_into_their_parent() {
+        let small = |seed| vecf(seed, D).iter().map(|v| v * 0.5).collect::<Vec<f64>>();
+        let big: Vec<f64> = vecf(5, D).iter().map(|v| v * 40.0).collect();
+        let a = Partial { o: big.iter().zip(small(6)).map(|(x, y)| x + y).collect(), m: 3.0, l: 2.0 };
+        let b = Partial { o: big.iter().zip(small(7)).map(|(x, y)| y - x).collect(), m: 3.0, l: 2.0 };
+        let round = |p: &Partial| decode_partials(&encode_partial(p), D).unwrap().remove(0);
+        let parent = round(&combine(&[a.clone(), b.clone()]).unwrap());
+        let children = [round(&a), round(&b)];
+        assert!(steps_on(&combine(&children).unwrap().o, &parent.o, &parent.o, 0.0).unwrap() > PARTIAL_STEPS, "the parent scale alone would refuse it");
+        assert!(check_node(&parent, &children));
+        let mut shifted = children.clone();
+        shifted[0].o.iter_mut().for_each(|x| *x += 1.0);
+        assert!(!check_node(&parent, &shifted));
+    }
+
+    #[test]
+    fn honest_partials_of_tiny_values_still_pass() {
+        let round = |p: &Partial| decode_partials(&encode_partial(p), D).unwrap().remove(0);
+        for scale in [1e-5, 3e-6, 1e-7, 1e-9] {
+            let k = case(0, 256, 16, 4);
+            let tiny = |p: &Partial| Partial { o: p.o.iter().map(|x| x * scale).collect(), ..p.clone() };
+            let children: Vec<Partial> = k.children(&[], Arith::Exact).iter().map(tiny).collect();
+            let parent = round(&combine(&children).unwrap());
+            let rounded: Vec<Partial> = children.iter().map(round).collect();
+            assert!(rounded.iter().zip(&children).all(|(r, c)| same_partial(c, r)), "leaves at {scale}");
+            assert!(check_node(&parent, &rounded), "node at {scale}");
+        }
     }
 
     #[test]

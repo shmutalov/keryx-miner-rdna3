@@ -968,6 +968,12 @@ impl KeryxdHandler {
                 self.inference_rx = Some(job);
                 return;
             }
+            // Under the attention rule an answer must also commit sequence leaves, which this
+            // engine does not trace. The miss is struck like any unanswered cohort assignment.
+            if traced && keryx_miner::trace::attention_active(self.last_known_daa) {
+                warn!("Inference: solo request id={} skipped — answers past the attention gate need sequence leaves this build does not trace; the miss counts as a service strike (mine through a pool)", stable_id);
+                return;
+            }
             // Second guard: re-check readiness at execution time (files could have been deleted).
             if !keryx_miner::slm::is_model_ready(&model_id) {
                 log::error!("Inference: model became unavailable after queuing id={} — discarding request", stable_id);
