@@ -3,9 +3,9 @@
 use crate::draw;
 use crate::manifest::{self, Chain};
 use crate::merkle::{B3_CHUNK, Hash, b3_fold, b3_leaf_from_chunk, b3_verify};
-use crate::opening::{ChunkRange, EntryOpening, ExpertIds, LeafBytes, LeafChunk, LinkOpening, Point, ResidAdd, ResidPoint, ResidSrc};
+use crate::opening::{ChunkRange, EntryOpening, ExpertIds, LeafBytes, LeafChunk, LinkOpening, Point, ResidAdd, ResidOpening, ResidPoint, ResidSrc};
 use crate::attn::{ATTN_THRESHOLD, Partial};
-use crate::attn_blocks::{BlockTree, LSE_ROOT_TOL, block_params, check_leaf, check_node, check_root_lse, child_weights, decode_partials, lse, open_partial, partial_len, partials_root};
+use crate::attn_blocks::{BlockTree, block_params, check_leaf, check_node, check_root_lse, child_weights, decode_partials, lse, open_partial, partial_len, partials_root, root_lse_tol};
 use crate::opening::{AttnOpening, PrefixPoint};
 use crate::prefix::{PrefixCtx, THRESHOLD, expected_input, verify_prefix_point_at};
 use crate::verify::{Fail, PosShape, Report, ResponseCtx, TierCtx, open_bytes, open_entry, open_row, verify_point_at};
@@ -149,6 +149,17 @@ pub fn peak_bounded(x: &[u8], layout: u8, k: u64, slot: u64) -> bool {
 }
 
 /// `v / rms(v)` in f64.
+/// RMS range of a whole residual vector past the embedding.
+pub const RESID_RMS_MIN: f64 = 1e-3;
+pub const RESID_RMS_MAX: f64 = 1024.0;
+/// Lower RMS bound of one chunk of a residual vector.
+pub const RESID_CHUNK_RMS_MIN: f64 = 1e-4;
+
+/// RMS of `v`, in f64.
+fn rms(v: &[f32]) -> f64 {
+    libm::sqrt(v.iter().map(|&a| a as f64 * a as f64).sum::<f64>() / v.len().max(1) as f64)
+}
+
 pub fn rms_scaled(v: &[f32], eps: f64, scale: f64) -> Vec<f64> {
     let e: Vec<f64> = v.iter().map(|&a| a as f64 * scale).collect();
     let inv = 1.0 / libm::sqrt(e.iter().map(|a| a * a).sum::<f64>() / e.len() as f64 + eps);
@@ -227,7 +238,7 @@ pub fn residual_link(dst: &[f32], add: &[f64], src: &[f32], scale: f64) -> Resul
     for ((&d, &a), &s) in dst.iter().zip(add).zip(src) {
         let s = s as f64;
         let tol = EPS_RESID * scale.abs() * (a.abs() + s.abs()) + f32::MIN_POSITIVE as f64;
-        if !(d as f64 - scale * (a + s)).abs().partial_cmp(&tol).is_some_and(std::cmp::Ordering::is_le) {
+        if !tol.is_finite() || !(d as f64 - scale * (a + s)).abs().partial_cmp(&tol).is_some_and(std::cmp::Ordering::is_le) {
             return Err(Fail::Mismatch);
         }
     }
@@ -247,6 +258,12 @@ pub fn shape(tier: &TierCtx, ctx: &ChainCtx, tok: u32) -> PosShape {
 
 pub(crate) fn f32s(b: &[u8]) -> Vec<f32> {
     b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+}
+
+/// [`f32s`] of committed activations, which must all be finite.
+pub(crate) fn finite_f32s(b: &[u8]) -> Result<Vec<f32>, Fail> {
+    let v = f32s(b);
+    if v.iter().all(|x| x.is_finite()) { Ok(v) } else { Err(Fail::Mismatch) }
 }
 
 pub(crate) fn f32_weights(tier: &TierCtx, w: &(EntryOpening, ChunkRange), index: u32, k: u64, offset: u64, n: u64) -> Result<Vec<f32>, Fail> {
@@ -273,7 +290,7 @@ fn whole_leaf(pos_root: &Hash, shape: &PosShape, index: u64, l: &LeafBytes, len:
     if !b3_verify(pos_root, shape.n_leaves, index, blake3::hash(&l.bytes).as_bytes(), &l.leaf_path) {
         return Err(Fail::Trace);
     }
-    Ok(f32s(&l.bytes))
+    finite_f32s(&l.bytes)
 }
 
 fn chunk_leaf_raw(c: &ExpertIds, total_len: u64, index: u64) -> Result<Hash, Fail> {
@@ -292,7 +309,7 @@ pub(crate) fn leaf_chunk(pos_root: &Hash, shape: &PosShape, leaf: u64, c: &LeafC
     if !b3_verify(pos_root, shape.n_leaves, leaf, &h, &c.leaf_path) {
         return Err(Fail::Trace);
     }
-    Ok(f32s(&c.chunk))
+    finite_f32s(&c.chunk)
 }
 
 fn n_chunks(total_len: u64) -> u64 {
@@ -342,6 +359,9 @@ pub fn verify_chain_point(
                 _ => return Err(Fail::Shape),
             };
             let h = whole_leaf(&o.pos_root, &shape, leaf, src, 4 * k)?;
+            if !(RESID_RMS_MIN..=RESID_RMS_MAX).contains(&rms(&h)) {
+                return Err(Fail::Mismatch);
+            }
             let x_one = crate::verify::x_len(k, o.layout) as usize;
             let xs = if p.x.len() == x_one { &p.x[..] } else { p.x.get(o.slot as usize * x_one..(o.slot as usize + 1) * x_one).ok_or(Fail::Shape)? };
             let (b0, n) = norm_fragment(link_block(seed, i, xs, o.layout, k).ok_or(Fail::Shape)?, k);
@@ -538,7 +558,7 @@ impl MoeCheck<'_> {
                 sum += ws * y[j] as f64;
                 mag += (ws * y[j] as f64).abs();
             }
-            if !(dst[j] as f64 - sum).abs().partial_cmp(&(EPS_MOE * mag + f32::MIN_POSITIVE as f64)).is_some_and(std::cmp::Ordering::is_le) {
+            if !mag.is_finite() || !(dst[j] as f64 - sum).abs().partial_cmp(&(EPS_MOE * mag + f32::MIN_POSITIVE as f64)).is_some_and(std::cmp::Ordering::is_le) {
                 return Err(Fail::Mismatch);
             }
         }
@@ -562,6 +582,18 @@ pub fn resid_position(ctx: &ChainCtx, resp: &ResponseCtx, layer: u64, d0: u64) -
     Ok(d0 % n_pos)
 }
 
+/// Residual site `2 * layer + kind` drawn from `d1` among `n_sites`, site `j` weighted `n_sites - j`.
+pub fn resid_site(d1: u64, n_sites: u64) -> u64 {
+    let mut x = d1 % (n_sites * (n_sites + 1) / 2).max(1);
+    for j in 0..n_sites {
+        if x < n_sites - j {
+            return j;
+        }
+        x -= n_sites - j;
+    }
+    0
+}
+
 /// Verify the residual point of a stage-2 opening.
 pub fn verify_resid_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, seed: &Hash, p: &ResidPoint) -> Result<(), Fail> {
     let (np, n_layers) = (tier.n_products, ctx.n_layers as u64);
@@ -569,7 +601,7 @@ pub fn verify_resid_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, se
         return Err(Fail::Shape);
     }
     let d = draw::point(seed, RESID_POINT);
-    let sel = d[1] % (2 * n_layers);
+    let sel = resid_site(d[1], 2 * n_layers);
     let (layer, kind) = (sel / 2, if sel.is_multiple_of(2) { Resid::Attn } else { Resid::Out });
     let t = resid_position(ctx, resp, layer, d[0])?;
     let shape = shape(tier, ctx, p.tok);
@@ -599,7 +631,10 @@ pub fn verify_resid_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, se
     {
         return Err(Fail::Trace);
     }
-    let dst = f32s(&p.dst.chunk);
+    let dst = finite_f32s(&p.dst.chunk)?;
+    if !(RESID_CHUNK_RMS_MIN..=RESID_RMS_MAX).contains(&rms(&dst)) {
+        return Err(Fail::Mismatch);
+    }
     let (off, n) = (c as usize * B3_CHUNK / 4, dst.len());
 
     let src = match (kind, &p.src) {
@@ -638,6 +673,109 @@ pub fn verify_resid_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, se
         return Err(Fail::Manifest);
     }
     residual_link(&dst, &add, &src, scale)
+}
+
+/// Verify a residual opening: its residual point, then one row of the product whose output the
+/// residual adds and, on a routed layer, one row of a routed expert.
+pub fn verify_resid_opening(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, seed: &Hash, op: &ResidOpening) -> Result<(), Fail> {
+    let p = &op.resid;
+    verify_resid_point(tier, ctx, resp, seed, p)?;
+    let (np, n_layers) = (tier.n_products, ctx.n_layers as u64);
+    let d = draw::point(seed, RESID_POINT);
+    let sel = resid_site(d[1], 2 * n_layers);
+    let (layer, kind) = (sel / 2, if sel.is_multiple_of(2) { Resid::Attn } else { Resid::Out });
+    let shape = shape(tier, ctx, p.tok);
+    let ll = match open_entry(tier, &p.layer, ctx.layer_base as u64 + layer)?.chain {
+        Chain::Layer(ll) => ll,
+        _ => return Err(Fail::Manifest),
+    };
+    let rank = if kind == Resid::Attn { ll.proj } else { ll.down } as u64;
+    let pe = open_entry(tier, &p.product, rank)?;
+    let (dim, per) = (pe.m, (B3_CHUNK / 4) as u64);
+    let c = d[2] % n_chunks(4 * dim);
+    let dst_leaf = chunk_leaf(&p.dst, 4 * dim, c)?;
+    let pos_root = b3_fold(shape.n_leaves, resid_leaf(np, layer, kind), &dst_leaf, &p.dst.leaf_path).ok_or(Fail::Trace)?;
+    let lo = c * per;
+    let row = lo + (d[3] >> 32) % per.min(dim.checked_sub(lo).filter(|&n| n > 0).ok_or(Fail::Shape)?);
+    let y_at = |b: &[u8], i: u64| -> Result<f64, Fail> {
+        let i = 4 * i as usize;
+        Ok(f32::from_le_bytes(b.get(i..i + 4).ok_or(Fail::Shape)?.try_into().unwrap()) as f64)
+    };
+    let y = match &p.add {
+        ResidAdd::Chunk(ac) => y_at(&ac.chunk, row - lo)?,
+        ResidAdd::Normed { y, .. } => y_at(&y.bytes, row)?,
+        ResidAdd::Moe(m) => y_at(&m.shexp.chunk, row - lo)?,
+    };
+    let f = &op.feed;
+    feed_row(tier, &shape, &pos_root, p.n_ubatch, (&pe, rank), (0, 0, 1), row, y, (&f.x, &f.x_path), &f.row, f.bias.as_ref())?;
+    match (&p.add, &op.expert) {
+        (ResidAdd::Moe(m), Some(er)) => {
+            let moe = ll.moe.ok_or(Fail::Shape)?;
+            let de = open_entry(tier, &er.entry, moe.down_exps as u64)?;
+            let trimmed = ctx.trim_last && layer + 1 == n_layers;
+            if !layer_role(de.role, trimmed) || de.glu_form != manifest::FORM_NONE || de.n_exp < 2 || de.m != dim {
+                return Err(Fail::Manifest);
+            }
+            let n_used = ctx.n_used as u64;
+            let slot = (d[3] >> 48) % n_used.max(1);
+            let s = 4 * slot as usize;
+            let id = u32::from_le_bytes(m.ids.chunk.get(s..s + 4).ok_or(Fail::Shape)?.try_into().unwrap()) as u64;
+            let y = y_at(&m.slots.get(slot as usize).ok_or(Fail::Shape)?.chunk, row - lo)?;
+            feed_row(tier, &shape, &pos_root, p.n_ubatch, (&de, moe.down_exps as u64), (id, slot, n_used), row, y, (&er.x, &er.x_path), &er.row, None)
+        }
+        (ResidAdd::Moe(_), None) | (_, Some(_)) => Err(Fail::Shape),
+        (_, None) => Ok(()),
+    }
+}
+
+/// Checks `y` against row `row` of expert `exp` of product `e` over its committed input, slot
+/// `slot` of `n_slots` (a single input row serves every slot).
+#[allow(clippy::too_many_arguments)]
+fn feed_row(
+    tier: &TierCtx,
+    shape: &PosShape,
+    pos_root: &Hash,
+    n_ubatch: u32,
+    (e, rank): (&manifest::Entry, u64),
+    (exp, slot, n_slots): (u64, u64, u64),
+    row: u64,
+    y: f64,
+    (x, x_path): (&[u8], &[Hash]),
+    w: &ChunkRange,
+    bias: Option<&(EntryOpening, ChunkRange)>,
+) -> Result<(), Fail> {
+    let layout = crate::verify::input_layout(e.role, n_ubatch, e.wtype);
+    let x_one = crate::verify::x_len(e.k, layout);
+    let xs = match x.len() as u64 {
+        n if n == x_one => x,
+        n if n_slots > 1 && n == n_slots * x_one => &x[(slot * x_one) as usize..((slot + 1) * x_one) as usize],
+        _ => return Err(Fail::Shape),
+    };
+    if !b3_verify(pos_root, shape.n_leaves, 2 * rank, blake3::hash(x).as_bytes(), x_path) {
+        return Err(Fail::Trace);
+    }
+    let k = e.k as usize;
+    if !q8::sums_consistent(xs, layout, k) {
+        return Err(Fail::Mismatch);
+    }
+    let bytes = crate::verify::open_expert_row(tier, e, w, exp, row)?;
+    let r = crate::dot::canonical_dot(e.wtype, &bytes, k, xs, layout).ok_or(Fail::Unsupported)?;
+    let b = match (e.bias, bias) {
+        (manifest::NONE, None) => 0.0,
+        (bi, Some((be, br))) if bi != manifest::NONE && n_slots == 1 => {
+            let bias_entry = open_entry(tier, be, bi as u64)?;
+            if bias_entry.role != manifest::ROLE_BIAS || bias_entry.wtype != 0 || bias_entry.k != e.m {
+                return Err(Fail::Manifest);
+            }
+            f32::from_le_bytes(open_bytes(tier, &bias_entry, br, row * 4, 4)?.try_into().unwrap()) as f64
+        }
+        _ => return Err(Fail::Shape),
+    };
+    let (y_hat, tol) = (r.y_hat + b, crate::verify::EPS * (r.scale + b.abs()));
+    if !(y.is_finite() && y_hat.is_finite() && tol.is_finite()) || !(y - y_hat).abs().partial_cmp(&tol).is_some_and(std::cmp::Ordering::is_le) {
+        return Err(Fail::Mismatch);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -767,6 +905,18 @@ mod tests {
         assert_eq!(glu_link(&x, q8::MMVQ, D, 4, &h[128..256]), Ok(()));
         assert_eq!(glu_link(&x, q8::MMVQ, D, 5, &h[128..256]), Err(Fail::Mismatch));
         assert_eq!(glu_link(&x, q8::MMVQ, D, 15, &h[128..256]), Err(Fail::Mismatch));
+    }
+
+    #[test]
+    fn an_infinite_activation_never_passes_a_link() {
+        assert_eq!(residual_link(&[f32::INFINITY], &[f64::NEG_INFINITY], &[0.0], 1.0), Err(Fail::Mismatch));
+        assert_eq!(residual_link(&[f32::NEG_INFINITY], &[0.0], &[f32::INFINITY], 1.0), Err(Fail::Mismatch));
+        let leaf: Vec<u8> = [1.0f32, f32::INFINITY, 2.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(finite_f32s(&leaf), Err(Fail::Mismatch));
+        let leaf: Vec<u8> = [1.0f32, f32::NAN].iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(finite_f32s(&leaf), Err(Fail::Mismatch));
+        let leaf: Vec<u8> = [1.0f32, -2.5].iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(finite_f32s(&leaf), Ok(vec![1.0, -2.5]));
     }
 
     #[test]
@@ -1216,7 +1366,7 @@ fn mla_phase(
             let mass = committed_lse(ctx, op, s, n_pos, 0, nh, qh)? as f64;
             ARITHS.iter().any(|&ar| {
                 crate::attn::partial(ar, &q, scale, &keys, &values)
-                    .is_some_and(|p| (lse(&p) - mass).abs() <= LSE_ROOT_TOL && block_deviation(x, layout, r, 0, &p.o).is_some_and(|dv| dv <= ATTN_THRESHOLD))
+                    .is_some_and(|p| (lse(&p) - mass).abs() <= root_lse_tol(p.m) && block_deviation(x, layout, r, 0, &p.o).is_some_and(|dv| dv <= ATTN_THRESHOLD))
             })
         }
         (None, None) => false,

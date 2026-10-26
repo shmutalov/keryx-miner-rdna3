@@ -14,8 +14,14 @@ pub const PARTIAL_STEPS: f64 = 0.25;
 const LEAF_FLOOR: f64 = 1.0 / (1u64 << 24) as f64;
 /// The same for a node, whose children and parent are rounded each.
 const NODE_FLOOR: f64 = 2.0 * LEAF_FLOOR;
-/// Largest difference between the log-sum-exp of the opened children and the committed one.
+/// Largest difference between the log-sum-exp of the opened children and the committed one, at a
+/// largest score of zero.
 pub const LSE_ROOT_TOL: f64 = 1.0 / 64.0;
+
+/// [`LSE_ROOT_TOL`] widened with the largest score `m`, up to `|m| = 256`.
+pub fn root_lse_tol(m: f64) -> f64 {
+    LSE_ROOT_TOL + m.abs().min(256.0) / 4096.0
+}
 
 #[cfg(test)]
 thread_local! {
@@ -224,7 +230,7 @@ pub fn check_root(x: &[u8], layout: u8, n_out: usize, head: usize, children: &[P
 /// [`check_root`] with the softmax mass of `children` matching the committed `lse` of the head.
 pub fn check_root_lse(x: &[u8], layout: u8, n_out: usize, head: usize, children: &[Partial], gate: Option<&[f32]>, committed: f32) -> bool {
     committed.is_finite()
-        && combine(children).is_some_and(|c| (lse(&c) - committed as f64).abs() <= LSE_ROOT_TOL)
+        && combine(children).is_some_and(|c| (lse(&c) - committed as f64).abs() <= root_lse_tol(c.m))
         && check_root(x, layout, n_out, head, children, gate)
 }
 
@@ -255,7 +261,7 @@ pub fn child_weights(parts: &[Partial]) -> Option<Vec<u16>> {
 }
 
 /// Child drawn by the chain randomness `rand` among children of draw `weights`: uniformly with
-/// probability 1/8, else in proportion to the weights.
+/// probability 1/2, else in proportion to the weights.
 pub fn draw_weighted_child(rand: &Hash, weights: &[u16]) -> u64 {
     let h = blake3::hash(&[rand.as_slice(), b"attn-child-w"].concat());
     let b = h.as_bytes();
@@ -496,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn a_forged_output_needs_a_forged_child_and_the_child_is_caught_below() {
+    fn an_inconsistent_root_fails_at_the_node_or_the_leaf() {
         let k = case(0, 256, 16, 4);
         let honest = k.decoded(&[], Arith::Exact);
         let mut forged_x = vec![0.0; D];
@@ -508,12 +514,21 @@ mod tests {
         lie[2] = decode_partials(&encode_partial(&Partial { o, m: honest[2].m + 60.0, l: 1.0 }), D).unwrap().remove(0);
         assert!(check_root(&forged_x, q8::MMVQ, 2 * D, 1, &lie, None));
         let mass = lse(&k.run((0, 256), Arith::Exact)) as f32;
-        assert!(!check_root_lse(&forged_x, q8::MMVQ, 2 * D, 1, &lie, None, mass), "a dominating child moves the committed mass");
+        assert!(!check_root_lse(&forged_x, q8::MMVQ, 2 * D, 1, &lie, None, mass));
         assert!(!check_node(&lie[2], &k.decoded(&[2], Arith::Exact)));
         for j in 0..4u64 {
             let (kr, vr) = k.leaf_rows(&[2, j]);
             assert!(check_leaf(&k.q, SCALE, &kr, &vr, &k.decoded(&[2], Arith::Exact)[j as usize]));
         }
+    }
+
+    #[test]
+    fn the_root_tolerance_widens_with_the_largest_score_up_to_a_cap() {
+        assert_eq!(root_lse_tol(0.0), LSE_ROOT_TOL);
+        assert_eq!(root_lse_tol(-147.0), root_lse_tol(147.0));
+        assert!(root_lse_tol(147.0) > 0.0070 * 4.0);
+        assert_eq!(root_lse_tol(1e9), root_lse_tol(256.0));
+        assert_eq!(root_lse_tol(256.0), LSE_ROOT_TOL + 1.0 / 16.0);
     }
 
     #[test]
@@ -524,7 +539,7 @@ mod tests {
             let x = k.x(a);
             let mass = lse(&k.run((0, 256), a)) as f32;
             assert!(check_root_lse(&x, q8::MMVQ, 2 * D, 1, &honest, None, mass), "{a:?}");
-            assert!(!check_root_lse(&x, q8::MMVQ, 2 * D, 1, &honest, None, mass + (2.0 * LSE_ROOT_TOL) as f32), "{a:?}");
+            assert!(!check_root_lse(&x, q8::MMVQ, 2 * D, 1, &honest, None, mass + (2.0 * root_lse_tol(256.0)) as f32), "{a:?}");
             assert!(!check_root_lse(&x, q8::MMVQ, 2 * D, 1, &honest, None, f32::NAN), "{a:?}");
         }
         let honest = k.decoded(&[], Arith::Exact);
@@ -535,9 +550,9 @@ mod tests {
         let mut all = vec![0.0; D];
         all.extend(c.o.iter().copied());
         let forged_x = q8_1_row(&all);
-        assert!(check_root(&forged_x, q8::MMVQ, 2 * D, 1, &suppressed, None), "the output alone lets a suppression through");
+        assert!(check_root(&forged_x, q8::MMVQ, 2 * D, 1, &suppressed, None));
         let mass = lse(&k.run((0, 256), Arith::Exact)) as f32;
-        assert!(!check_root_lse(&forged_x, q8::MMVQ, 2 * D, 1, &suppressed, None, mass), "a suppressed child moves the committed mass");
+        assert!(!check_root_lse(&forged_x, q8::MMVQ, 2 * D, 1, &suppressed, None, mass));
     }
 
     #[test]
@@ -589,7 +604,7 @@ mod tests {
     }
 
     #[test]
-    fn forged_partials_fail_their_checks() {
+    fn inconsistent_partials_fail_their_checks() {
         let k = case(0, 256, 16, 4);
         let parent = &k.decoded(&[], Arith::Exact)[1];
         let children = k.decoded(&[1], Arith::Exact);

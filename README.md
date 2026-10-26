@@ -111,7 +111,7 @@ Pool miners get the opened prompt from the pool (`mining.ai_request`), and legac
 inference tasks are ignored past the gate.
 
 **H15 (verifiable inference; mainnet DAA 140,115,000 ≈ 2026-10-30, testnet 3,500)** — the rules of
-keryx-node master after v1.6.5 (d1ab79b3, the coming 1.6.6):
+keryx-node master after v1.6.5 (ae4f228b, the coming 1.6.6):
 - **PoM v5**: the walk also reads the tier's context pad (`pom_v5`), which the GPU fills from its
   seed. A share of the steps lands on pad tiles, and each next offset folds in the walk state.
 - **No block task**: the node dropped it from H15 (`block_task_activation: never`). Headers keep the
