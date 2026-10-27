@@ -18,9 +18,9 @@ const NODE_FLOOR: f64 = 2.0 * LEAF_FLOOR;
 /// largest score of zero.
 pub const LSE_ROOT_TOL: f64 = 1.0 / 64.0;
 
-/// [`LSE_ROOT_TOL`] widened with the largest score `m`, up to `|m| = 256`.
+/// [`LSE_ROOT_TOL`] widened with the largest score `m`, up to `|m| = 176`.
 pub fn root_lse_tol(m: f64) -> f64 {
-    LSE_ROOT_TOL + m.abs().min(256.0) / 4096.0
+    LSE_ROOT_TOL + m.abs().min(176.0) / 4096.0
 }
 
 #[cfg(test)]
@@ -224,7 +224,18 @@ pub fn check_root(x: &[u8], layout: u8, n_out: usize, head: usize, children: &[P
     {
         return false;
     }
-    crate::chain::block_deviation(x, layout, n_out, head * d / 32, &o).is_some_and(|dv| dv <= ATTN_THRESHOLD)
+    root_within(x, layout, n_out, head * d / 32, &o)
+}
+
+/// Largest deviation, in quantization steps, of a value of the attention-output input.
+pub const ATTN_OUT_MAX: f64 = 3.0;
+/// Values of one block allowed past `ATTN_THRESHOLD`, up to `ATTN_OUT_MAX`.
+pub const ATTN_OUT_SPARE: usize = 4;
+
+/// Whether `o` matches the Q8 blocks of the attention-output input `x` from `first_block`.
+pub fn root_within(x: &[u8], layout: u8, n_out: usize, first_block: usize, o: &[f64]) -> bool {
+    let dev = crate::chain::block_outliers(x, layout, n_out, first_block, o, ATTN_THRESHOLD);
+    dev.is_some_and(|(dv, spare)| dv <= ATTN_OUT_MAX && spare <= ATTN_OUT_SPARE)
 }
 
 /// [`check_root`] with the softmax mass of `children` matching the committed `lse` of the head.
@@ -527,8 +538,8 @@ mod tests {
         assert_eq!(root_lse_tol(0.0), LSE_ROOT_TOL);
         assert_eq!(root_lse_tol(-147.0), root_lse_tol(147.0));
         assert!(root_lse_tol(147.0) > 0.0070 * 4.0);
-        assert_eq!(root_lse_tol(1e9), root_lse_tol(256.0));
-        assert_eq!(root_lse_tol(256.0), LSE_ROOT_TOL + 1.0 / 16.0);
+        assert_eq!(root_lse_tol(1e9), root_lse_tol(176.0));
+        assert_eq!(root_lse_tol(176.0), LSE_ROOT_TOL + 176.0 / 4096.0);
     }
 
     #[test]
@@ -539,7 +550,7 @@ mod tests {
             let x = k.x(a);
             let mass = lse(&k.run((0, 256), a)) as f32;
             assert!(check_root_lse(&x, q8::MMVQ, 2 * D, 1, &honest, None, mass), "{a:?}");
-            assert!(!check_root_lse(&x, q8::MMVQ, 2 * D, 1, &honest, None, mass + (2.0 * root_lse_tol(256.0)) as f32), "{a:?}");
+            assert!(!check_root_lse(&x, q8::MMVQ, 2 * D, 1, &honest, None, mass + (2.0 * root_lse_tol(176.0)) as f32), "{a:?}");
             assert!(!check_root_lse(&x, q8::MMVQ, 2 * D, 1, &honest, None, f32::NAN), "{a:?}");
         }
         let honest = k.decoded(&[], Arith::Exact);
