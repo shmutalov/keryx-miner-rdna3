@@ -1480,3 +1480,65 @@ mod proof_encoding_tests {
         assert!(matches!(line.payload, StratumLinePayload::StratumResult { result: StratumResult::Plain(Some(false)) }));
     }
 }
+
+#[cfg(test)]
+mod notify_v4_tests {
+    use super::*;
+    use crate::proto::{RpcBlockHeader, RpcBlockLevelParents};
+
+    /// A post-H15 template header, as the pool's node hands it over.
+    fn header() -> RpcBlockHeader {
+        RpcBlockHeader {
+            version: 1,
+            parents: vec![
+                RpcBlockLevelParents { parent_hashes: vec!["11".repeat(32), "12".repeat(32)] },
+                RpcBlockLevelParents { parent_hashes: vec!["13".repeat(32)] },
+            ],
+            hash_merkle_root: "22".repeat(32),
+            accepted_id_merkle_root: "23".repeat(32),
+            utxo_commitment: "24".repeat(32),
+            timestamp: 1_790_000_000_000,
+            bits: 0x1d2f_ffff,
+            daa_score: 140_115_001,
+            blue_work: "123456789abcdef".into(),
+            blue_score: 128_000_000,
+            pruning_point: "33".repeat(32),
+            service_state_hash: "55".repeat(32),
+            ..Default::default()
+        }
+    }
+
+    fn pre_pow(h: &RpcBlockHeader) -> [u8; 32] {
+        let mut hasher = crate::pow::HeaderHasher::new();
+        crate::pow::serialize_header(&mut hasher, h, true);
+        hasher.finalize().to_le_bytes()
+    }
+
+    /// The header of a v4 job survives the pool's encoding (prost bytes as hex in `mining.notify`
+    /// params[1]) and our decoding in `handle_notify_v4` unchanged, so the pre-PoW hash this miner
+    /// grinds is the one of the pool's template.
+    #[test]
+    fn v4_job_header_round_trips_to_the_same_pre_pow_hash() {
+        let sent = header();
+        let header_hex = hex::encode(prost::Message::encode_to_vec(&sent));
+        let raw = format!(
+            r#"{{"id":null,"method":"mining.notify","params":["job7","{header_hex}",{},{},{},""]}}"#,
+            sent.timestamp, sent.daa_score, sent.bits
+        );
+        let line: StratumLine = serde_json::from_str(&raw).unwrap();
+        let StratumLinePayload::StratumCommand(StratumCommand::MiningNotify(MiningNotify::MiningNotifyV4((_, h, ts, daa, bits, _)))) = line.payload else {
+            panic!("expected MiningNotifyV4");
+        };
+        assert_eq!((ts, daa, bits), (sent.timestamp as u64, sent.daa_score, sent.bits));
+        // Exactly the decode `handle_notify_v4` runs.
+        let bytes = hex::decode(&h).unwrap();
+        let got = <RpcBlockHeader as prost::Message>::decode(bytes.as_slice()).unwrap();
+        assert_eq!(got, sent);
+        assert_eq!(pre_pow(&got), pre_pow(&sent));
+        // No block task past the gate: the header carries no task root, and none is hashed.
+        assert!(got.task_root.is_empty());
+        let mut with_root = got.clone();
+        with_root.task_root = "44".repeat(32);
+        assert_eq!(pre_pow(&with_root), pre_pow(&got));
+    }
+}

@@ -363,6 +363,95 @@ mod tests {
         parsed.error.expect("line should carry an error")
     }
 
+    /// v4 (H15), ported from keryx-miner-supr 0.15.1: a notify whose field 1 is a STRING (the prost
+    /// header hex) must match `MiningNotifyV4` and never a v3 arm, and a v3 notify (field 1 = array)
+    /// must still NOT match v4. The 7-tuple submit must round-trip as `MiningSubmitWithPomTask`.
+    #[test]
+    fn mining_notify_v4_and_submit_task_roundtrip() {
+        // v4: string at slot 1 -> MiningNotifyV4
+        let v4 = serde_json::from_str::<MiningNotify>(r#"["jobV4","0a02deadbeef",111,222,490707704,"ff00ff00"]"#)
+            .expect("v4 notify must deserialize");
+        match v4 {
+            MiningNotify::MiningNotifyV4((id, header_hex, ts, daa, bits, seed)) => {
+                assert_eq!((id.as_str(), ts, daa, bits, seed.as_str()), ("jobV4", 111, 222, 490707704, "ff00ff00"));
+                assert_eq!(header_hex, "0a02deadbeef");
+            }
+            other => panic!("string-at-slot-1 notify must be V4, got {other:?}"),
+        }
+        // empty window seed stays a valid v4 line
+        assert!(matches!(serde_json::from_str::<MiningNotify>(r#"["j","00",1,2,3,""]"#).unwrap(), MiningNotify::MiningNotifyV4(_)));
+        // v3 (array at slot 1) must NOT be mistaken for v4
+        assert!(!matches!(
+            serde_json::from_str::<MiningNotify>(r#"["j3",[1,2,3,4],5,6,490707704]"#).unwrap(),
+            MiningNotify::MiningNotifyV4(_)
+        ));
+        // 7-tuple submit round-trips as MiningSubmitWithPomTask
+        let s = MiningSubmit::MiningSubmitWithPomTask((
+            "addr".into(),
+            "job".into(),
+            "000000000000002a".into(),
+            "tag".into(),
+            "".into(),
+            "abcd".into(),
+            "ff".repeat(32),
+        ));
+        let json = serde_json::to_string(&s).unwrap();
+        match serde_json::from_str::<MiningSubmit>(&json).unwrap() {
+            MiningSubmit::MiningSubmitWithPomTask((a, _, n, _, _, p, root)) => {
+                assert_eq!((a.as_str(), n.as_str(), p.as_str()), ("addr", "000000000000002a", "abcd"));
+                assert_eq!(root.len(), 64);
+            }
+            other => panic!("7-tuple submit must be WithPomTask, got {other:?}"),
+        }
+    }
+
+    /// A whole v4 `mining.notify` line, as the pool sends it, reaches `MiningNotifyV4` through
+    /// `StratumLine` (the path `handle_message` takes), with or without a window seed.
+    #[test]
+    fn mining_notify_v4_line_decodes() {
+        for seed in ["", "ab"] {
+            let raw = format!(r#"{{"id":null,"method":"mining.notify","params":["job7","0a02deadbeef",1790000000000,140115001,490707704,"{seed}"]}}"#);
+            let line: StratumLine = serde_json::from_str(&raw).unwrap();
+            match line.payload {
+                StratumLinePayload::StratumCommand(StratumCommand::MiningNotify(MiningNotify::MiningNotifyV4((id, h, ts, daa, bits, s)))) => {
+                    assert_eq!((id.as_str(), h.as_str(), ts, daa, bits, s.as_str()), ("job7", "0a02deadbeef", 1790000000000, 140115001, 490707704, seed));
+                }
+                other => panic!("expected MiningNotifyV4, got {other:?}"),
+            }
+        }
+    }
+
+    /// The share this miner sends past the H15 gate: the plain 6-element PoM submit (no task root),
+    /// with the proof as hex or as tagged base64. It serializes with the proof at params[5] and
+    /// decodes back as `MiningSubmitWithPom`, not as the 7-element task form.
+    #[test]
+    fn post_h15_pom_submit_is_six_fields() {
+        for proof in ["aabb", "b64:qrs="] {
+            let line = StratumLine {
+                id: Some(9),
+                payload: StratumLinePayload::StratumCommand(StratumCommand::MiningSubmit(MiningSubmit::MiningSubmitWithPom((
+                    "addr.rig".into(),
+                    "job7".into(),
+                    "000000000000002a".into(),
+                    "0011223344556677".into(),
+                    "".into(),
+                    proof.into(),
+                )))),
+                jsonrpc: None,
+                error: None,
+            };
+            let v = serde_json::to_value(&line).unwrap();
+            assert_eq!(v["method"], "mining.submit");
+            assert_eq!(v["params"].as_array().map(Vec::len), Some(6));
+            assert_eq!(v["params"][5], proof);
+            let back: StratumLine = serde_json::from_value(v).unwrap();
+            assert!(matches!(
+                back.payload,
+                StratumLinePayload::StratumCommand(StratumCommand::MiningSubmit(MiningSubmit::MiningSubmitWithPom(_)))
+            ));
+        }
+    }
+
     #[test]
     fn error_as_array() {
         let err = parse_error(r#"{"id":1,"result":null,"error":[23,"Low difficulty share",null]}"#);
