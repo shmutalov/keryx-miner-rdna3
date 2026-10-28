@@ -95,6 +95,9 @@ pub struct ShareStats {
     pub duplicate: AtomicU64,
     pub invalid_opoi: AtomicU64,
     pub invalid_pom: AtomicU64,
+    /// Shares refused without a recognised reason: a `false`/`null` result, or any error for a
+    /// base64 proof.
+    pub rejected_other: AtomicU64,
     // std::sync::Mutex (NOT tokio): every critical section is a tiny synchronous map op
     // (insert/remove/len) that is never held across an `.await`, and `Display::fmt` (a sync
     // context) also needs it. The old tokio `try_lock().unwrap()` panicked the moment two tasks
@@ -104,6 +107,90 @@ pub struct ShareStats {
 }
 
 static SHARE_STATS: OnceLock<Arc<ShareStats>> = OnceLock::new();
+
+/// Subscribe-result entry by which a pool announces that it accepts base64 proofs.
+const PROOF_ENCODING_KEY: &str = "keryx.proof_encoding";
+const PROOF_ENCODING_B64: &str = "b64";
+/// Tag that marks a base64 proof in `mining.submit` params[5]; hex never contains ':'.
+const PROOF_B64_PREFIX: &str = "b64:";
+
+/// Per-connection proof encoding for `mining.submit` params[5] (ported from keryx-miner-supr
+/// 0.15.1).
+///
+/// Hex is the default and what every pool understands. A pool that lists
+/// `["keryx.proof_encoding","b64"]` in its `mining.subscribe` result accepts `"b64:" + base64`
+/// instead (RFC 4648 standard alphabet, padded), a third smaller: ~650 KB instead of ~975 KB per
+/// H15 proof. Any error for a base64 submit falls back to hex for that pool for the rest of the
+/// process, so a mis-advertising pool can never strand the miner.
+#[derive(Default)]
+struct ProofEncoding {
+    /// Pool address of this connection; a base64 rejection is remembered per address.
+    pool: String,
+    b64: AtomicBool,
+    b64_ids: std::sync::Mutex<HashSet<u32>>,
+}
+
+/// Pools that rejected a base64 submit during this process. They are only ever sent hex from then
+/// on, even after a reconnect re-advertises base64: a pool that advertises but rejects (with a
+/// code that forces a reconnect, say) would otherwise put the miner in a reconnect loop.
+static B64_REFUSED_BY: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+impl ProofEncoding {
+    fn for_pool(pool: &str) -> Self {
+        ProofEncoding { pool: pool.to_string(), ..Default::default() }
+    }
+
+    fn refused_here(&self) -> bool {
+        B64_REFUSED_BY.lock().map(|v| v.iter().any(|p| p == &self.pool)).unwrap_or(false)
+    }
+
+    /// Called with the subscription list of every `mining.subscribe` result.
+    fn absorb_subscribe(&self, subscriptions: &[(String, String)]) {
+        let offered = subscriptions.iter().any(|(k, v)| k == PROOF_ENCODING_KEY && v == PROOF_ENCODING_B64);
+        if offered && self.refused_here() {
+            info!("Pool advertises base64 proofs but rejected one earlier in this session — keeping hex proofs.");
+            return;
+        }
+        if offered && !self.b64.swap(true, Ordering::SeqCst) {
+            info!("Pool accepts base64 proofs ({}={}) — submitting proofs base64-encoded on this connection.", PROOF_ENCODING_KEY, PROOF_ENCODING_B64);
+        }
+    }
+
+    /// Encodes a proof for params[5] and remembers base64 submit ids for the fallback.
+    fn encode(&self, msg_id: u32, proof: &[u8]) -> String {
+        if !self.b64.load(Ordering::SeqCst) {
+            return hex::encode(proof);
+        }
+        if let Ok(mut ids) = self.b64_ids.lock() {
+            if ids.len() > 4096 {
+                ids.clear(); // unanswered ids from a pool that never replies; bound the set
+            }
+            ids.insert(msg_id);
+        }
+        let mut out = String::with_capacity(PROOF_B64_PREFIX.len() + proof.len().div_ceil(3) * 4);
+        out.push_str(PROOF_B64_PREFIX);
+        base64::Engine::encode_string(&base64::engine::general_purpose::STANDARD, proof, &mut out);
+        out
+    }
+
+    /// A reply for `msg_id` arrived. Returns true if it was a base64 submit.
+    fn answered(&self, msg_id: u32) -> bool {
+        self.b64_ids.lock().map(|mut ids| ids.remove(&msg_id)).unwrap_or(false)
+    }
+
+    /// An error for a base64 submit: hex for the rest of this connection and for every later
+    /// connection to the same pool in this process.
+    fn reject_b64(&self, reason: &str) {
+        if let Ok(mut v) = B64_REFUSED_BY.lock() {
+            if !v.iter().any(|p| p == &self.pool) {
+                v.push(self.pool.clone());
+            }
+        }
+        if self.b64.swap(false, Ordering::SeqCst) {
+            warn!("Pool refused a base64 proof submit ({reason}) — using hex proofs for this pool from now on.");
+        }
+    }
+}
 
 /// Last real DAA score from a job that carries one (WithTask / ShortV2). The plain `Short` notify
 /// carries NO daa_score; pinning it to the SALT-v4 era (21,932,751) leaves it BELOW PoM activation
@@ -135,7 +222,7 @@ impl Display for ShareStats {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Shares: {}{}{}{}{}{}Pending: {}",
+            "Shares: {}{}{}{}{}{}{}Pending: {}",
             match self.accepted.load(Ordering::SeqCst) {
                 0 => "".to_string(),
                 v => format!("Accepted: {} ", v),
@@ -159,6 +246,10 @@ impl Display for ShareStats {
             match self.invalid_pom.load(Ordering::SeqCst) {
                 0 => "".to_string(),
                 v => format!("Invalid PoM proof: {} ", v),
+            },
+            match self.rejected_other.load(Ordering::SeqCst) {
+                0 => "".to_string(),
+                v => format!("Rejected: {} ", v),
             },
             self.shares_pending.lock().unwrap().len()
         )
@@ -191,6 +282,7 @@ pub struct StratumHandler {
     last_stratum_id: Arc<AtomicU32>,
 
     shares_stats: Arc<ShareStats>,
+    proof_encoding: Arc<ProofEncoding>,
     block_channel: Sender<BlockSeed>,
     block_handle: BlockHandle,
 
@@ -223,11 +315,12 @@ impl Client for StratumHandler {
                         // suprnova's bridge version-gates PoM shares by the reported keryx-miner-supr
                         // version, raising the floor at every hardfork (H4 >= 0.7.0, H5.2 >= 0.9.2,
                         // H10 >= 0.12.0 — the mandatory one-way-seed release, H14 >= 0.14.0). This
-                        // build mines the H15 consensus: PoM v5 (context pad), the block task and
-                        // stratum-v4 notifies/submits (supr's H15 release is 0.15.0), and H14 before
-                        // the gate — so advertise the current supr release. Bump this single string if
-                        // the pool raises the floor again. (Real build: keryx-miner/CARGO_PKG_VERSION.)
-                        "keryx-miner-supr/0.15.0".to_string(),
+                        // build mines the H15 consensus of keryx-node 1.6.6: PoM v5 (context pad) and
+                        // no block task, as supr 0.15.1 does (0.15.0 still hashes a task root, which
+                        // makes every post-H15 block invalid), and H14 before the gate — so advertise
+                        // the current supr release. Bump this single string if the pool raises the
+                        // floor again. (Real build: keryx-miner/CARGO_PKG_VERSION.)
+                        "keryx-miner-supr/0.15.1".to_string(),
                         KERYX_STRATUM_DAA_CAPABILITY.into(),
                     )),
                 )),
@@ -332,6 +425,7 @@ impl StratumHandler {
         ipfs_url: String,
     ) -> Result<Box<Self>, Error> {
         info!("Connecting to {}", address);
+        let proof_encoding = Arc::new(ProofEncoding::for_pool(&address));
         let socket = TcpStream::connect(address).await?;
 
         let client = Framed::new(socket, NewLineJsonCodec::new());
@@ -356,6 +450,7 @@ impl StratumHandler {
             submit_username,
             last_stratum_id.clone(),
             share_state.clone(),
+            proof_encoding.clone(),
             Arc::clone(&current_task_slot),
             Arc::clone(&inference_cache),
         );
@@ -378,6 +473,7 @@ impl StratumHandler {
             extranonce: None,
             last_stratum_id,
             shares_stats: share_state,
+            proof_encoding,
             mining_dev: None,
             block_channel,
             block_handle,
@@ -394,6 +490,7 @@ impl StratumHandler {
         submit_username: String,
         last_stratum_id: Arc<AtomicU32>,
         share_stats: Arc<ShareStats>,
+        proof_encoding: Arc<ProofEncoding>,
         current_task_slot: Arc<Mutex<Option<CurrentTask>>>,
         inference_cache: InferenceCache,
     ) -> (Sender<BlockSeed>, BlockHandle) {
@@ -439,7 +536,7 @@ impl StratumHandler {
                                 nonce_hex,
                                 opoi_tag,
                                 cid,
-                                hex::encode(&pom_proof),
+                                proof_encoding.encode(msg_id, &pom_proof),
                                 hex::encode(root),
                             )),
                         )),
@@ -449,7 +546,8 @@ impl StratumHandler {
                 } else if !pom_proof.is_empty() {
                     // PoM (post-fork): fixed 6-slot submit — proof always at params[5], CID-or-empty
                     // at params[4]. The pool relays params[5] -> RpcBlock.pomProof (it does not verify).
-                    let proof_hex = hex::encode(&pom_proof);
+                    // Lowercase hex, or "b64:"+base64 when the pool offered it.
+                    let proof_hex = proof_encoding.encode(msg_id, &pom_proof);
                     let cid = cid_opt.unwrap_or_default();
                     info!("PoM: submitting share with proof ({} B) for job {}", pom_proof.len(), job_id);
                     StratumLine {
@@ -514,12 +612,9 @@ impl StratumHandler {
                     StratumLinePayload::StratumResult { result } if id.is_some() => {
                         match result {
                             StratumResult::Plain(Some(true)) | StratumResult::Eth((true, _)) => {
-                                let removed = self
-                                    .shares_stats
-                                    .shares_pending
-                                    .lock()
-                                    .unwrap()
-                                    .remove(&id.expect("We checked id is not none"));
+                                let rid = id.expect("We checked id is not none");
+                                self.proof_encoding.answered(rid);
+                                let removed = self.shares_stats.shares_pending.lock().unwrap().remove(&rid);
                                 if removed.is_some() {
                                     self.shares_stats.accepted.fetch_add(1, Ordering::SeqCst);
                                     info!("Share accepted");
@@ -531,7 +626,8 @@ impl StratumHandler {
                                 }
                                 Ok(())
                             }
-                            StratumResult::Subscribe((ref _subscriptions, ref extranonce, ref nonce_size)) => {
+                            StratumResult::Subscribe((ref subscriptions, ref extranonce, ref nonce_size)) => {
+                                self.proof_encoding.absorb_subscribe(subscriptions);
                                 self.set_extranonce(extranonce.as_str(), nonce_size)
                                 /*for (name, value) in _subscriptions {
                                     match name.as_str() {
@@ -541,7 +637,28 @@ impl StratumHandler {
                                 }
                                 Ok(())*/
                             }
-                            _ => Err(format!("Inconsistent stratum message: {:?}", msg).into()),
+                            other => {
+                                // A non-true result without an error object (`false` / `null`). For a
+                                // pending share that is a rejection; anything else is a reply we cannot
+                                // attribute. Neither is a reason to drop the connection.
+                                let rid = id.expect("We checked id is not none");
+                                if self.take_ai_response_ack(id).await {
+                                    warn!("AI response not accepted by the pool: result {:?}", other);
+                                    return Ok(());
+                                }
+                                let was_b64 = self.proof_encoding.answered(rid);
+                                match self.shares_stats.shares_pending.lock().unwrap().remove(&rid) {
+                                    Some(jobid) => {
+                                        if was_b64 {
+                                            self.proof_encoding.reject_b64(&format!("result {:?}", other));
+                                        }
+                                        self.shares_stats.rejected_other.fetch_add(1, Ordering::SeqCst);
+                                        warn!("Share not accepted by pool (Job id: {}): result {:?}", jobid, other);
+                                    }
+                                    None => warn!("Ignoring unmatched pool result for id {}: {:?}", rid, other),
+                                }
+                                Ok(())
+                            }
                         }
                     }
                     StratumLinePayload::StratumCommand(command) => match command {
@@ -687,7 +804,13 @@ impl StratumHandler {
                         }
                         _ => Err(format!("Unexpected stratum message: {:?}", msg).into()),
                     },
-                    _ => Err(format!("Inconsistent stratum message: {:?}", msg).into()),
+                    // A result without an id: some pools answer our id-less notifications (such as
+                    // `mining.declare_capabilities`) with `{"id":null,"result":true}`. It answers
+                    // nothing we wait for; ignoring it keeps the connection, and mining, alive.
+                    StratumLinePayload::StratumResult { result } => {
+                        debug!("Ignoring pool result without id: {:?}", result);
+                        Ok(())
+                    }
                 }
             }
             StratumLine {
@@ -703,6 +826,15 @@ impl StratumHandler {
                 // Option, not unwrap(): a pool error for an id we never tracked (or already
                 // removed) must not panic — jobid is only used for the warn! below.
                 let jobid = self.shares_stats.shares_pending.lock().unwrap().remove(&id);
+                if self.proof_encoding.answered(id) {
+                    // Whatever code the pool chose (some use 25 = not subscribed, which would
+                    // otherwise force a reconnect), a refused base64 proof is just a rejected share:
+                    // fall back to hex and keep the connection.
+                    self.proof_encoding.reject_b64(&format!("{}: {}", code, error));
+                    self.shares_stats.rejected_other.fetch_add(1, Ordering::SeqCst);
+                    warn!("Share with a base64 proof rejected by pool (Job id: {:?}): {}", jobid, error);
+                    return Ok(());
+                }
                 match code {
                     ErrorCode::Unknown => {
                         // Match solo-mining behaviour (grpc.rs SubmitBlockResponse): a rejected
@@ -1261,5 +1393,90 @@ fn do_inference_and_upload(
             warn!("OPoI [{}]: IPFS upload failed: {}", stable_id, e);
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod proof_encoding_tests {
+    use super::*;
+    use base64::Engine;
+
+    fn subs(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+        entries.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn hex_until_the_pool_offers_base64() {
+        let enc = ProofEncoding::for_pool("test-pool-hex:1");
+        let proof: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+        assert_eq!(enc.encode(1, &proof), hex::encode(&proof));
+        enc.absorb_subscribe(&subs(&[("mining.notify", "abc"), (PROOF_ENCODING_KEY, "hex")]));
+        assert_eq!(enc.encode(2, &proof), hex::encode(&proof));
+        assert!(!enc.answered(1) && !enc.answered(2));
+    }
+
+    #[test]
+    fn base64_round_trip_and_tag() {
+        let enc = ProofEncoding::for_pool("test-pool-b64:1");
+        enc.absorb_subscribe(&subs(&[("mining.notify", "abc"), (PROOF_ENCODING_KEY, PROOF_ENCODING_B64)]));
+        for len in [0usize, 1, 2, 3, 452_705, 487_281] {
+            let proof: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+            let s = enc.encode(len as u32, &proof);
+            let body = s.strip_prefix(PROOF_B64_PREFIX).expect("tagged");
+            assert_eq!(body.len(), len.div_ceil(3) * 4);
+            assert!(!s.contains('\n') && !s.contains('\\'));
+            assert_eq!(base64::engine::general_purpose::STANDARD.decode(body).unwrap(), proof);
+            assert!(enc.answered(len as u32));
+        }
+        // A hex proof never contains the tag separator, so the pool can always tell them apart.
+        assert!(!hex::encode([0xffu8; 64]).contains(':'));
+    }
+
+    #[test]
+    fn a_refused_base64_submit_sticks_to_hex_for_that_pool() {
+        let enc = ProofEncoding::for_pool("test-pool-fallback:1");
+        enc.absorb_subscribe(&subs(&[(PROOF_ENCODING_KEY, PROOF_ENCODING_B64)]));
+        let proof = vec![1u8, 2, 3];
+        assert!(enc.encode(7, &proof).starts_with(PROOF_B64_PREFIX));
+        assert!(enc.answered(7));
+        enc.reject_b64("pom proof not hex");
+        assert_eq!(enc.encode(8, &proof), "010203");
+        assert!(!enc.answered(8));
+        // A reconnect to the same pool that re-advertises base64 stays on hex.
+        let again = ProofEncoding::for_pool("test-pool-fallback:1");
+        again.absorb_subscribe(&subs(&[(PROOF_ENCODING_KEY, PROOF_ENCODING_B64)]));
+        assert_eq!(again.encode(9, &proof), "010203");
+        // A different pool is unaffected.
+        let other = ProofEncoding::for_pool("test-pool-other:1");
+        other.absorb_subscribe(&subs(&[(PROOF_ENCODING_KEY, PROOF_ENCODING_B64)]));
+        assert!(other.encode(10, &proof).starts_with(PROOF_B64_PREFIX));
+    }
+
+    #[test]
+    fn subscribe_result_with_the_encoding_entry_parses() {
+        let raw = r#"{"id":0,"result":[[["mining.notify","1"],["keryx.proof_encoding","b64"]],"a1b2",6],"error":null}"#;
+        let line: StratumLine = serde_json::from_str(raw).unwrap();
+        match line.payload {
+            StratumLinePayload::StratumResult { result: StratumResult::Subscribe((s, ex, n)) } => {
+                assert_eq!(ex, "a1b2");
+                assert_eq!(n, 6);
+                let enc = ProofEncoding::for_pool("test-pool-subscribe:1");
+                enc.absorb_subscribe(&s);
+                assert!(enc.encode(1, &[0u8]).starts_with(PROOF_B64_PREFIX));
+            }
+            other => panic!("unexpected {:?}", other),
+        }
+    }
+
+    #[test]
+    fn id_less_and_non_true_results_parse_as_results() {
+        // `{"id":null,"result":true}` must decode as a result (it is then ignored, not fatal).
+        let line: StratumLine = serde_json::from_str(r#"{"id":null,"result":true,"error":null}"#).unwrap();
+        assert!(line.id.is_none());
+        assert!(matches!(line.payload, StratumLinePayload::StratumResult { .. }));
+        // A `false` result for a submit decodes too (counted as a rejected share).
+        let line: StratumLine = serde_json::from_str(r#"{"id":12,"result":false,"error":null}"#).unwrap();
+        assert_eq!(line.id, Some(12));
+        assert!(matches!(line.payload, StratumLinePayload::StratumResult { result: StratumResult::Plain(Some(false)) }));
     }
 }
