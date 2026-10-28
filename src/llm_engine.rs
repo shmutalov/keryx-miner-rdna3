@@ -311,8 +311,11 @@ impl LlamaEngine {
 
         let backend = backend()?;
         info!("llm-engine: loading {} (Vulkan, all layers on GPU, in-process)", gguf_path);
-        // u32::MAX = offload every layer (the crate's "all" sentinel, like -ngl 999).
-        let params = LlamaModelParams::default().with_n_gpu_layers(u32::MAX);
+        // u32::MAX = offload every layer (the crate's "all" sentinel, like -ngl 999). MTP
+        // (next-token prediction) layers are loaded too: llama.cpp 0.6.0 skips them by default,
+        // but the possession index covers every tensor of the GGUF, so the zero-dup walk over
+        // the engine's resident weights (Qwen3.8-27B, tier 3) needs them resident.
+        let params = LlamaModelParams::default().with_n_gpu_layers(u32::MAX).with_load_mtp(true);
         let model = LlamaModel::load_from_file(backend, Path::new(gguf_path), &params)
             .map_err(|e| anyhow!("llm-engine: model load failed: {e}"))?;
         let ctx_cap = std::env::var("KERYX_LLAMA_CTX")
@@ -924,6 +927,7 @@ mod tests {
         unsafe {
             let mut mp = llama_cpp_sys_2::llama_model_default_params();
             mp.n_gpu_layers = i32::MAX;
+            mp.load_mtp = true; // as the engine loads it
             mp.no_alloc = true;
             mp.load_mode = llama_cpp_sys_2::LLAMA_LOAD_MODE_NONE; // llama.cpp asserts no_alloc never maps host-pointer buffers
             let model = llama_cpp_sys_2::llama_model_load_from_file(path.as_ptr(), mp);
