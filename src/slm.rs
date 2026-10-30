@@ -1049,6 +1049,52 @@ mod tests {
         assert!(!pom_fits(4_000 * MB, 5_000, 10_023));
     }
 
+    /// The most a 4-word phrase of `text` repeats.
+    fn max_phrase_repeats(text: &str) -> usize {
+        let words: Vec<&str> = text.split_whitespace().collect();
+        let mut counts = std::collections::HashMap::new();
+        for w in words.windows(4) {
+            *counts.entry(w).or_insert(0usize) += 1;
+        }
+        counts.into_values().max().unwrap_or(0)
+    }
+
+    #[test]
+    fn phrase_repeats_count_the_loop() {
+        assert_eq!(max_phrase_repeats("a b c d a b c d a b c d"), 3);
+        assert!(max_phrase_repeats(&"of achieving the goal ".repeat(40)) >= 39);
+        assert_eq!(max_phrase_repeats("short"), 0);
+    }
+
+    /// Answers through the model's own template stop looping: the two pool chat prompts on which
+    /// greedy decoding on GLM-4-9B looped ("achieving the goal of …" to the token cap) or parroted
+    /// the instruction, verbatim from a live session. Run with:
+    ///   KERYX_TEST_GGUF=<lineup model.gguf> cargo test --release --lib -- --ignored --nocapture answers_do_not_loop
+    #[test]
+    #[ignore = "loads a lineup model onto the GPU; set KERYX_TEST_GGUF to run"]
+    fn answers_do_not_loop() {
+        let Ok(gguf) = std::env::var("KERYX_TEST_GGUF") else {
+            eprintln!("SKIP: KERYX_TEST_GGUF not set");
+            return;
+        };
+        let spec = crate::models::spec_for_gguf(&gguf).expect("a lineup model");
+        let engine = super::InferenceEngine::launch(&gguf).expect("engine launch");
+        let prompts = [
+            ("user: Who is Yin in anime Darker Than Black?\nassistant:", 256),
+            (
+                "Current date and time: Fri, 30 Oct 2026 15:04 UTC (2026-10-30). Mention it only when the question is about the date, the day or the time.\n\nReply in the language of the user's message below, whatever the language of the material above. Do not introduce yourself and do not describe the Keryx network unless the user asks about it. No web search was made for this message: never claim you searched the web, cite online sources or give live figures you do not have.\n\nWrite a two-line slogan for a decentralized AI network\n\nReply in English.",
+                2048,
+            ),
+        ];
+        for (prompt, max_tokens) in prompts {
+            let out = engine.generate(&super::format_prompt_by_name(spec.name, prompt), max_tokens, &[]).expect("generate");
+            let answer = super::strip_think(&out).trim().to_string();
+            eprintln!("{}: {prompt:?}\n  -> {answer:?}", spec.name);
+            assert!(!answer.is_empty(), "empty answer");
+            assert!(max_phrase_repeats(&answer) <= 3, "the answer loops: {answer:?}");
+        }
+    }
+
     /// The tier and model the GPU trace tests run: `KERYX_TEST_TIER` (default 0), whose model
     /// `KERYX_TEST_GGUF` must be.
     fn test_tier() -> (u8, &'static crate::models::ModelSpec) {

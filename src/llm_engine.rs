@@ -17,6 +17,7 @@ use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams};
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
+use llama_cpp_2::model::params::kv_overrides::ParamOverrideValue;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::sampling::LlamaSampler;
@@ -139,6 +140,31 @@ fn backend() -> Result<&'static LlamaBackend> {
         let _ = BACKEND.set(b);
     }
     Ok(BACKEND.get().expect("backend just initialised"))
+}
+
+/// GLM-4-0414 rotates 64 of its 128 head dims; a GGUF without `glm4.rope.dimension_count` (the
+/// lineup's tier-1 GLM-4-9B is one) makes llama.cpp rotate all of them, which garbles positions
+/// and makes the model loop. Upstream's `keryx_needs_glm4_rope_fix` (keryx-miner v0.5.7), same rule.
+fn needs_glm4_rope_fix(gguf_path: &str) -> bool {
+    let Ok(path) = std::ffi::CString::new(gguf_path) else {
+        return false;
+    };
+    // SAFETY: a metadata-only read (no tensor data, no ggml context), freed before returning; the
+    // value string is read while the context is alive.
+    unsafe {
+        let params = llama_cpp_sys_2::gguf_init_params { no_alloc: true, ctx: std::ptr::null_mut() };
+        let g = llama_cpp_sys_2::gguf_init_from_file(path.as_ptr(), params);
+        if g.is_null() {
+            return false;
+        }
+        let arch = llama_cpp_sys_2::gguf_find_key(g, c"general.architecture".as_ptr());
+        let fix = arch >= 0
+            && llama_cpp_sys_2::gguf_get_kv_type(g, arch) == llama_cpp_sys_2::GGUF_TYPE_STRING
+            && std::ffi::CStr::from_ptr(llama_cpp_sys_2::gguf_get_val_str(g, arch)).to_bytes() == b"glm4"
+            && llama_cpp_sys_2::gguf_find_key(g, c"glm4.rope.dimension_count".as_ptr()) < 0;
+        llama_cpp_sys_2::gguf_free(g);
+        fix
+    }
 }
 
 /// One resident model bound to the inference GPU, serving chat completions in-process.
@@ -315,7 +341,11 @@ impl LlamaEngine {
         // (next-token prediction) layers are loaded too: llama.cpp 0.6.0 skips them by default,
         // but the possession index covers every tensor of the GGUF, so the zero-dup walk over
         // the engine's resident weights (Qwen3.8-27B, tier 3) needs them resident.
-        let params = LlamaModelParams::default().with_n_gpu_layers(u32::MAX).with_load_mtp(true);
+        let mut params = std::pin::pin!(LlamaModelParams::default().with_n_gpu_layers(u32::MAX).with_load_mtp(true));
+        if needs_glm4_rope_fix(gguf_path) {
+            info!("llm-engine: the GGUF has no glm4.rope.dimension_count — rotating 64 of the 128 head dims, as GLM-4-0414 does");
+            params.as_mut().append_kv_override(c"glm4.rope.dimension_count", ParamOverrideValue::Int(64));
+        }
         let model = LlamaModel::load_from_file(backend, Path::new(gguf_path), &params)
             .map_err(|e| anyhow!("llm-engine: model load failed: {e}"))?;
         let ctx_cap = std::env::var("KERYX_LLAMA_CTX")
@@ -410,16 +440,15 @@ impl LlamaEngine {
             ctx.decode(&mut batch)?;
         }
 
-        // Greedy decode until end-of-generation or the token budget. Output is accumulated
-        // as BYTES: byte-level BPE tokens can split UTF-8 sequences mid-character, so
-        // per-token string conversion would corrupt multi-byte output.
+        // Decode until end-of-generation or the token budget. Output is accumulated as BYTES:
+        // byte-level BPE tokens can split UTF-8 sequences mid-character, so per-token string
+        // conversion would corrupt multi-byte output. `sample` also accepts the token.
         let budget = max_tokens.min((n_ctx as usize - tokens.len()).saturating_sub(1));
-        let mut sampler = LlamaSampler::greedy();
+        let mut sampler = self.answer_sampler();
         let mut out = Vec::<u8>::new();
         let mut n_cur = tokens.len() as i32;
         for _ in 0..budget {
             let token = sampler.sample(&ctx, batch.n_tokens() - 1);
-            sampler.accept(token);
             if self.model.vocab().is_eog(token) {
                 break;
             }
@@ -488,6 +517,26 @@ impl LlamaEngine {
         self.model.vocab().tokenize(text.as_bytes(), bos, true)
     }
 
+    /// The sampler of an answer, upstream's (`keryx_llama.cpp`, since keryx-miner v0.4.5): DRY,
+    /// a flat repeat penalty, top-p 0.9, temperature 0.7, seed 42. Greedy decoding loops on these
+    /// models ("achieving the goal of achieving the goal of …" on GLM-4-9B), and a flat penalty
+    /// alone barely charges a repeated sentence; DRY penalises continuing an already-seen
+    /// sequence. Built per request, which restarts the seed as upstream's per-request reset
+    /// does. The text is not consensus-relevant: a trace commits whatever tokens were sampled.
+    fn answer_sampler(&self) -> LlamaSampler {
+        // Upstream scans the whole context (-1); llama.cpp 0.6.0 clamps a negative DRY window to
+        // 0, which turns DRY off, so the window is the training context instead.
+        let window = i32::try_from(self.model.n_ctx_train()).unwrap_or(i32::MAX);
+        LlamaSampler::chain_simple([
+            // Breakers keep normal structure (newlines, list markers, quotes) from counting as repetition.
+            LlamaSampler::dry(&self.model, 0.8, 1.75, 2, window, ["\n", ":", "\"", "*"]),
+            LlamaSampler::penalties(self.model.n_vocab(), 256, 1.10, 0.0, 0.0),
+            LlamaSampler::top_p(0.9, 1),
+            LlamaSampler::temp(0.7),
+            LlamaSampler::dist(42),
+        ])
+    }
+
     /// The token fed as padding: a newline, else the end-of-sequence token.
     fn pad_token(&self) -> LlamaToken {
         self.tokenize("\n", false).first().copied().unwrap_or_else(|| self.model.vocab().eos())
@@ -548,12 +597,12 @@ impl LlamaEngine {
         let mut run = || -> Result<(Vec<LlamaToken>, Vec<u8>)> {
             let mut fed = toks.clone();
             feed_traced(&mut ctx, &mut batch, &toks, 0, Some(n_prompt - 1))?;
-            let mut sampler = LlamaSampler::greedy();
+            // The traced answer is sampled like any other (the trace commits the sampled tokens).
+            let mut sampler = self.answer_sampler();
             let mut out = Vec::<u8>::new();
             let budget = max_tokens.min((n_ctx as usize).saturating_sub(n_prompt + 1));
             for _ in 0..budget {
                 let token = sampler.sample(&ctx, batch.n_tokens() - 1);
-                sampler.accept(token);
                 if self.model.vocab().is_eog(token) {
                     break;
                 }
@@ -865,9 +914,9 @@ mod tests {
         let out = engine.generate(prompt, 16, &[]).expect("generate");
         eprintln!("model replied: {out:?}");
         assert!(!out.trim().is_empty(), "empty completion");
-        // Greedy decoding is deterministic: the same call must reproduce byte-identically.
+        // Each request restarts the sampler's seed: the same call must reproduce byte-identically.
         let again = engine.generate(prompt, 16, &[]).expect("generate (repeat)");
-        assert_eq!(out, again, "greedy decode not deterministic");
+        assert_eq!(out, again, "decode not deterministic");
     }
 
     /// The stop scan must catch a marker regardless of how token pieces split it, cut at the
