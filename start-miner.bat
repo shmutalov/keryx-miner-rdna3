@@ -47,6 +47,11 @@ REM Cap each inference request at 32K tokens. The model allows 64K, which fits t
 REM 7900 XT with only ~0.3 GiB of VRAM to spare.
 set KERYX_LLAMA_CTX=32768
 
+REM --- Telegram notifications (optional): copy telegram.conf.example to telegram.conf
+REM     next to this file and fill in the bot token and chat id (README, "Telegram
+REM     notifications"). Alerts arrive on their own; send /stats to the bot for numbers.
+REM     telegram.conf is git-ignored. ---
+
 REM ----------------------------------------------------------------------------
 cd /d "%~dp0"
 set "RELEASE_DIR=%~dp0target\release\"

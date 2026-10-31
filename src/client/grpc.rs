@@ -790,6 +790,7 @@ impl KeryxdHandler {
                 }
                 if !self.ai_seen_prefixes.contains(&stable_id) {
                     info!("Inference: queued AiRequest id={}", stable_id);
+                    crate::notify::ai_request();
                     self.ai_seen_prefixes.insert(stable_id.clone());
                     self.ai_request_queue.push_back((stable_id.clone(), request_hash, model_id, prompt, prompt_len, max_tokens, private));
                     while self.ai_request_queue.len() > MAX_AI_QUEUE_SIZE {
@@ -973,11 +974,20 @@ impl KeryxdHandler {
             // is struck like any unanswered cohort assignment.
             if traced && keryx_miner::trace::attention_active(self.last_known_daa) {
                 warn!("Inference: solo request id={} skipped — solo audits past the attention gate are not supported by this build; the miss counts as a service strike (mine through a pool)", stable_id);
+                crate::notify::ai_missed();
+                crate::notify::ai_exchange(
+                    &label,
+                    keryx_miner::slm::model_name(&model_id).unwrap_or(""),
+                    &prompt,
+                    Err("not answered: this build skips solo requests past the attention gate"),
+                    None,
+                );
                 return;
             }
             // Second guard: re-check readiness at execution time (files could have been deleted).
             if !keryx_miner::slm::is_model_ready(&model_id) {
                 log::error!("Inference: model became unavailable after queuing id={} — discarding request", stable_id);
+                crate::notify::ai_missed();
                 return;
             }
             info!("Inference: spawning LLM inference (max_tokens={}{})", max_tokens, if tier.is_some() { ", traced" } else { "" });
@@ -989,6 +999,7 @@ impl KeryxdHandler {
                 };
                 if result.is_none() {
                     log::warn!("Inference: inference returned no result for id={} — AiResponse will be skipped", stable_id);
+                    crate::notify::ai_missed();
                 }
                 let _ = tx_done.send(result);
             });
@@ -1808,6 +1819,7 @@ impl KeryxdHandler {
             .map(|t| t.strikes as usize)
             .unwrap_or(self.misses_seen.len());
 
+        crate::notify::service_bond(&status, active, total);
         if self.strike_status.as_deref() != Some(status.as_str()) {
             match status.as_str() {
                 "clear" => info!("service-bond: no strikes against this miner"),
@@ -2050,8 +2062,14 @@ impl KeryxdHandler {
                 }
             }
             Payload::SubmitBlockResponse(res) => match res.error {
-                None => info!("Block submitted successfully!"),
-                Some(e) => warn!("Failed submitting block: {:?}", e),
+                None => {
+                    info!("Block submitted successfully!");
+                    crate::notify::block_found();
+                }
+                Some(e) => {
+                    warn!("Failed submitting block: {:?}", e);
+                    crate::notify::block_rejected(&e.message);
+                }
             },
             Payload::SubmitTransactionResponse(res) => {
                 // Escrow claims and inference submissions share this stream. Match responses to
@@ -2117,10 +2135,12 @@ impl KeryxdHandler {
                             (Some(txid), None) => {
                                 self.ai_response_inflight.remove(&txid);
                                 info!("Inference: AiResponse accepted by the mempool");
+                                crate::notify::ai_answered();
                             }
                             (Some(txid), Some(e)) if (e.contains(&txid) && e.contains("already")) || e.contains("same responder") => {
                                 self.ai_response_inflight.remove(&txid);
                                 info!("Inference: AiResponse already known to the node — done");
+                                crate::notify::ai_answered();
                             }
                             (Some(txid), Some(e)) => {
                                 let attempts = self.ai_response_inflight.get(&txid).map(|(_, a, _)| *a).unwrap_or(1);

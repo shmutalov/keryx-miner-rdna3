@@ -129,6 +129,11 @@ pub struct ShareStats {
 
 static SHARE_STATS: OnceLock<Arc<ShareStats>> = OnceLock::new();
 
+/// This process's pool share counters; `None` until a pool connection was made.
+pub fn share_stats() -> Option<Arc<ShareStats>> {
+    SHARE_STATS.get().cloned()
+}
+
 /// Subscribe-result entry by which a pool announces that it accepts base64 proofs.
 const PROOF_ENCODING_KEY: &str = "keryx.proof_encoding";
 const PROOF_ENCODING_B64: &str = "b64";
@@ -662,6 +667,7 @@ impl StratumHandler {
                                     info!("Share accepted");
                                 } else if self.take_ai_response_ack(id).await {
                                     info!("AI response accepted by the pool");
+                                    crate::notify::ai_answered();
                                 } else {
                                     info!("{:?} (Last: {})", msg.clone(), self.last_stratum_id.load(Ordering::SeqCst));
                                     warn!("Ignoring result for now");
@@ -690,6 +696,7 @@ impl StratumHandler {
                                 }
                                 if self.take_ai_response_ack(id).await {
                                     warn!("AI response not accepted by the pool: result {:?}", other);
+                                    crate::notify::ai_missed();
                                     return Ok(());
                                 }
                                 let was_b64 = self.proof_encoding.answered(rid);
@@ -884,6 +891,7 @@ impl StratumHandler {
                 }
                 if self.take_ai_response_ack(Some(id)).await {
                     warn!("AI response rejected by the pool: {}", error);
+                    crate::notify::ai_missed();
                     return Ok(());
                 }
                 // Option, not unwrap(): a pool error for an id we never tracked (or already
@@ -980,8 +988,10 @@ impl StratumHandler {
                 return;
             }
         };
+        crate::notify::ai_request();
         if keryx_miner::pow_only() || !keryx_miner::slm::is_model_ready(&request.model_id) {
             warn!("AI request {:.16}: model is not ready", request.task_id);
+            crate::notify::ai_missed();
             return;
         }
         // H15 traced answer: the tier is the model's own (its manifests define the trace), and this
@@ -1004,16 +1014,19 @@ impl StratumHandler {
                         Some(Ok(_)) => "supported".to_string(),
                     }
                 );
+                crate::notify::ai_missed();
                 return;
             }
         }
         if self.ai_response_pending.lock().await.is_some() || self.challenge_in_flight.swap(true, Ordering::SeqCst) {
             warn!("AI request {:.16}: inference is busy", request.task_id);
+            crate::notify::ai_missed();
             return;
         }
         let guard = ai::InferenceGuard::new(miner.opoi_challenge_flag(), self.challenge_in_flight.clone());
         if let Err(error) = miner.process_block(None).await {
             warn!("Could not pause mining for AI request: {}", error);
+            crate::notify::ai_missed();
             return;
         }
         info!(
@@ -1072,6 +1085,7 @@ impl StratumHandler {
                         _ => {
                             drop(guard);
                             warn!("AI request {:.16}: no traced answer — left to the pool", request.task_id);
+                            crate::notify::ai_missed();
                             return;
                         }
                     }
@@ -1092,11 +1106,13 @@ impl StratumHandler {
                     if sender.blocking_send(line).is_err() {
                         *pending.blocking_lock() = None;
                         warn!("AI response {:.16}: connection closed", request.task_id);
+                        crate::notify::ai_missed();
                     }
                 }
                 Err(error) => {
                     drop(guard);
                     warn!("AI request {:.16}: {}", request.task_id, error);
+                    crate::notify::ai_missed();
                 }
             }
         });
@@ -1170,10 +1186,12 @@ impl StratumHandler {
             let line = match &body {
                 Some(b) => {
                     info!("AI opening {:.16}: built ({} B in {:.1} s)", op.request_hash, b.len(), t0.elapsed().as_secs_f64());
+                    crate::notify::opening(true);
                     op.result(id, worker, Ok(b))
                 }
                 None => {
                     warn!("AI opening {:.16}: the replay or its check failed", op.request_hash);
+                    crate::notify::opening(false);
                     op.result(id, worker, Err("replay failed"))
                 }
             };

@@ -3,6 +3,8 @@
 models/
 escrow.key
 escrow_state.json
+# Telegram bot token and chat id (telegram.conf.example shows the format)
+telegram.conf
 .env
 
 target-hive/

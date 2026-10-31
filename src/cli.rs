@@ -173,6 +173,14 @@ pub struct Opt {
     )]
     pub mine_when_not_synced: bool,
 
+    #[clap(
+        long = "telegram-config",
+        value_name = "FILE",
+        default_value = "telegram.conf",
+        help = "Telegram notification settings (bot token, chat id, AI messages; see telegram.conf.example). Notifications are off while the file is missing"
+    )]
+    pub telegram_config: String,
+
     #[clap(skip)]
     pub devfund_address: String,
 }

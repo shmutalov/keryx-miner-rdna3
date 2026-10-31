@@ -1,0 +1,25 @@
+# Telegram notifications for the Keryx miner.
+# Copy this file to telegram.conf (git-ignored) in the miner's working directory, or pass
+# --telegram-config <FILE>. Lines are `key = value`; `#` starts a comment.
+#
+# Alerts arrive on their own: service-bond strikes, a hashrate stall, a lost node or pool,
+# rejected blocks, restarts. Send /stats to the bot for hashrate, network share, blocks or
+# shares, balance, escrow, AI requests and the service bond.
+
+# Bot token from @BotFather.
+token =
+
+# Your chat id. Leave it empty, send the bot any message, and start the miner: it logs the
+# ids of the chats that wrote to the bot. Only this chat gets alerts and answers to /stats.
+chat =
+
+# AI messages: 0 = off, 1 = the prompt and answer of every AI request the miner serves (solo
+# private requests left out; a pool does not mark private requests, so all pool requests go),
+# all = solo private requests too. Telegram stores what it is sent.
+ai = 0
+
+# Rig name in messages (default: the computer name).
+# name = rx7900xt
+
+# Bot API base URL, for a local Bot API server.
+# api = https://api.telegram.org

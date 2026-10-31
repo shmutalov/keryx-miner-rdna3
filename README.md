@@ -203,6 +203,64 @@ exporting anything. Prebuilt release binaries need none of this.
 - `--password` is the stratum `mining.authorize` password; on suprnova-style pools it requests a
   fixed difficulty (e.g. `d=1`). Default `x` = the pool's own (vardiff) difficulty.
 
+### Telegram notifications
+
+Solo mining has no pool dashboard, so the miner can report to a Telegram chat itself (pool mining
+too). Warnings arrive on their own: a service-bond change (strike, burn, suspension, clear again),
+the hashrate at zero for 5 minutes outside inference pauses, the node or pool unreachable for 2
+minutes (and back), a rejected block (at most one alert an hour), and the miner starting or
+stopping. A restart by the launcher shows up as a new start message.
+
+Stats come on request: send `/stats` to the bot. The changes are over the last hour, or since the
+start if the miner has run for less:
+
+```
+⛏ RIG · solo · up 5h12m
+Hashrate: 1.61 MH/s now · 1.58 MH/s avg over 1h00m
+Network: 591.01 MH/s · this rig 0.27% · reward 5.02 KRX/block · DAA 141,032,821
+Blocks: 3 found (+1 in 1h00m) · 0 rejected
+Balance: 1,234.56 KRX (+2.40 in 1h00m, +12.40 since start) · 192 UTXOs
+Escrow: 4.10 KRX claimed (2 outputs) · 2.30 KRX pending (7 outputs)
+AI requests: 7 (+4 in 1h00m) · 0 answered · 7 missed
+⚠ Service bond: strike 2 (last at daa 140200000) · 2 active, 3 lifetime strikes
+Node: connected for 3h00m
+```
+
+The bot answers only the configured chat; commands from other chats are logged once and
+ignored. Give each rig its own bot: only one program can read a bot's messages at a time.
+
+Setup:
+
+1. Create a bot with [@BotFather](https://t.me/BotFather) and send the bot any message.
+2. Copy `telegram.conf.example` to `telegram.conf` in the miner's working directory (the repo root
+   for the launchers; `--telegram-config <FILE>` points elsewhere) and put the bot token in it.
+3. Start the miner: with no `chat` set it logs the chats that wrote to the bot. Put yours in as
+   `chat = <id>` and start again.
+
+```ini
+token = 123456789:AAE...      # from @BotFather
+chat = 123456789              # numeric chat id
+ai = 0                        # AI messages: 0, 1, or all (below)
+# name = rx7900xt             # rig name in messages (default: the computer name)
+# api = https://api.telegram.org   # Bot API base URL (a local Bot API server)
+```
+
+`telegram.conf` is git-ignored. The token is masked in the miner's log. Notifications stay off
+while the file is missing or has no token.
+
+- The balance, UTXO count and network numbers come from the explorer API at
+  `--recover-escrow-api` (default `https://keryx-labs.com`), which is sent the payout address. The
+  balance is read every 5 minutes, and everything again on each `/stats`.
+- The other counters cover the current process: a restart resets them. The lifetime strike count
+  comes from the node.
+- `ai = 1` also sends the prompt and answer of every AI request the miner serves, as silent
+  messages (prompt cut at 1,400 characters, answer at 2,200). Solo private requests stay out, and
+  `ai = all` includes them. A pool sends opened prompts without saying which requests were
+  private, so all pool requests go. Telegram stores what it is sent. Solo requests this build skips
+  past the attention gate are sent with "not answered". Node and pool challenges are not sent.
+- Telegram unreachable or slow never holds up mining: messages wait in a small queue and are
+  dropped when it is full (AI messages first). `HTTPS_PROXY` / `ALL_PROXY` are honoured.
+
 ### All options
 
 ```bash

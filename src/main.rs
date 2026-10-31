@@ -30,6 +30,7 @@ mod escrow;
 mod ipfs;
 mod keryxd_messages;
 mod miner;
+mod notify;
 mod pow;
 mod target;
 mod watch;
@@ -97,6 +98,7 @@ fn spawn_shutdown_handler() {
         // Give the client loop a moment to flush the escrow journal (funds-critical), then
         // exit regardless — a stuck flush must never block a supervisor stop.
         SHUTDOWN.notify_waiters();
+        tokio::task::spawn_blocking(|| notify::stopping("stop signal"));
         tokio::time::sleep(Duration::from_secs(3)).await;
         std::process::exit(0);
     });
@@ -207,6 +209,21 @@ fn filter_specs_by_vram(
     }
 }
 
+/// The tier flags as typed, for the notification start message: `light`, or `high, light from H15`.
+fn tier_label(opt: &Opt) -> String {
+    let base = match (opt.very_light, opt.light, opt.high, opt.very_high) {
+        (true, ..) => "very-light",
+        (_, true, ..) => "light",
+        (_, _, true, _) => "high",
+        (.., true) => "very-high",
+        _ => "default",
+    };
+    match opt.h15_tier.as_deref() {
+        Some(t) if t != base => format!("{}, {} from H15", base, t),
+        _ => base.to_string(),
+    }
+}
+
 async fn get_client(
     keryxd_address: String,
     mining_address: String,
@@ -279,6 +296,7 @@ async fn client_main(
         client.add_devfund(opt.devfund_address.clone(), opt.devfund_percent);
     }
     client.register().await?;
+    notify::link_up();
     let mut miner_manager = MinerManager::new(client.get_block_channel(), opt.num_threads, plugin_manager);
     let shutdown = SHUTDOWN.notified();
     tokio::pin!(shutdown);
@@ -288,6 +306,7 @@ async fn client_main(
             if let Err(e) = client.flush_escrow_state() {
                 error!("Escrow final flush failed: {}", e);
             }
+            notify::stopping("stop signal");
             std::process::exit(0);
         }
     };
@@ -667,13 +686,26 @@ async fn run() -> Result<(), Error> {
     // (start-miner.bat / HiveOS) relaunch us clean, instead of looping uselessly.
     const MAX_SHORT_SESSIONS: u32 = 3;
     let mut short_sessions: u32 = 0;
+    notify::init(notify::Session {
+        solo: opt.keryxd_address.starts_with("grpc://"),
+        endpoint: opt.keryxd_address.clone(),
+        address: opt.mining_address.clone().unwrap_or_default(),
+        tier: tier_label(&opt),
+        explorer: opt.recover_escrow_api.clone(),
+    }, &opt.telegram_config);
     loop {
         let started = std::time::Instant::now();
         match client_main(&opt, block_template_ctr.clone(), &plugin_manager, escrow_privkey.clone(), escrow_cert.clone())
             .await
         {
-            Ok(_) => info!("Client closed gracefully"),
-            Err(e) => error!("Client closed with error {:?}", e),
+            Ok(_) => {
+                info!("Client closed gracefully");
+                notify::link_down("connection closed");
+            }
+            Err(e) => {
+                error!("Client closed with error {:?}", e);
+                notify::link_down(&e.to_string());
+            }
         }
         if started.elapsed() >= HEALTHY_SESSION {
             backoff = Duration::from_secs(1); // a long, healthy session → reset
@@ -686,6 +718,7 @@ async fn run() -> Result<(), Error> {
                      Exiting for a clean supervised restart.",
                     short_sessions
                 );
+                notify::stopping("the pool refuses in-process reconnects — the launcher restarts the miner");
                 std::process::exit(1);
             }
         }

@@ -573,19 +573,33 @@ fn write_ai_log_entry(
     out.write_all(format!("{at} [{request}] {entry}\n").as_bytes())
 }
 
+/// Called after every inference that `load_and_run_inference` / `load_and_run_traced_inference`
+/// ran: `(request label, model name, prompt, answer, seconds)`. The binary's Telegram notifier
+/// sets it; it must not block.
+pub type AiObserver = fn(&str, &str, &str, Option<&str>, f64);
+
+static AI_OBSERVER: std::sync::OnceLock<AiObserver> = std::sync::OnceLock::new();
+
+/// Installs the inference observer (first call wins).
+pub fn set_ai_observer(observer: AiObserver) {
+    let _ = AI_OBSERVER.set(observer);
+}
+
+/// The name of a supported model, by id.
+pub fn model_name(model_id: &[u8; 32]) -> Option<&'static str> {
+    SUPPORTED_SPECS.read().ok().and_then(|specs| specs.iter().find(|s| &s.model_id == model_id).map(|s| s.name))
+}
+
 /// Load the requested model on demand (swapping out a different resident model), then run
 /// inference in-process. Blocking — call from `spawn_blocking`. `request` names the request in the
 /// `--log-ai` file; prompt and answer are Debug-escaped there, so each entry stays one line and a
 /// prompt cannot forge entries.
 pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize, request: &str) -> Option<String> {
-    if ai_log_path().is_none() {
+    let observer = AI_OBSERVER.get();
+    if ai_log_path().is_none() && observer.is_none() {
         return run_inference(model_id, prompt, max_tokens);
     }
-    let model = SUPPORTED_SPECS
-        .read()
-        .ok()
-        .and_then(|specs| specs.iter().find(|s| &s.model_id == model_id).map(|s| s.name))
-        .unwrap_or("unknown model");
+    let model = model_name(model_id).unwrap_or("unknown model");
     ai_log(request, format_args!("prompt ({model}, {}, max_tokens={max_tokens}): {prompt:?}", inference_gpu_label()));
     // Total time of this inference, including a model (re)load when the model was not resident.
     let started = std::time::Instant::now();
@@ -594,6 +608,9 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
     match &answer {
         Some(text) => ai_log(request, format_args!("answer ({elapsed:.2} s): {text:?}")),
         None => ai_log(request, format_args!("no answer ({elapsed:.2} s)")),
+    }
+    if let Some(observe) = observer {
+        observe(request, model, prompt, answer.as_deref(), elapsed);
     }
     answer
 }
@@ -1105,12 +1122,8 @@ pub fn load_and_run_traced_inference(
     request: &str,
 ) -> Option<Generated> {
     let started = std::time::Instant::now();
+    let model = model_name(model_id).unwrap_or("unknown model");
     if ai_log_path().is_some() {
-        let model = SUPPORTED_SPECS
-            .read()
-            .ok()
-            .and_then(|specs| specs.iter().find(|s| &s.model_id == model_id).map(|s| s.name))
-            .unwrap_or("unknown model");
         ai_log(request, format_args!("prompt ({model}, {}, max_tokens={max_tokens}, traced): {prompt:?}", inference_gpu_label()));
     }
     let answer = run_traced_inference(model_id, prompt, max_tokens, tier, prompt_len, request_hash, attention);
@@ -1118,6 +1131,9 @@ pub fn load_and_run_traced_inference(
     match &answer {
         Some(g) => ai_log(request, format_args!("answer ({elapsed:.2} s, {}): {:?}", if g.trace.is_some() { "traced" } else { "untraced" }, g.text)),
         None => ai_log(request, format_args!("no answer ({elapsed:.2} s)")),
+    }
+    if let Some(observe) = AI_OBSERVER.get() {
+        observe(request, model, prompt, answer.as_ref().map(|g| g.text.as_str()), elapsed);
     }
     answer
 }

@@ -264,6 +264,7 @@ impl MinerManager {
     pub fn record_claim_accepted(&self, outputs: u64, amount_sompi: u64) {
         let total_outputs = self.claimed_outputs.fetch_add(outputs, Ordering::AcqRel) + outputs;
         let total_sompi = self.claimed_sompi.fetch_add(amount_sompi, Ordering::AcqRel) + amount_sompi;
+        crate::notify::escrow_claimed(outputs, amount_sompi);
         info!(
             "escrow: claim accepted — {} output(s), {:.8} KRX (session total: {} output(s), {:.8} KRX)",
             outputs,
@@ -276,6 +277,7 @@ impl MinerManager {
     pub fn record_escrow_pending(&self, outputs: u64, amount_sompi: u64) {
         let prev_outputs = self.escrow_pending_outputs.swap(outputs, Ordering::AcqRel);
         let prev_sompi = self.escrow_pending_sompi.swap(amount_sompi, Ordering::AcqRel);
+        crate::notify::escrow_pending(outputs, amount_sompi);
         if prev_outputs != outputs || prev_sompi != amount_sompi {
             info!("escrow: {} output(s) pending, {:.8} KRX awaiting maturity", outputs, amount_sompi as f64 / 1e8);
         }
@@ -693,6 +695,7 @@ impl MinerManager {
                 || keryx_miner::pom_gpu::is_loading();
             let total = hashes_tried.swap(0, Ordering::AcqRel);
             LAST_HASHRATE.store((total as f64 / duration).to_bits(), Ordering::Relaxed);
+            crate::notify::hashes(total, total as f64 / duration, challenge_active);
 
             if total > 0 {
                 // Mining normally: report aggregate + per-device rates.
