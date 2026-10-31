@@ -1,4 +1,7 @@
 #![cfg_attr(all(test, feature = "bench"), feature(test))]
+// The test harness replaces `main`, so whatever only `main` reaches (most of the stratum client)
+// reads as dead code in `cargo test`; the regular build still reports real dead code.
+#![cfg_attr(test, allow(dead_code))]
 
 use std::env::consts::DLL_EXTENSION;
 use std::env::current_exe;
