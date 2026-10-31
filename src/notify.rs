@@ -293,15 +293,7 @@ pub fn init(session: Session, path: &str) {
     };
     let (tx, rx) = sync_channel(QUEUE_LEN);
     STARTED.get_or_init(Instant::now);
-    let start = format!(
-        "▶ {}: miner {} started · {} via {} · tier {} · pays {} · /stats for numbers",
-        cfg.name,
-        env!("CARGO_PKG_VERSION"),
-        if session.solo { "solo" } else { "pool" },
-        session.endpoint,
-        session.tier,
-        short_address(&session.address),
-    );
+    let start = render_start(&cfg.name, &session);
     let ai = cfg.ai;
     if BOT.set(Bot { tx, name: cfg.name.clone(), session, ai }).is_err() {
         return;
@@ -344,7 +336,7 @@ pub fn hashes(n: u64, rate: f64, paused: bool) {
     if n > 0 && s.stall_alerted {
         s.stall_alerted = false;
         drop(s);
-        alert("✅", format!("hashrate back: {}", fmt_rate(rate)));
+        alert("✅", "Hashrate back", fmt_rate(rate));
     }
 }
 
@@ -360,10 +352,7 @@ pub fn block_rejected(reason: &str) {
     }
     s.last_reject_alert = Some(Instant::now());
     drop(s);
-    alert(
-        "⚠",
-        format!("block rejected by the node: {} (more rejects within the hour only show in /stats)", clip(reason)),
-    );
+    alert("⚠️", "Block rejected", format!("{}\nFurther rejects this hour only show in /stats.", clip(reason)));
 }
 
 /// An AI request this miner is due to answer (solo: queued from a block; pool: dispatched).
@@ -497,9 +486,9 @@ pub fn service_bond(status: &str, active: u32, lifetime: usize) {
         return;
     }
     if status == "clear" {
-        alert("✅", format!("service bond clear again ({} lifetime strikes)", lifetime));
+        alert("✅", "Service bond clear", format!("{} lifetime strikes", lifetime));
     } else {
-        alert("⚠", format!("service bond: {} — {} active, {} lifetime strikes", status, active, lifetime));
+        alert("⚠️", "Service bond", format!("{}\n{} active · {} lifetime strikes", status, active, lifetime));
     }
 }
 
@@ -514,7 +503,8 @@ pub fn link_up() {
     s.stall_alerted = false;
     drop(s);
     if let (true, Some(t), Some(bot)) = (alerted, down, BOT.get()) {
-        alert("✅", format!("back on {} after {} down", bot.session.endpoint, fmt_dur(t.elapsed())));
+        let title = if bot.session.solo { "Node back" } else { "Pool back" };
+        alert("✅", title, format!("{} after {} down", strip_scheme(&bot.session.endpoint), fmt_dur(t.elapsed())));
     }
 }
 
@@ -566,7 +556,7 @@ pub fn stopping(reason: &str) {
         return;
     }
     if !STOPPING.swap(true, Ordering::AcqRel) {
-        alert("⏹", format!("miner stopping: {}", reason));
+        alert("⏹️", "Miner stopping", reason.to_string());
     }
     let t0 = Instant::now();
     while IN_FLIGHT.load(Ordering::Acquire) > 0 && t0.elapsed() < Duration::from_millis(2500) {
@@ -583,10 +573,32 @@ fn post(msg: Msg) {
     }
 }
 
-fn alert(icon: &str, text: String) {
+fn alert(icon: &str, title: &str, body: String) {
     if let Some(bot) = BOT.get() {
-        post(Msg { text: format!("{} {}: {}", icon, bot.name, text), silent: false });
+        post(Msg { text: render_alert(icon, title, &bot.name, &body), silent: false });
     }
+}
+
+/// An alert: the bold title and the rig, then the details.
+fn render_alert(icon: &str, title: &str, name: &str, body: &str) -> String {
+    let mut out = format!("<b>{} {}</b> · {}", icon, esc(title), esc(name));
+    if !body.is_empty() {
+        out.push('\n');
+        out.push_str(&esc(body));
+    }
+    out
+}
+
+/// The start message: what this process mines, and where.
+fn render_start(name: &str, session: &Session) -> String {
+    let rows = [
+        row("Miner", env!("CARGO_PKG_VERSION")),
+        row("Mode", if session.solo { "solo" } else { "pool" }),
+        row(if session.solo { "Node" } else { "Pool" }, strip_scheme(&session.endpoint)),
+        row("Tier", &session.tier),
+        row("Payout", short_address(&session.address)),
+    ];
+    format!("<b>▶️ Miner started</b> · {}\n<pre>{}</pre>\nSend /stats for numbers.", esc(name), esc(&rows.join("\n")))
 }
 
 /// Watches for stalls and lost links, and keeps the hour of snapshots `/stats` compares against.
@@ -625,10 +637,10 @@ fn stats_text() -> String {
 
 fn help_text(name: &str) -> String {
     format!(
-        "This bot reports for the Keryx miner {}.\n\
-         /stats — hashrate, network share, blocks or shares, balance, escrow, AI requests, service bond, link\n\
+        "<b>Keryx miner</b> · {}\n\
+         /stats — hashrate, network share, blocks or shares, balance, escrow, AI requests, service bond, link\n\n\
          Warnings arrive on their own: service-bond strikes, a hashrate stall, a lost node or pool, a rejected block, a restart.",
-        name
+        esc(name)
     )
 }
 
@@ -781,10 +793,11 @@ fn watch_link() {
     let reason = s.link_down_reason.clone();
     drop(s);
     if let Some(bot) = BOT.get() {
-        let what = if bot.session.solo { "node" } else { "pool" };
+        let title = if bot.session.solo { "Node lost" } else { "Pool lost" };
         alert(
-            "⚠",
-            format!("lost the {} {} {} ago: {} — reconnecting", what, bot.session.endpoint, fmt_dur(since.elapsed()), reason),
+            "⚠️",
+            title,
+            format!("{} down for {}, reconnecting\n{}", strip_scheme(&bot.session.endpoint), fmt_dur(since.elapsed()), reason),
         );
     }
 }
@@ -800,8 +813,9 @@ fn watch_stall() {
     drop(s);
     let what = if BOT.get().is_some_and(|b| b.session.solo) { "node (not synced?)" } else { "pool" };
     alert(
-        "⚠",
-        format!("hashrate at 0 for {} outside inference pauses — workers stalled, or no work from the {}", fmt_dur(t.elapsed()), what),
+        "⚠️",
+        "Hashrate at 0",
+        format!("For {} outside inference pauses: workers stalled, or no work from the {}.", fmt_dur(t.elapsed()), what),
     );
 }
 
@@ -885,118 +899,144 @@ impl Snapshot {
     }
 }
 
-/// The `/stats` text: `now` against `prev`, taken `window` earlier.
-fn render_summary(name: &str, solo: bool, now: &Snapshot, prev: &Snapshot, window: Duration, uptime: Duration) -> String {
-    let w = fmt_dur(window);
-    let mut out = vec![format!("⛏ {} · {} · up {}", name, if solo { "solo" } else { "pool" }, fmt_dur(uptime))];
-    let avg = now.hashes.saturating_sub(prev.hashes) as f64 / window.as_secs_f64().max(1.0);
-    out.push(format!("Hashrate: {} now · {} avg over {}", fmt_rate(now.rate_now), fmt_rate(avg), w));
-    if let Some(net) = &now.network {
-        let mine = if avg > 0.0 { avg } else { now.rate_now };
-        out.push(format!(
-            "Network: {} · this rig {} · reward {:.2} KRX/block · DAA {}",
-            fmt_rate(net.hashrate),
-            fmt_pct(if net.hashrate > 0.0 { 100.0 * mine / net.hashrate } else { 0.0 }),
-            net.reward_krx,
-            fmt_count(net.daa)
-        ));
-    }
-    if solo {
-        out.push(format!(
-            "Blocks: {} found (+{} in {}) · {} rejected",
-            fmt_count(now.blocks),
-            fmt_count(now.blocks.saturating_sub(prev.blocks)),
-            w,
-            fmt_count(now.blocks_rejected)
-        ));
-    }
-    if let Some((acc, rej, stale)) = now.shares {
-        let prev_acc = prev.shares.map_or(0, |s| s.0);
-        out.push(format!(
-            "Shares: {} accepted (+{} in {}) · {} rejected ({} stale)",
-            fmt_count(acc),
-            fmt_count(acc.saturating_sub(prev_acc)),
-            w,
-            fmt_count(rej),
-            fmt_count(stale)
-        ));
-    }
-    out.push(match (now.balance, &now.balance_error) {
-        (Some(b), err) => {
-            let mut line = format!("Balance: {} KRX", fmt_krx(b as i128));
-            let mut deltas = Vec::new();
-            if let Some(p) = prev.balance.filter(|_| window >= Duration::from_secs(60)) {
-                deltas.push(format!("{} in {}", fmt_signed_krx(b as i128 - p as i128), w));
-            }
-            if let Some(f) = now.balance_first {
-                deltas.push(format!("{} since start", fmt_signed_krx(b as i128 - f as i128)));
-            }
-            if !deltas.is_empty() {
-                line.push_str(&format!(" ({})", deltas.join(", ")));
-            }
-            if let Some(n) = now.utxos {
-                line.push_str(&format!(" · {} UTXOs", fmt_count(n)));
-            }
-            if let Some(e) = err {
-                line.push_str(&format!(" · last read failed: {}", e));
-            }
-            line
-        }
-        (None, Some(e)) => format!("Balance: n/a — {}", e),
-        (None, None) => "Balance: not read yet".to_string(),
-    });
-    if solo || now.claimed_outputs > 0 || now.pending_outputs > 0 {
-        out.push(format!(
-            "Escrow: {} KRX claimed ({} outputs) · {} KRX pending ({} outputs)",
-            fmt_krx(now.claimed_sompi as i128),
-            fmt_count(now.claimed_outputs),
-            fmt_krx(now.pending_sompi as i128),
-            fmt_count(now.pending_outputs)
-        ));
-    }
-    let mut ai = format!(
-        "AI requests: {} (+{} in {}) · {} answered · {} missed",
-        fmt_count(now.ai_requests),
-        fmt_count(now.ai_requests.saturating_sub(prev.ai_requests)),
-        w,
-        fmt_count(now.ai_answered),
-        fmt_count(now.ai_missed)
-    );
-    if now.openings + now.openings_failed > 0 {
-        ai.push_str(&format!(" · {} openings ({} failed)", fmt_count(now.openings), fmt_count(now.openings_failed)));
-    }
-    out.push(ai);
-    if solo {
-        out.push(match &now.bond {
-            Some(b) if b.status == "clear" => format!("Service bond: clear · {} lifetime strikes", b.lifetime),
-            Some(b) => format!("⚠ Service bond: {} · {} active, {} lifetime strikes", b.status, b.active, b.lifetime),
-            None => "Service bond: not read yet".to_string(),
-        });
-    }
-    let what = if solo { "Node" } else { "Pool" };
-    out.push(match &now.link {
-        Link::Up(d) => format!("{}: connected for {}", what, fmt_dur(*d)),
-        Link::Down(d, why) => format!("⚠ {}: DOWN for {} — {}", what, fmt_dur(*d), why),
-        Link::Unknown => format!("{}: not connected yet", what),
-    });
-    out.join("\n")
+/// Label column of the monospace tables: values start at a fixed column.
+const LABEL_WIDTH: usize = 11;
+
+fn row(label: &str, value: impl std::fmt::Display) -> String {
+    format!("{:<w$}{}", label, value, w = LABEL_WIDTH)
 }
 
-/// The AI message: what was asked, and what the miner answered.
+/// The `/stats` text: `now` against `prev`, taken `window` earlier. A bold title, an aligned
+/// monospace table short enough for a phone, then a line per thing that needs a look.
+fn render_summary(name: &str, solo: bool, now: &Snapshot, prev: &Snapshot, window: Duration, uptime: Duration) -> String {
+    let avg = now.hashes.saturating_sub(prev.hashes) as f64 / window.as_secs_f64().max(1.0);
+    let plus = |n: u64, p: u64| format!("+{}", fmt_count(n.saturating_sub(p)));
+    let mut rows = vec![row("Hashrate", fmt_rate(now.rate_now)), row("  average", fmt_rate(avg))];
+    let mut warnings: Vec<String> = Vec::new();
+    if let Some(net) = &now.network {
+        let mine = if avg > 0.0 { avg } else { now.rate_now };
+        rows.push(row("Network", fmt_rate(net.hashrate)));
+        rows.push(row("  this rig", fmt_pct(if net.hashrate > 0.0 { 100.0 * mine / net.hashrate } else { 0.0 })));
+        rows.push(row("  reward", format!("{:.2} KRX", net.reward_krx)));
+        rows.push(row("  DAA", fmt_count(net.daa)));
+    }
+    rows.push(String::new());
+    if solo {
+        rows.push(row("Blocks", format!("{} ({})", fmt_count(now.blocks), plus(now.blocks, prev.blocks))));
+        rows.push(row("  rejected", fmt_count(now.blocks_rejected)));
+    }
+    if let Some((acc, rej, stale)) = now.shares {
+        rows.push(row("Shares", format!("{} ({})", fmt_count(acc), plus(acc, prev.shares.map_or(0, |s| s.0)))));
+        rows.push(row("  rejected", format!("{} ({} stale)", fmt_count(rej), fmt_count(stale))));
+    }
+    match (now.balance, &now.balance_error) {
+        (Some(b), err) => {
+            let mut value = format!("{} KRX", fmt_krx(b as i128));
+            if let Some(p) = prev.balance.filter(|_| window >= Duration::from_secs(60)) {
+                value.push_str(&format!(" ({})", fmt_signed_krx(b as i128 - p as i128)));
+            }
+            rows.push(row("Balance", value));
+            if let Some(first) = now.balance_first {
+                rows.push(row("  session", fmt_signed_krx(b as i128 - first as i128)));
+            }
+            if let Some(n) = now.utxos {
+                rows.push(row("  UTXOs", fmt_count(n)));
+            }
+            if let Some(e) = err {
+                warnings.push(format!("Balance read failed, showing the last one: {}", e));
+            }
+        }
+        (None, Some(e)) => {
+            rows.push(row("Balance", "n/a"));
+            warnings.push(format!("Balance: {}", e));
+        }
+        (None, None) => rows.push(row("Balance", "not read yet")),
+    }
+    if solo || now.claimed_outputs > 0 || now.pending_outputs > 0 {
+        rows.push(row("Escrow", format!("{} KRX pending", fmt_krx(now.pending_sompi as i128))));
+        rows.push(row("  outputs", fmt_count(now.pending_outputs)));
+        rows.push(row("  claimed", format!("{} KRX ({})", fmt_krx(now.claimed_sompi as i128), fmt_count(now.claimed_outputs))));
+    }
+    rows.push(String::new());
+    rows.push(row("AI", format!("{} ({})", fmt_count(now.ai_requests), plus(now.ai_requests, prev.ai_requests))));
+    rows.push(row("  answered", fmt_count(now.ai_answered)));
+    rows.push(row("  missed", fmt_count(now.ai_missed)));
+    if now.openings + now.openings_failed > 0 {
+        rows.push(row("  openings", format!("{} ({} failed)", fmt_count(now.openings), fmt_count(now.openings_failed))));
+    }
+    if solo {
+        match &now.bond {
+            Some(b) => {
+                rows.push(row("Bond", bond_short(b)));
+                rows.push(row("  lifetime", format!("{} strikes", b.lifetime)));
+                if b.status != "clear" {
+                    warnings.push(format!("Service bond: {}", b.status));
+                }
+            }
+            None => rows.push(row("Bond", "not read yet")),
+        }
+    }
+    let what = if solo { "Node" } else { "Pool" };
+    match &now.link {
+        Link::Up(d) => rows.push(row(what, format!("up {}", fmt_dur(*d)))),
+        Link::Down(d, why) => {
+            rows.push(row(what, format!("DOWN {}", fmt_dur(*d))));
+            warnings.push(format!("{} down: {}", what, why));
+        }
+        Link::Unknown => rows.push(row(what, "connecting")),
+    }
+    let mut out = format!(
+        "<b>⛏ {}</b> · {} · up {}\n<pre>{}</pre>\n<i>average and (+n): last {}</i>",
+        esc(name),
+        if solo { "solo" } else { "pool" },
+        fmt_dur(uptime),
+        esc(&rows.join("\n")),
+        fmt_dur(window)
+    );
+    for w in warnings {
+        out.push_str(&format!("\n⚠️ {}", esc(&w)));
+    }
+    out
+}
+
+/// The service-bond standing in a table cell; the full status goes below the table.
+fn bond_short(b: &Bond) -> String {
+    if b.status == "clear" {
+        "clear".into()
+    } else if b.status.contains("suspended") {
+        "SUSPENDED".into()
+    } else if b.active > 0 {
+        format!("strike {}", b.active)
+    } else {
+        "burning".into()
+    }
+}
+
+/// The AI message: what was asked, and what the miner answered, in collapsible quotes.
 fn render_ai(name: &str, label: &str, model: &str, prompt: &str, answer: Result<&str, &str>, secs: Option<f64>) -> String {
-    let mut head = format!("💬 {} · {}", name, label);
+    let mut meta = vec![label.to_string()];
     if !model.is_empty() {
-        head.push_str(&format!(" · {}", model));
+        meta.push(model.to_string());
     }
     if let Some(s) = secs {
-        head.push_str(&format!(" · {:.1} s", s));
+        meta.push(format!("{:.1} s", s));
     }
+    let prompt = match prompt.trim() {
+        "" => "(empty prompt)".to_string(),
+        p => clip_to(p, AI_PROMPT_MAX),
+    };
     let answer = match answer {
         Ok(text) if text.trim().is_empty() => "(empty answer)".to_string(),
         Ok(text) => clip_to(text.trim(), AI_ANSWER_MAX),
         Err(why) => format!("({})", why),
     };
-    format!("{}\n\nQ: {}\n\nA: {}", head, clip_to(prompt.trim(), AI_PROMPT_MAX), answer)
+    format!(
+        "<b>💬 AI request</b> · {}\n<i>{}</i>\n<b>Prompt</b>\n<blockquote expandable>{}</blockquote>\n<b>Answer</b>\n<blockquote expandable>{}</blockquote>",
+        esc(name),
+        esc(&meta.join(" · ")),
+        esc(&prompt),
+        esc(&answer)
+    )
 }
 
 enum Failure {
@@ -1026,9 +1066,17 @@ fn run_sender(cfg: Config, chat: String, rx: Receiver<Msg>) {
 }
 
 fn deliver(agent: &ureq::Agent, url: &str, chat: &str, text: &str, silent: bool, token: &str) -> Result<(), Failure> {
-    let body = json!({ "chat_id": chat, "text": text, "disable_web_page_preview": true, "disable_notification": silent });
+    let mut body = json!({
+        "chat_id": chat,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": true,
+        "disable_notification": silent,
+    });
     let mut last = String::new();
-    for attempt in 1..=SEND_ATTEMPTS {
+    let mut attempt = 0;
+    while attempt < SEND_ATTEMPTS {
+        attempt += 1;
         let wait = match agent.post(url).send_json(&body) {
             Ok(_) => return Ok(()),
             Err(ureq::Error::Status(code, resp)) => {
@@ -1042,6 +1090,18 @@ fn deliver(agent: &ureq::Agent, url: &str, chat: &str, text: &str, silent: bool,
                     }
                     403 => {
                         return Err(Failure::Fatal(format!("the bot may not write to chat {} — send it /start first ({})", chat, last)))
+                    }
+                    // Markup Telegram cannot parse: the plain text goes instead, at once.
+                    400 if desc.contains("parse entities") && body.get("parse_mode").is_some() => {
+                        warn!("Telegram: markup refused ({}) — sending the message as plain text", last);
+                        body = json!({
+                            "chat_id": chat,
+                            "text": strip_html(text),
+                            "disable_web_page_preview": true,
+                            "disable_notification": silent,
+                        });
+                        attempt -= 1;
+                        continue;
                     }
                     // A message the API refuses: retrying it will not help.
                     400 => return Err(Failure::Dropped(last)),
@@ -1060,6 +1120,31 @@ fn deliver(agent: &ureq::Agent, url: &str, chat: &str, text: &str, silent: bool,
         }
     }
     Err(Failure::Dropped(format!("{} after {} attempts", last, SEND_ATTEMPTS)))
+}
+
+/// Escapes text for Telegram's HTML parse mode.
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// The plain text of one of our HTML messages (tags dropped, entities decoded).
+fn strip_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' if in_tag => in_tag = false,
+            c if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+}
+
+/// `grpc://host:port` → `host:port`.
+fn strip_scheme(endpoint: &str) -> &str {
+    endpoint.split_once("://").map_or(endpoint, |(_, rest)| rest)
 }
 
 fn retry_delay(attempt: u32) -> Duration {
@@ -1194,13 +1279,13 @@ fn fmt_count(n: u64) -> String {
     group(n as u128)
 }
 
-/// KRX from sompi: 2 decimals from 1 KRX up, 4 below, truncated.
+/// KRX from sompi: 2 decimals from 1 KRX up (and for zero), 4 below, truncated.
 fn fmt_krx(sompi: i128) -> String {
     let sign = if sompi < 0 { "-" } else { "" };
     let a = sompi.unsigned_abs();
     let whole = a / 100_000_000;
     let frac = a % 100_000_000;
-    if whole >= 1 {
+    if whole >= 1 || a == 0 {
         format!("{}{}.{:02}", sign, group(whole), frac / 1_000_000)
     } else {
         format!("{}0.{:04}", sign, frac / 10_000)
@@ -1229,23 +1314,6 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
-
-    #[test]
-    fn ai_message() {
-        let text = render_ai("RIG", "pool chat 7", "GLM-4-9B", "  What is 2+2?\n", Ok(" 4 "), Some(3.27));
-        assert_eq!(text, "💬 RIG · pool chat 7 · GLM-4-9B · 3.3 s\n\nQ: What is 2+2?\n\nA: 4");
-        let skipped = render_ai("RIG", "solo request ab12", "", "hi", Err("not answered: solo audits past the attention gate"), None);
-        assert_eq!(skipped, "💬 RIG · solo request ab12\n\nQ: hi\n\nA: (not answered: solo audits past the attention gate)");
-        assert!(render_ai("RIG", "x", "m", "q", Ok("  "), None).ends_with("A: (empty answer)"));
-        let long = render_ai("RIG", "pool ai_request 0123456789abcdef", "Qwen3.8-27B", &"q".repeat(10_000), Ok(&"a".repeat(10_000)), Some(1.0));
-        assert!(long.contains(&format!("{}… (+{} chars)", "q".repeat(AI_PROMPT_MAX), 10_000 - AI_PROMPT_MAX)));
-        assert!(long.contains(&format!("{}… (+{} chars)", "a".repeat(AI_ANSWER_MAX), 10_000 - AI_ANSWER_MAX)));
-        assert!(long.encode_utf16().count() < 4096, "{} UTF-16 units", long.encode_utf16().count());
-        // Emoji take two UTF-16 units each: the budget holds for them too.
-        let emoji = render_ai("RIG", "pool chat 7", "GLM-4-9B", &"😀".repeat(5_000), Ok(&"🚀".repeat(5_000)), Some(1.0));
-        assert!(emoji.encode_utf16().count() < 4096, "{} UTF-16 units", emoji.encode_utf16().count());
-        assert!(emoji.contains(&format!("{}… (+{} chars)", "😀".repeat(AI_PROMPT_MAX / 2), 5_000 - AI_PROMPT_MAX / 2)));
-    }
 
     fn cfg(text: &str) -> Option<Config> {
         read_config(&parse_settings(text).unwrap(), Some("PC".into()))
@@ -1346,7 +1414,8 @@ mod tests {
         assert_eq!(fmt_krx(1_234_567), "0.0123");
         assert_eq!(fmt_signed_krx(1_240_000_000), "+12.40");
         assert_eq!(fmt_signed_krx(-50_000_000), "-0.5000");
-        assert_eq!(fmt_signed_krx(0), "+0.0000");
+        assert_eq!(fmt_signed_krx(0), "+0.00");
+        assert_eq!(fmt_krx(0), "0.00");
         assert_eq!(
             short_address("keryx:qz4zajm2kecfy5c6qctepdnt4666yz0qhff5alnhyy6jjzfm94svxylck57rh"),
             "keryx:qz4za…k57rh"
@@ -1354,71 +1423,6 @@ mod tests {
         assert_eq!(short_address("keryx:short"), "keryx:short");
         assert_eq!(clip(&"x".repeat(300)).chars().count(), REASON_MAX + 1);
         assert_eq!(mask("https://h/bot123:abc/sendMessage: Dns Failed", "123:abc"), "https://h/bot<token>/sendMessage: Dns Failed");
-    }
-
-    #[test]
-    fn summary_solo() {
-        let prev = Snapshot { hashes: 0, blocks: 2, ai_requests: 3, balance: Some(123_216_000_000), ..Default::default() };
-        let now = Snapshot {
-            rate_now: 1_610_000.0,
-            hashes: 1_580_000 * 3600,
-            blocks: 3,
-            ai_requests: 7,
-            ai_missed: 7,
-            claimed_sompi: 410_000_000,
-            claimed_outputs: 2,
-            pending_sompi: 230_000_000,
-            pending_outputs: 7,
-            balance: Some(123_456_000_000),
-            balance_first: Some(122_216_000_000),
-            utxos: Some(192),
-            network: Some(Network { hashrate: 591_008_278.41, reward_krx: 5.023_847_74, daa: 141_032_821 }),
-            bond: Some(Bond { status: "strike 2 (last at daa 140200000)".into(), active: 2, lifetime: 3 }),
-            link: Link::Up(Duration::from_secs(3 * 3600)),
-            ..Default::default()
-        };
-        let text = render_summary("RIG", true, &now, &prev, Duration::from_secs(3600), Duration::from_secs(5 * 3600 + 12 * 60));
-        let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines[0], "⛏ RIG · solo · up 5h12m");
-        assert_eq!(lines[1], "Hashrate: 1.61 MH/s now · 1.58 MH/s avg over 1h00m");
-        assert_eq!(lines[2], "Network: 591.01 MH/s · this rig 0.27% · reward 5.02 KRX/block · DAA 141,032,821");
-        assert_eq!(lines[3], "Blocks: 3 found (+1 in 1h00m) · 0 rejected");
-        assert_eq!(lines[4], "Balance: 1,234.56 KRX (+2.40 in 1h00m, +12.40 since start) · 192 UTXOs");
-        assert_eq!(lines[5], "Escrow: 4.10 KRX claimed (2 outputs) · 2.30 KRX pending (7 outputs)");
-        assert_eq!(lines[6], "AI requests: 7 (+4 in 1h00m) · 0 answered · 7 missed");
-        assert_eq!(lines[7], "⚠ Service bond: strike 2 (last at daa 140200000) · 2 active, 3 lifetime strikes");
-        assert_eq!(lines[8], "Node: connected for 3h00m");
-        assert_eq!(lines.len(), 9);
-    }
-
-    #[test]
-    fn summary_pool() {
-        let prev = Snapshot { shares: Some((100, 1, 0)), ..Default::default() };
-        let now = Snapshot {
-            shares: Some((156, 3, 1)),
-            ai_requests: 5,
-            ai_answered: 4,
-            ai_missed: 1,
-            openings: 3,
-            link: Link::Down(Duration::from_secs(180), "connection reset".into()),
-            ..Default::default()
-        };
-        let text = render_summary("RIG", false, &now, &prev, Duration::from_secs(600), Duration::from_secs(600));
-        let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines[0], "⛏ RIG · pool · up 10m");
-        assert_eq!(lines[2], "Shares: 156 accepted (+56 in 10m) · 3 rejected (1 stale)");
-        assert_eq!(lines[3], "Balance: not read yet");
-        assert_eq!(lines[4], "AI requests: 5 (+5 in 10m) · 4 answered · 1 missed · 3 openings (0 failed)");
-        assert_eq!(lines[5], "⚠ Pool: DOWN for 3m — connection reset");
-        assert_eq!(lines.len(), 6, "no network, blocks, escrow or bond lines here: {text}");
-        let none = Snapshot { balance_error: Some("HTTP 502 from info".into()), ..Default::default() };
-        let solo = render_summary("RIG", true, &none, &Snapshot::default(), Duration::from_secs(600), Duration::from_secs(600));
-        assert!(solo.contains("Balance: n/a — HTTP 502 from info"), "{solo}");
-        let stale = Snapshot { balance: Some(100_000_000), balance_error: Some("Dns Failed".into()), ..Default::default() };
-        let solo = render_summary("RIG", true, &stale, &Snapshot::default(), Duration::from_secs(30), Duration::from_secs(30));
-        assert!(solo.contains("Balance: 1.00 KRX · last read failed: Dns Failed"), "{solo}");
-        assert!(solo.contains("Service bond: not read yet"), "{solo}");
-        assert!(solo.contains("Node: not connected yet"), "{solo}");
     }
 
     #[test]
@@ -1452,6 +1456,175 @@ mod tests {
                 "GET /api/v1/addresses/keryx%3Aabc/balance HTTP/1.1",
             ]
         );
+    }
+
+    #[test]
+    fn summary_solo() {
+        let prev = Snapshot { hashes: 0, blocks: 2, ai_requests: 3, balance: Some(123_216_000_000), ..Default::default() };
+        let now = Snapshot {
+            rate_now: 1_610_000.0,
+            hashes: 1_580_000 * 3600,
+            blocks: 3,
+            ai_requests: 7,
+            ai_missed: 7,
+            claimed_sompi: 410_000_000,
+            claimed_outputs: 2,
+            pending_sompi: 230_000_000,
+            pending_outputs: 7,
+            balance: Some(123_456_000_000),
+            balance_first: Some(122_216_000_000),
+            utxos: Some(192),
+            network: Some(Network { hashrate: 591_008_278.41, reward_krx: 5.023_847_74, daa: 141_032_821 }),
+            bond: Some(Bond { status: "strike 2 (last at daa 140200000)".into(), active: 2, lifetime: 3 }),
+            link: Link::Up(Duration::from_secs(3 * 3600)),
+            ..Default::default()
+        };
+        let text = render_summary("RIG", true, &now, &prev, Duration::from_secs(3600), Duration::from_secs(5 * 3600 + 12 * 60));
+        let expected = "<b>⛏ RIG</b> · solo · up 5h12m\n<pre>\
+Hashrate   1.61 MH/s
+  average  1.58 MH/s
+Network    591.01 MH/s
+  this rig 0.27%
+  reward   5.02 KRX
+  DAA      141,032,821
+
+Blocks     3 (+1)
+  rejected 0
+Balance    1,234.56 KRX (+2.40)
+  session  +12.40
+  UTXOs    192
+Escrow     2.30 KRX pending
+  outputs  7
+  claimed  4.10 KRX (2)
+
+AI         7 (+4)
+  answered 0
+  missed   7
+Bond       strike 2
+  lifetime 3 strikes
+Node       up 3h00m</pre>
+<i>average and (+n): last 1h00m</i>
+⚠️ Service bond: strike 2 (last at daa 140200000)";
+        assert_eq!(text, expected);
+        let pre = text.split("<pre>").nth(1).unwrap().split("</pre>").next().unwrap();
+        assert!(pre.lines().all(|l| l.chars().count() <= 34), "phone-width rows: {pre}");
+    }
+
+    #[test]
+    fn summary_pool() {
+        let prev = Snapshot { shares: Some((100, 1, 0)), ..Default::default() };
+        let now = Snapshot {
+            shares: Some((156, 3, 1)),
+            ai_requests: 5,
+            ai_answered: 4,
+            ai_missed: 1,
+            openings: 3,
+            link: Link::Down(Duration::from_secs(180), "connection <reset> & gone".into()),
+            ..Default::default()
+        };
+        let text = render_summary("R&D", false, &now, &prev, Duration::from_secs(600), Duration::from_secs(600));
+        let expected = "<b>⛏ R&amp;D</b> · pool · up 10m\n<pre>\
+Hashrate   0.00 H/s
+  average  0.00 H/s
+
+Shares     156 (+56)
+  rejected 3 (1 stale)
+Balance    not read yet
+
+AI         5 (+5)
+  answered 4
+  missed   1
+  openings 3 (0 failed)
+Pool       DOWN 3m</pre>
+<i>average and (+n): last 10m</i>
+⚠️ Pool down: connection &lt;reset&gt; &amp; gone";
+        assert_eq!(text, expected);
+        let none = Snapshot { balance_error: Some("HTTP 502 from info".into()), ..Default::default() };
+        let solo = render_summary("RIG", true, &none, &Snapshot::default(), Duration::from_secs(600), Duration::from_secs(600));
+        assert!(solo.contains("Balance    n/a\n"), "{solo}");
+        assert!(solo.contains("\n⚠️ Balance: HTTP 502 from info"), "{solo}");
+        assert!(solo.contains("Bond       not read yet\n"), "{solo}");
+        assert!(solo.contains("Node       connecting</pre>"), "{solo}");
+        let stale = Snapshot { balance: Some(100_000_000), balance_error: Some("Dns Failed".into()), ..Default::default() };
+        let solo = render_summary("RIG", true, &stale, &Snapshot::default(), Duration::from_secs(30), Duration::from_secs(30));
+        assert!(solo.contains("Balance    1.00 KRX\n"), "{solo}");
+        assert!(solo.contains("⚠️ Balance read failed, showing the last one: Dns Failed"), "{solo}");
+        let clear = Snapshot { bond: Some(Bond { status: "clear".into(), active: 0, lifetime: 0 }), ..Default::default() };
+        let solo = render_summary("RIG", true, &clear, &Snapshot::default(), Duration::from_secs(30), Duration::from_secs(30));
+        assert!(solo.contains("Bond       clear\n  lifetime 0 strikes"), "{solo}");
+        assert!(!solo.contains("⚠️"), "nothing to flag: {solo}");
+    }
+
+    #[test]
+    fn start_and_alerts() {
+        let session = Session {
+            solo: true,
+            endpoint: "grpc://192.168.1.111:22110".into(),
+            address: "keryx:qz4zajm2kecfy5c6qctepdnt4666yz0qhff5alnhyy6jjzfm94svxylck57rh".into(),
+            tier: "light".into(),
+            explorer: String::new(),
+        };
+        assert_eq!(
+            render_start("RIG", &session),
+            format!(
+                "<b>▶️ Miner started</b> · RIG\n<pre>Miner      {}\nMode       solo\nNode       192.168.1.111:22110\nTier       light\nPayout     keryx:qz4za…k57rh</pre>\nSend /stats for numbers.",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+        assert_eq!(
+            render_alert("⚠️", "Block rejected", "RIG", "block <invalid>\nFurther rejects this hour only show in /stats."),
+            "<b>⚠️ Block rejected</b> · RIG\nblock &lt;invalid&gt;\nFurther rejects this hour only show in /stats."
+        );
+        assert_eq!(render_alert("✅", "Hashrate back", "RIG", ""), "<b>✅ Hashrate back</b> · RIG");
+        assert!(help_text("RIG").contains("/stats"));
+    }
+
+    #[test]
+    fn ai_message() {
+        let text = render_ai("RIG", "pool chat 7", "GLM-4-9B", "  Is 2 < 3 & 4 > 1?\n", Ok(" Yes "), Some(3.27));
+        assert_eq!(
+            text,
+            "<b>💬 AI request</b> · RIG\n<i>pool chat 7 · GLM-4-9B · 3.3 s</i>\n<b>Prompt</b>\n<blockquote expandable>Is 2 &lt; 3 &amp; 4 &gt; 1?</blockquote>\n<b>Answer</b>\n<blockquote expandable>Yes</blockquote>"
+        );
+        let skipped = render_ai("RIG", "solo request ab12", "", "hi", Err("not answered: solo audits past the attention gate"), None);
+        assert!(skipped.contains("<i>solo request ab12</i>"), "{skipped}");
+        assert!(skipped.ends_with("<blockquote expandable>(not answered: solo audits past the attention gate)</blockquote>"));
+        assert!(render_ai("RIG", "x", "m", " ", Ok("  "), None).contains("(empty prompt)"));
+        assert!(render_ai("RIG", "x", "m", "q", Ok("  "), None).contains("(empty answer)"));
+        // The 4096 limit counts the text Telegram shows: tags and entities do not count.
+        let visible = |html: &str| strip_html(html).encode_utf16().count();
+        let long = render_ai("RIG", "pool ai_request 0123456789abcdef", "Qwen3.8-27B", &"q".repeat(10_000), Ok(&"a".repeat(10_000)), Some(1.0));
+        assert!(long.contains(&format!("{}… (+{} chars)", "q".repeat(AI_PROMPT_MAX), 10_000 - AI_PROMPT_MAX)));
+        assert!(long.contains(&format!("{}… (+{} chars)", "a".repeat(AI_ANSWER_MAX), 10_000 - AI_ANSWER_MAX)));
+        assert!(visible(&long) < 4096, "{} UTF-16 units", visible(&long));
+        let emoji = render_ai("RIG", "pool chat 7", "GLM-4-9B", &"😀".repeat(5_000), Ok(&"🚀".repeat(5_000)), Some(1.0));
+        assert!(visible(&emoji) < 4096, "{} UTF-16 units", visible(&emoji));
+        let amps = render_ai("RIG", "pool chat 7", "GLM-4-9B", &"&".repeat(5_000), Ok(&"<".repeat(5_000)), Some(1.0));
+        assert!(visible(&amps) < 4096, "{} UTF-16 units", visible(&amps));
+    }
+
+    #[test]
+    fn html_helpers() {
+        assert_eq!(esc("a < b && c > d"), "a &lt; b &amp;&amp; c &gt; d");
+        assert_eq!(strip_html("<b>⚠️ Node lost</b> · R&amp;D\n<pre>x &lt; y</pre>"), "⚠️ Node lost · R&D\nx < y");
+        assert_eq!(strip_scheme("stratum+tcp://krx.suprnova.cc:4401"), "krx.suprnova.cc:4401");
+        assert_eq!(strip_scheme("plain:1"), "plain:1");
+    }
+
+    #[test]
+    fn falls_back_to_plain_text() {
+        let (api, server) = fake_api(vec![
+            (400, r#"{"ok":false,"description":"Bad Request: can't parse entities: unclosed tag"}"#),
+            (200, r#"{"ok":true}"#),
+        ]);
+        let url = format!("{}/botT/sendMessage", api);
+        assert!(deliver(&agent(), &url, "42", "<b>Hi</b> &amp; bye", false, "T").is_ok());
+        let seen = server.join().unwrap();
+        let first: Value = serde_json::from_str(&seen[0].1).unwrap();
+        let second: Value = serde_json::from_str(&seen[1].1).unwrap();
+        assert_eq!(first["parse_mode"], "HTML");
+        assert_eq!(second["parse_mode"], Value::Null);
+        assert_eq!(second["text"], "Hi & bye");
     }
 
     #[test]
@@ -1523,6 +1696,7 @@ mod tests {
         assert_eq!(body["chat_id"], "42");
         assert_eq!(body["text"], "hello ⛏");
         assert_eq!(body["disable_notification"], true);
+        assert_eq!(body["parse_mode"], "HTML");
     }
 
     #[test]
