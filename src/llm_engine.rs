@@ -305,7 +305,17 @@ fn trace_error(fallback: &str) -> anyhow::Error {
 /// (`verify::expected_ubatch`: 512-token prompt batches, CUDA's MMQ layouts past 8 tokens, one token
 /// per generated position). A batch never straddles a 512-position boundary: batches start on
 /// multiples of [`TRACE_UBATCH`], which divides 512, and the prompt is fed apart from the answer.
-fn feed_traced(ctx: &mut LlamaContext<'_>, batch: &mut LlamaBatch, tokens: &[LlamaToken], start: usize, logits_at: Option<usize>, n_prompt: usize) -> Result<()> {
+///
+/// With `rec`, the recurrent records of each batch are taken right after its decode.
+fn feed_traced(
+    ctx: &mut LlamaContext<'_>,
+    batch: &mut LlamaBatch,
+    tokens: &[LlamaToken],
+    start: usize,
+    logits_at: Option<usize>,
+    n_prompt: usize,
+    mut rec: Option<&mut RecurSink>,
+) -> Result<()> {
     let n_prompt = n_prompt.min(u32::MAX as usize) as u32;
     for (c, chunk) in tokens.chunks(TRACE_UBATCH as usize).enumerate() {
         let base = start + c * TRACE_UBATCH as usize;
@@ -323,6 +333,9 @@ fn feed_traced(ctx: &mut LlamaContext<'_>, batch: &mut LlamaBatch, tokens: &[Lla
             return Err(trace_error("trace batch refused"));
         }
         ctx.decode(batch)?;
+        if let Some(r) = rec.as_deref_mut() {
+            r.after_batch(chunk.len())?;
+        }
     }
     Ok(())
 }
@@ -346,6 +359,20 @@ pub struct SeqAttn {
     pub head_dim: u32,
 }
 
+/// One recurrent (gated delta-rule) layer of the sequence layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SeqRecur {
+    pub layer: u32,
+    pub slot: u32,
+    /// Sequence layer kind: 3 = one decay per head, 4 = one per key dimension.
+    pub kind: u32,
+    pub n_v_heads: u32,
+    pub head_dim: u32,
+}
+
+/// Sequence layer kind of a delta-rule layer with one decay per head (`RECUR_GDA`).
+pub const SEQ_KIND_GDA: u32 = 3;
+
 /// The sequence leaves a manifest under the attention rule commits.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SeqSpec {
@@ -354,6 +381,9 @@ pub struct SeqSpec {
     /// Heads per layer in the leaf layout (`seq_heads`).
     pub heads: u32,
     pub attn: Vec<SeqAttn>,
+    pub recur: Vec<SeqRecur>,
+    /// Positions between recurrent state checkpoints.
+    pub interval: u32,
 }
 
 impl SeqSpec {
@@ -367,12 +397,21 @@ impl SeqSpec {
         (self.attn.iter().map(|a| a.layer + 1).max().unwrap_or(0), self.attn.iter().map(|a| a.n_head).max().unwrap_or(0))
     }
 
-    /// Whether this engine can commit the layout: grouped-query attention layers only.
+    /// Bytes of one record of a recurrent head (`seq::record_len` of a one-decay layer).
+    fn record_len(&self) -> usize {
+        self.recur.first().map_or(0, |r| 8 * r.head_dim as usize + 8)
+    }
+
+    /// The backend's rows of the recurrent layers: (layer, kind, slot, heads, head_dim).
+    fn recur_rows(&self) -> Vec<SeqLayer> {
+        self.recur.iter().map(|r| [r.layer, r.kind, r.slot, r.n_v_heads, r.head_dim]).collect()
+    }
+
+    /// Whether this engine can commit the layout: grouped-query attention layers, and delta-rule
+    /// layers with one decay per head, alike in heads and dimension (the backend's record
+    /// capture), checkpointed on traced batch ends.
     pub fn check(&self) -> Result<()> {
-        if self.n_recur != 0 {
-            return Err(anyhow!("recurrent layers are not traced by this engine"));
-        }
-        if self.attn.len() != self.n_attn as usize || self.heads == 0 {
+        if self.attn.len() != self.n_attn as usize || self.recur.len() != self.n_recur as usize || self.heads == 0 {
             return Err(anyhow!("inconsistent sequence layout"));
         }
         for (i, a) in self.attn.iter().enumerate() {
@@ -380,7 +419,156 @@ impl SeqSpec {
                 return Err(anyhow!("unsupported attention layer {}", a.layer));
             }
         }
+        if let Some(first) = self.recur.first() {
+            if self.interval == 0 || self.interval % TRACE_UBATCH != 0 {
+                return Err(anyhow!("recurrent checkpoints every {} positions fall inside traced batches", self.interval));
+            }
+            for (i, r) in self.recur.iter().enumerate() {
+                if r.slot as usize != i || r.kind != SEQ_KIND_GDA || r.n_v_heads != first.n_v_heads || r.head_dim != first.head_dim {
+                    return Err(anyhow!("unsupported recurrent layer {}", r.layer));
+                }
+            }
+            if first.n_v_heads == 0 || first.n_v_heads > self.heads || first.head_dim % 32 != 0 || first.head_dim > 128 {
+                return Err(anyhow!("unsupported recurrent heads ({} of {})", first.n_v_heads, first.head_dim));
+            }
+        }
         Ok(())
+    }
+}
+
+/// The recurrent sequence leaves of a traced evaluation, built batch by batch from the records
+/// the backend takes after every gated-delta-net node (`keryx_rec.comp`): each head's records of
+/// every position end to end, and its states after every whole checkpoint interval. Every leaf is
+/// hashed as it grows; the leaves named at creation are also kept whole (a replay's spans).
+struct RecurSink {
+    n_recur: usize,
+    heads: usize,
+    seq_heads: usize,
+    n_attn: usize,
+    rec_len: usize,
+    state_len: usize,
+    interval: usize,
+    rec: Vec<blake3::Hasher>,
+    ckpt: Vec<blake3::Hasher>,
+    keep: Vec<(u32, Vec<u8>)>,
+    buf_rec: Vec<u8>,
+    buf_ckpt: Vec<u8>,
+    pos: usize,
+    n_ckpt: usize,
+}
+
+impl RecurSink {
+    /// A sink for `spec`'s recurrent leaves (`None` without any), keeping the leaves `keep` whole.
+    fn new(spec: &SeqSpec, keep: &[u32]) -> Option<Self> {
+        let first = *spec.recur.first()?;
+        let (n_recur, heads, hd) = (spec.recur.len(), first.n_v_heads as usize, first.head_dim as usize);
+        let rec_len = spec.record_len();
+        let state_len = hd * hd * 4;
+        let mut sink = Self {
+            n_recur,
+            heads,
+            seq_heads: spec.heads as usize,
+            n_attn: spec.n_attn as usize,
+            rec_len,
+            state_len,
+            interval: spec.interval as usize,
+            rec: vec![blake3::Hasher::new(); n_recur * heads],
+            ckpt: vec![blake3::Hasher::new(); n_recur * heads],
+            keep: Vec::new(),
+            buf_rec: vec![0u8; n_recur * heads * TRACE_UBATCH as usize * rec_len],
+            buf_ckpt: vec![0u8; n_recur * heads * state_len],
+            pos: 0,
+            n_ckpt: 0,
+        };
+        let mut leaves: Vec<u32> = keep.iter().copied().filter(|&l| sink.slot_head(l).is_some()).collect();
+        leaves.sort_unstable();
+        leaves.dedup();
+        sink.keep = leaves.into_iter().map(|l| (l, Vec::new())).collect();
+        Some(sink)
+    }
+
+    /// The (record?, slot * heads + head) of sequence leaf `leaf`, if it is a written recurrent leaf.
+    fn slot_head(&self, leaf: u32) -> Option<(bool, usize)> {
+        let base = 2 * self.seq_heads * self.n_attn;
+        let i = (leaf as usize).checked_sub(base)?;
+        let (sh, ck) = (i / 2, i % 2 == 1);
+        let (slot, h) = (sh / self.seq_heads, sh % self.seq_heads);
+        (slot < self.n_recur && h < self.heads).then_some((!ck, slot * self.heads + h))
+    }
+
+    /// Takes the records (and checkpoint) of the batch of `n_tokens` just decoded.
+    fn after_batch(&mut self, n_tokens: usize) -> Result<()> {
+        let (mut n, mut has_ckpt) = (0u32, 0u32);
+        // SAFETY: the buffers hold a whole batch of records and one state of every head.
+        let rc = unsafe {
+            llama_cpp_sys_2::ggml_backend_vk_keryx_recur_read(
+                TRACE_DEVICE,
+                self.buf_rec.as_mut_ptr(),
+                self.buf_rec.len(),
+                self.buf_ckpt.as_mut_ptr(),
+                self.buf_ckpt.len(),
+                &mut n,
+                &mut has_ckpt,
+            )
+        };
+        if rc != 0 {
+            return Err(trace_error(&format!("recurrent records unavailable ({rc})")));
+        }
+        if n as usize != n_tokens {
+            return Err(anyhow!("{n} recurrent records for a batch of {n_tokens}"));
+        }
+        self.pos += n_tokens;
+        let due = self.pos % self.interval == 0;
+        if (has_ckpt != 0) != due {
+            return Err(anyhow!("recurrent checkpoint {} at position {}", if due { "missing" } else { "unexpected" }, self.pos));
+        }
+        let per = n_tokens * self.rec_len;
+        for (i, hasher) in self.rec.iter_mut().enumerate() {
+            hasher.update(&self.buf_rec[i * per..(i + 1) * per]);
+        }
+        if due {
+            self.n_ckpt += 1;
+            for (i, hasher) in self.ckpt.iter_mut().enumerate() {
+                hasher.update(&self.buf_ckpt[i * self.state_len..(i + 1) * self.state_len]);
+            }
+        }
+        for k in 0..self.keep.len() {
+            let (is_rec, i) = self.slot_head(self.keep[k].0).expect("kept leaves are recurrent");
+            let bytes = if is_rec {
+                &self.buf_rec[i * per..(i + 1) * per]
+            } else if due {
+                &self.buf_ckpt[i * self.state_len..(i + 1) * self.state_len]
+            } else {
+                continue;
+            };
+            self.keep[k].1.extend_from_slice(bytes);
+        }
+        Ok(())
+    }
+
+    /// Checks the evaluation covered `n_pos` positions.
+    fn check_end(&self, n_pos: usize) -> Result<()> {
+        if self.pos != n_pos || self.n_ckpt != n_pos / self.interval {
+            return Err(anyhow!("recurrent records of {} positions ({} checkpoints) for {n_pos}", self.pos, self.n_ckpt));
+        }
+        Ok(())
+    }
+
+    /// The hashes of the recurrent leaves into `leaves` (every sequence leaf, in order).
+    fn hashes_into(&self, leaves: &mut [[u8; 32]]) {
+        let base = 2 * self.seq_heads * self.n_attn;
+        for slot in 0..self.n_recur {
+            for h in 0..self.heads {
+                let (i, leaf) = (slot * self.heads + h, base + 2 * (slot * self.seq_heads + h));
+                leaves[leaf] = *self.rec[i].finalize().as_bytes();
+                leaves[leaf + 1] = *self.ckpt[i].finalize().as_bytes();
+            }
+        }
+    }
+
+    /// The whole bytes of kept leaf `leaf`.
+    fn kept(&self, leaf: u32) -> Option<&[u8]> {
+        self.keep.iter().find(|(l, _)| *l == leaf).map(|(_, b)| b.as_slice())
     }
 }
 
@@ -394,7 +582,15 @@ struct LayerCache {
 
 /// Parses the llama.cpp state of sequence 0 (`llama_kv_cache::state_write`): one stream, one range
 /// of cells holding positions `0..n_pos` in order, unrotated q8_0 rows, value rows untransposed.
-fn parse_kv_state(b: &[u8], n_pos: usize) -> Result<Vec<LayerCache>> {
+/// The cache holds the attention layers only, in layer order. With `hybrid` the recurrent memory's
+/// state follows (`llama_memory_hybrid::state_write`) and is skipped. A cell of an M-RoPE model
+/// carries its 2D position and token (`llama_kv_cell_ext`, 12 bytes) after its sequence count; the
+/// state does not say so, and only one of the two readings holds positions `0..n_pos` in order.
+fn parse_kv_state(b: &[u8], n_pos: usize, hybrid: bool) -> Result<Vec<LayerCache>> {
+    parse_kv_state_ext(b, n_pos, hybrid, 0).or_else(|e| parse_kv_state_ext(b, n_pos, hybrid, 12).map_err(|_| e))
+}
+
+fn parse_kv_state_ext(b: &[u8], n_pos: usize, hybrid: bool, cell_ext: usize) -> Result<Vec<LayerCache>> {
     let mut o = 0usize;
     let mut take = |n: usize| -> Result<&[u8]> {
         let s = b.get(o..o + n).ok_or_else(|| anyhow!("the cache state ends early"))?;
@@ -417,6 +613,7 @@ fn parse_kv_state(b: &[u8], n_pos: usize) -> Result<Vec<LayerCache>> {
     for i in 0..cells {
         let pos = u32_at(take(4)?);
         let n_seq = u32_at(take(4)?);
+        take(cell_ext)?;
         let seq = if n_seq == 1 { u32_at(take(4)?) } else { u32::MAX };
         if pos as usize != i || seq != 0 {
             return Err(anyhow!("cache cell {i} holds position {pos} of {n_seq} sequences"));
@@ -445,7 +642,7 @@ fn parse_kv_state(b: &[u8], n_pos: usize) -> Result<Vec<LayerCache>> {
             }
         }
     }
-    if o != b.len() {
+    if o != b.len() && !hybrid {
         return Err(anyhow!("{} bytes past the cache state", b.len() - o));
     }
     Ok(layers)
@@ -461,8 +658,11 @@ fn seq_leaf_bytes(spec: &SeqSpec, cache: &[LayerCache], lse: &[f32], n_pos: usiz
     }
     let heads = spec.heads as usize;
     let mut out = vec![Vec::new(); spec.n_leaves()];
+    // The cache holds the attention layers in layer order: the rank of a layer among them is its slot.
+    let by_slot = cache.len() == spec.attn.len();
     for a in &spec.attn {
-        let lc = cache.get(a.layer as usize).ok_or_else(|| anyhow!("no cache for layer {}", a.layer))?;
+        let at = if by_slot { a.slot } else { a.layer } as usize;
+        let lc = cache.get(at).ok_or_else(|| anyhow!("no cache for layer {}", a.layer))?;
         let hb = a.head_dim as usize / 32 * 34;
         let nkv = a.n_head_kv as usize;
         if lc.k_row != nkv * hb || lc.v_row != nkv * hb {
@@ -504,7 +704,7 @@ fn read_seq(ctx: &LlamaContext<'_>, spec: &SeqSpec, n_pos: usize) -> Result<Vec<
     if n != size {
         return Err(anyhow!("cache state of {n} bytes for {size}"));
     }
-    let cache = parse_kv_state(&state, n_pos)?;
+    let cache = parse_kv_state(&state, n_pos, spec.n_recur > 0)?;
     let (layers, heads) = spec.lse_shape();
     let mut lse = vec![0f32; layers as usize * n_pos * heads as usize];
     // SAFETY: the buffer holds `layers * n_pos * heads` floats, as the backend writes them.
@@ -747,6 +947,14 @@ impl LlamaEngine {
             *g = None;
             return Err(anyhow!("softmax mass capture unavailable ({rc}) for {layers} layers of {heads} heads"));
         }
+        let rows = seq.map_or(Vec::new(), |s| s.recur_rows());
+        let interval = seq.map_or(0, |s| s.interval);
+        // SAFETY: `rows` outlives the call; the backend copies what it keeps.
+        let rc = unsafe { llama_cpp_sys_2::ggml_backend_vk_keryx_recur_configure(TRACE_DEVICE, rows.as_ptr() as *const u32, rows.len() as u32, interval) };
+        if rc != 0 {
+            *g = None;
+            return Err(anyhow!("recurrent record capture unavailable ({rc}) for {} layers", rows.len()));
+        }
         *g = Some(TraceConfig { manifest: digest, max_pos, leaves: nl as usize, seq: seq.cloned() });
         Ok(nl as usize)
     }
@@ -862,9 +1070,10 @@ impl LlamaEngine {
         if unsafe { llama_cpp_sys_2::ggml_backend_vk_keryx_trace_begin(TRACE_DEVICE) } != 0 {
             return Err(anyhow!("the trace could not be started"));
         }
+        let mut rec = seq.as_ref().and_then(|s| RecurSink::new(s, &[]));
         let mut run = || -> Result<(Vec<LlamaToken>, Vec<u8>)> {
             let mut fed = toks.clone();
-            feed_traced(&mut ctx, &mut batch, &toks, 0, Some(n_prompt - 1), n_prompt)?;
+            feed_traced(&mut ctx, &mut batch, &toks, 0, Some(n_prompt - 1), n_prompt, rec.as_mut())?;
             // The traced answer is sampled like any other (the trace commits the sampled tokens).
             let mut sampler = self.answer_sampler();
             let mut out = Vec::<u8>::new();
@@ -877,13 +1086,13 @@ impl LlamaEngine {
                 let piece = self.model.vocab().token_to_piece(token, false, None);
                 out.extend_from_slice(&piece);
                 fed.push(token);
-                feed_traced(&mut ctx, &mut batch, &[token], fed.len() - 1, Some(fed.len() - 1), n_prompt)?;
+                feed_traced(&mut ctx, &mut batch, &[token], fed.len() - 1, Some(fed.len() - 1), n_prompt, rec.as_mut())?;
             }
             if answer_bytes_per_position > 0 {
                 let need = (out.len() / answer_bytes_per_position as usize).min(max_tokens);
                 while fed.len() - n_prompt < need && fed.len() + 1 < n_ctx as usize {
                     fed.push(pad);
-                    feed_traced(&mut ctx, &mut batch, &[pad], fed.len() - 1, Some(fed.len() - 1), n_prompt)?;
+                    feed_traced(&mut ctx, &mut batch, &[pad], fed.len() - 1, Some(fed.len() - 1), n_prompt, rec.as_mut())?;
                 }
             }
             Ok((fed, out))
@@ -897,7 +1106,14 @@ impl LlamaEngine {
         };
         let (ubatch, leaves) = read_trace(nl, fed.len())?;
         let seq = match &seq {
-            Some(spec) => Some(read_seq(&ctx, spec, fed.len())?.iter().map(|b| *blake3::hash(b).as_bytes()).collect()),
+            Some(spec) => {
+                let mut hashes: Vec<[u8; 32]> = read_seq(&ctx, spec, fed.len())?.iter().map(|b| *blake3::hash(b).as_bytes()).collect();
+                if let Some(r) = &rec {
+                    r.check_end(fed.len())?;
+                    r.hashes_into(&mut hashes);
+                }
+                Some(hashes)
+            }
             None => None,
         };
         Ok(TracedGeneration {
@@ -926,7 +1142,7 @@ impl LlamaEngine {
         if unsafe { llama_cpp_sys_2::ggml_backend_vk_keryx_trace_begin(TRACE_DEVICE) } != 0 {
             return Err(anyhow!("the trace could not be started"));
         }
-        if let Err(e) = feed_traced(&mut ctx, &mut batch, &toks, 0, Some(toks.len() - 1), toks.len()) {
+        if let Err(e) = feed_traced(&mut ctx, &mut batch, &toks, 0, Some(toks.len() - 1), toks.len(), None) {
             abandon_trace();
             return Err(e);
         }
@@ -976,9 +1192,9 @@ impl LlamaEngine {
             // chunk holding the last capture; generated positions one by one.
             let step = TRACE_UBATCH as usize;
             let prompt_end = if last < n_prompt { n_prompt.min((last / step + 1) * step) } else { n_prompt };
-            feed_traced(&mut ctx, &mut batch, &toks[..prompt_end], 0, Some(n_prompt - 1), n_prompt)?;
+            feed_traced(&mut ctx, &mut batch, &toks[..prompt_end], 0, Some(n_prompt - 1), n_prompt, None)?;
             for p in n_prompt..=last {
-                feed_traced(&mut ctx, &mut batch, &toks[p..=p], p, Some(p), n_prompt)?;
+                feed_traced(&mut ctx, &mut batch, &toks[p..=p], p, Some(p), n_prompt, None)?;
             }
             Ok(())
         };
@@ -1000,7 +1216,8 @@ impl LlamaEngine {
     }
 
     /// Replays a traced evaluation whole, as it ran (see [`replay_multi`](Self::replay_multi)), and
-    /// returns the bytes of the sequence leaves `leaves` (every leaf when empty), in that order.
+    /// returns the bytes of the sequence leaves `leaves` (every leaf when empty and the layout has
+    /// no recurrent layer), in that order.
     pub fn replay_seq(&self, manifest: &[u8], tokens: &[i32], n_prompt: u32, n_ctx: u32, leaves: &[u32]) -> Result<Vec<Vec<u8>>> {
         let n_prompt = n_prompt as usize;
         if n_prompt == 0 || tokens.len() < n_prompt || tokens.len() > n_ctx as usize {
@@ -1020,10 +1237,11 @@ impl LlamaEngine {
         if unsafe { llama_cpp_sys_2::ggml_backend_vk_keryx_trace_begin(TRACE_DEVICE) } != 0 {
             return Err(anyhow!("the trace could not be started"));
         }
+        let mut rec = RecurSink::new(&spec, leaves);
         let mut run = || -> Result<()> {
-            feed_traced(&mut ctx, &mut batch, &toks[..n_prompt], 0, Some(n_prompt - 1), n_prompt)?;
+            feed_traced(&mut ctx, &mut batch, &toks[..n_prompt], 0, Some(n_prompt - 1), n_prompt, rec.as_mut())?;
             for p in n_prompt..toks.len() {
-                feed_traced(&mut ctx, &mut batch, &toks[p..=p], p, Some(p), n_prompt)?;
+                feed_traced(&mut ctx, &mut batch, &toks[p..=p], p, Some(p), n_prompt, rec.as_mut())?;
             }
             Ok(())
         };
@@ -1035,11 +1253,19 @@ impl LlamaEngine {
         if unsafe { llama_cpp_sys_2::ggml_backend_vk_keryx_trace_end(TRACE_DEVICE) } != 0 {
             return Err(trace_error("replay failed"));
         }
-        let mut all = read_seq(&ctx, &spec, toks.len())?;
+        let all = read_seq(&ctx, &spec, toks.len())?;
+        if let Some(r) = &rec {
+            r.check_end(toks.len())?;
+        }
         if leaves.is_empty() {
+            if spec.n_recur > 0 {
+                return Err(anyhow!("a replay keeps only the recurrent leaves it names"));
+            }
             return Ok(all);
         }
-        Ok(leaves.iter().map(|&l| std::mem::take(&mut all[l as usize])).collect())
+        // A recurrent leaf comes whole from the records the replay took; the rest from the cache.
+        // A leaf may be named twice (two spans of one checkpoint leaf).
+        Ok(leaves.iter().map(|&l| rec.as_ref().and_then(|r| r.kept(l)).unwrap_or(&all[l as usize]).to_vec()).collect())
     }
 }
 
@@ -1340,12 +1566,18 @@ mod tests {
 
     /// A llama.cpp sequence state of `cells` positions and the given layers' K and V rows.
     fn kv_state(cells: u32, layers: &[(Vec<u8>, Vec<u8>)], row: u64) -> Vec<u8> {
+        kv_state_cells(cells, layers, row, false)
+    }
+
+    /// [`kv_state`] whose cells carry the M-RoPE extension (2D position, token) when `ext`.
+    fn kv_state_cells(cells: u32, layers: &[(Vec<u8>, Vec<u8>)], row: u64, ext: bool) -> Vec<u8> {
         let mut b = Vec::new();
         for v in [0xaf14_3cd8u32, 0, 1, cells] {
             b.extend_from_slice(&v.to_le_bytes());
         }
         for i in 0..cells {
-            for v in [i, 1, 0] {
+            let cell: &[u32] = if ext { &[i, 1, 0, 0, 1000 + i, 0] } else { &[i, 1, 0] };
+            for v in cell {
                 b.extend_from_slice(&v.to_le_bytes());
             }
         }
@@ -1367,14 +1599,23 @@ mod tests {
     #[test]
     fn sequence_leaves_follow_the_node_layout() {
         let (n_pos, hb) = (3usize, 34usize);
-        let spec = SeqSpec { n_attn: 1, n_recur: 0, heads: 2, attn: vec![SeqAttn { layer: 0, slot: 0, n_head: 4, n_head_kv: 2, head_dim: 32 }] };
+        let spec = SeqSpec { n_attn: 1, n_recur: 0, heads: 2, attn: vec![SeqAttn { layer: 0, slot: 0, n_head: 4, n_head_kv: 2, head_dim: 32 }], recur: vec![], interval: 0 };
         spec.check().unwrap();
         let k: Vec<u8> = (0..n_pos * 2 * hb).map(|i| i as u8).collect();
         let v: Vec<u8> = (0..n_pos * 2 * hb).map(|i| (i as u8).wrapping_mul(7)).collect();
         let state = kv_state(n_pos as u32, &[(k.clone(), v.clone())], 2 * hb as u64);
-        let cache = parse_kv_state(&state, n_pos).unwrap();
-        assert!(parse_kv_state(&state, n_pos + 1).is_err());
-        assert!(parse_kv_state(&state[..state.len() - 1], n_pos).is_err());
+        let cache = parse_kv_state(&state, n_pos, false).unwrap();
+        assert!(parse_kv_state(&state, n_pos + 1, false).is_err());
+        assert!(parse_kv_state(&state[..state.len() - 1], n_pos, false).is_err());
+        // A hybrid memory's recurrent state follows the cache.
+        let mut hybrid = state.clone();
+        hybrid.extend_from_slice(&[1, 2, 3]);
+        assert!(parse_kv_state(&hybrid, n_pos, false).is_err());
+        assert_eq!(parse_kv_state(&hybrid, n_pos, true).unwrap().len(), 1);
+        // An M-RoPE cache's cells carry their 2D position and token.
+        let mrope = kv_state_cells(n_pos as u32, &[(k.clone(), v.clone())], 2 * hb as u64, true);
+        let ext = parse_kv_state(&mrope, n_pos, false).unwrap();
+        assert_eq!((ext[0].k.as_slice(), ext[0].v.as_slice()), (cache[0].k.as_slice(), cache[0].v.as_slice()));
         let lse: Vec<f32> = (0..n_pos * 4).map(|i| i as f32 * 0.5).collect();
         let leaves = seq_leaf_bytes(&spec, &cache, &lse, n_pos).unwrap();
         assert_eq!(leaves.len(), spec.n_leaves());
@@ -1395,7 +1636,53 @@ mod tests {
         let mut rotated = state.clone();
         let rot = 16 + 12 * n_pos + 8;
         rotated[rot..rot + 4].copy_from_slice(&64u32.to_le_bytes());
-        assert!(parse_kv_state(&rotated, n_pos).is_err());
+        assert!(parse_kv_state(&rotated, n_pos, false).is_err());
+    }
+
+    /// Recurrent leaves land where the node's layout puts each head's records and checkpoints,
+    /// sized as it decodes them; layouts the record capture cannot take are refused.
+    #[test]
+    fn recurrent_leaves_follow_the_node_layout() {
+        use keryx_verifiable_inference::manifest::RECUR_GDA;
+        use keryx_verifiable_inference::seq::{record_len, SeqLayout};
+        let recur = |layer, slot| SeqRecur { layer, slot, kind: SEQ_KIND_GDA, n_v_heads: 3, head_dim: 32 };
+        let spec = SeqSpec {
+            n_attn: 1,
+            n_recur: 2,
+            heads: 4,
+            attn: vec![SeqAttn { layer: 1, slot: 0, n_head: 4, n_head_kv: 2, head_dim: 32 }],
+            recur: vec![recur(0, 0), recur(2, 1)],
+            interval: 16,
+        };
+        spec.check().unwrap();
+        assert_eq!(spec.record_len(), record_len(RECUR_GDA, 32));
+        assert_eq!(spec.recur_rows(), vec![[0, 3, 0, 3, 32], [2, 3, 1, 3, 32]]);
+        let layout = SeqLayout { n_attn: 1, n_recur: 2, heads: 4 };
+        let sink = RecurSink::new(&spec, &[layout.checkpoint(1, 2).unwrap() as u32, layout.kcache(0, 0).unwrap() as u32]).unwrap();
+        assert_eq!(sink.keep.len(), 1, "only recurrent leaves are kept");
+        for slot in 0..2u64 {
+            for h in 0..4u64 {
+                let (r, c) = (layout.record(slot, h).unwrap() as u32, layout.checkpoint(slot, h).unwrap() as u32);
+                let i = (slot * 3 + h) as usize;
+                let want = |rec: bool| (h < 3).then_some((rec, i));
+                assert_eq!((sink.slot_head(r), sink.slot_head(c)), (want(true), want(false)), "slot {slot} head {h}");
+            }
+        }
+        assert_eq!(sink.slot_head(layout.vcache(0, 3).unwrap() as u32), None);
+        assert_eq!(sink.slot_head(layout.lse(0, 0).unwrap() as u32), None);
+        // Nothing recorded yet: every written recurrent leaf is the hash of nothing; the others stay.
+        let mut leaves = vec![[7u8; 32]; spec.n_leaves()];
+        sink.hashes_into(&mut leaves);
+        let empty = *blake3::hash(b"").as_bytes();
+        assert_eq!(leaves[layout.record(1, 2).unwrap() as usize], empty);
+        assert_eq!(leaves[layout.checkpoint(0, 0).unwrap() as usize], empty);
+        assert_eq!(leaves[layout.record(0, 3).unwrap() as usize], [7u8; 32]);
+        assert!(sink.check_end(0).is_ok() && sink.check_end(1).is_err());
+        // Checkpoints inside a traced batch, key-wise decays, uneven layers: refused.
+        assert!(SeqSpec { interval: 12, ..spec.clone() }.check().is_err());
+        assert!(SeqSpec { recur: vec![recur(0, 0), SeqRecur { kind: 4, ..recur(2, 1) }], ..spec.clone() }.check().is_err());
+        assert!(SeqSpec { recur: vec![recur(0, 0), SeqRecur { n_v_heads: 2, ..recur(2, 1) }], ..spec.clone() }.check().is_err());
+        assert!(SeqSpec { n_recur: 3, ..spec.clone() }.check().is_err());
     }
 
     /// A capture holds the asked bytes and the chaining value of every chunk of its leaf, which

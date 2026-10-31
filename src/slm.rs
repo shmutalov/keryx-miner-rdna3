@@ -830,8 +830,37 @@ fn open_attention(
     Ok(body)
 }
 
-/// Every opening of a stage-2 response, one transaction each: the trace opening, the first
-/// attention phase under the attention rule, then the residual opening.
+/// The recurrent opening of the draw of `seed`, checked as the node checks it.
+fn open_recurrent(
+    engine: &InferenceEngine,
+    tm: &TraceManifest,
+    trace: &crate::trace::ResponseTrace,
+    seed: &[u8; 32],
+    response_txid: [u8; 32],
+    index: &crate::pom::WeightIndex,
+    n_ctx: u32,
+) -> std::result::Result<Vec<u8>, String> {
+    use crate::trace_seq::{draw_recur, recur_opening, seq_response_ctx};
+    let (m, rec) = (&tm.m, &trace.record);
+    let seq = trace.seq.as_ref().ok_or("no sequence leaves")?;
+    let d = draw_recur(m, rec, seed).ok_or("no recurrent draw")?;
+    let caps = replay_captures(engine, tm, trace, &d.captures(), n_ctx)?;
+    let plans = d.spans(m, rec.n_pos as u64).ok_or("no recurrent spans")?;
+    let spans = replay_spans(engine, tm, trace, &plans, n_ctx)?;
+    let op = recur_opening(m, rec, seq, index, &d, &caps, &spans, response_txid).map_err(|e| format!("{e} (layer {}, head {}, segment {})", d.layer, d.head, d.segment))?;
+    let ctx = m.chain.ok_or("no stage-2 context")?;
+    keryx_verifiable_inference::recur::verify_recur_point(&m.tier_ctx(index), &ctx, &seq_response_ctx(rec, seq), seed, &op)
+        .map_err(|e| format!("recurrent point {e:?} at layer {}, head {}, segment {}", d.layer, d.head, d.segment))?;
+    let body = op.encode();
+    if body.len() + SEEDED_OVERHEAD > keryx_verifiable_inference::opening::MAX_BODY_LEN {
+        return Err(format!("recurrent opening of {} B over the cap", body.len()));
+    }
+    Ok(body)
+}
+
+/// Every opening of a stage-2 response, one transaction each: the trace opening, then under the
+/// attention rule the first attention phase and, for a tier with recurrent layers, the recurrent
+/// opening, then the residual opening.
 #[allow(clippy::too_many_arguments)]
 fn open_pieces(
     engine: &InferenceEngine,
@@ -847,10 +876,10 @@ fn open_pieces(
     let (body, resid) = open_chain(engine, tm, pctx, trace, seed, request_hash, response_txid, index, n_ctx)?;
     let mut bodies = vec![body];
     if trace.seq.is_some() {
-        if tm.m.chain.is_some_and(|c| c.n_recur > 0) {
-            return Err("recurrent openings are not built by this engine".to_string());
-        }
         bodies.push(open_attention(engine, tm, trace, seed, response_txid, index, &[], None, n_ctx)?);
+        if tm.m.chain.is_some_and(|c| c.n_recur > 0) {
+            bodies.push(open_recurrent(engine, tm, trace, seed, response_txid, index, n_ctx)?);
+        }
     }
     bodies.push(resid);
     Ok(bodies)

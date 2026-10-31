@@ -987,7 +987,8 @@ impl StratumHandler {
             return;
         }
         // H15 traced answer: the tier is the model's own (its manifests define the trace), and this
-        // engine commits stage-2 traces with the sequence leaves of attention-only models.
+        // engine commits stage-2 traces with the sequence leaves of grouped-query attention and
+        // gated delta-rule layers (tiers 0, 1 and 3).
         if let Some(t) = request.trace {
             let own = keryx_miner::models::pom_tier_index(&request.model_id, u64::MAX);
             let supported = keryx_miner::trace::TierManifest::for_attn(t.tier).map(|m| m.seq_spec());

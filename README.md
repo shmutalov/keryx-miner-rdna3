@@ -119,14 +119,18 @@ keryx-node v1.6.6:
 - **Verifiable inference.** A traced answer commits the trace of its forward pass, with the prompt
   committed in 512-token batches (inputs in CUDA's MMQ layouts past 8 tokens), and under the
   **attention rule** (from the same gate on both networks) its sequence leaves: the q8_0 key and
-  value cache rows of every attention layer and the softmax mass of every query head. This build
-  commits both on Vulkan for **attention-only tiers (tier 1, GLM-4-9B)**: it computes in 8-token
-  batches and commits each input in the layout of its 512-token batch, reads the cache rows back
-  from llama.cpp's KV cache (rotation off) and the masses from a shader that recomputes them after
-  every flash-attention node. Before it serves a traced answer it runs a self-check on the GPU:
-  a traced answer, then its openings (trace, attention phase, residual) under two seeds, checked
-  with the node's own verifier. Tiers with recurrent or latent-cache layers (0, 3, 4) and sliding
-  windows (2) are not traced.
+  value cache rows of every attention layer and the softmax mass of every query head, and for the
+  gated delta-rule layers of hybrid models the per-head records of the delta rule (q, k, v, output,
+  beta, decay) and the state every 32 positions. This build commits them on Vulkan for **tiers 0, 1
+  and 3 (Qwen3.5-9B, GLM-4-9B, Qwen3.8-27B)**: it computes in 8-token batches and commits each input in
+  the layout of its 512-token batch (Q4_K/Q5_K products of such a batch take CUDA's MMQ arithmetic,
+  f16 tile scales), reads the cache rows back from llama.cpp's KV cache (rotation off), the masses
+  from a shader that recomputes them after every flash-attention node, and the delta-rule records
+  and states from a shader after every gated-delta-net node, hashed batch by batch. Before it serves
+  a traced answer it runs a self-check on the GPU: a traced answer, then its openings (trace,
+  attention phase, recurrent point on the hybrid tiers, residual) under two seeds, checked with the
+  node's own verifier. Tier 2 (sliding windows, value norms) and tier 4 (latent cache, key-wise
+  decays) are not traced.
 - **Traced pool answers** (keryx-miner-supr 0.15.3's pool protocol): a pool asks for a traced answer
   with the optional 8th `mining.ai_request` parameter; the miner answers with the trace commitment
   and the answer body for the pool to seal and sign, keeps the trace for 9 h

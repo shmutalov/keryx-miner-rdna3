@@ -292,23 +292,32 @@ impl TierManifest {
     }
 
     /// The sequence layout the Vulkan engine commits for this manifest: its grouped-query attention
-    /// layers. `Err` names what it cannot commit (recurrent or latent-cache layers, sliding windows).
+    /// layers (output gates allowed: they act past the attention the leaves commit) and its gated
+    /// delta-rule layers with one decay per head. `Err` names what it cannot commit (latent caches,
+    /// sliding windows, value norms, softcaps, key-wise decays).
     pub fn seq_spec(&self) -> Result<crate::llm_engine::SeqSpec, String> {
+        use crate::llm_engine::{SeqAttn, SeqRecur, SeqSpec, SEQ_KIND_GDA};
         let c = self.chain.ok_or("no chain context")?;
-        if c.n_recur > 0 {
-            return Err(format!("{} recurrent layers", c.n_recur));
-        }
-        let mut attn = Vec::new();
+        let (mut attn, mut recur) = (Vec::new(), Vec::new());
         for (e, _) in &self.entries {
             let Chain::Layer(ll) = e.chain else { continue };
-            let Some(a) = ll.attn else { continue };
-            if a.mla_rank > 0 || a.swa_window > 0 || a.gated > 0 || a.v_norm > 0 || a.softcap != 0 {
-                return Err(format!("attention layer {} has a latent cache, a window, a gate, a value norm or a softcap", ll.layer));
+            if let Some(a) = ll.attn {
+                if a.mla_rank > 0 || a.swa_window > 0 || a.v_norm > 0 || a.softcap != 0 {
+                    return Err(format!("attention layer {} has a latent cache, a window, a value norm or a softcap", ll.layer));
+                }
+                attn.push(SeqAttn { layer: ll.layer, slot: a.slot, n_head: a.n_head, n_head_kv: a.n_head_kv, head_dim: a.head_dim });
             }
-            attn.push(crate::llm_engine::SeqAttn { layer: ll.layer, slot: a.slot, n_head: a.n_head, n_head_kv: a.n_head_kv, head_dim: a.head_dim });
+            if let Some(r) = ll.recur {
+                if r.kind != manifest::RECUR_GDA {
+                    return Err(format!("recurrent layer {} decays per key dimension", ll.layer));
+                }
+                recur.push(SeqRecur { layer: ll.layer, slot: r.slot, kind: SEQ_KIND_GDA, n_v_heads: r.n_v_heads, head_dim: r.head_dim });
+            }
         }
         attn.sort_by_key(|a| a.slot);
-        let spec = crate::llm_engine::SeqSpec { n_attn: c.n_attn, n_recur: c.n_recur, heads: c.seq_heads, attn };
+        recur.sort_by_key(|r| r.slot);
+        let interval = if recur.is_empty() { 0 } else { self.seq_interval() };
+        let spec = SeqSpec { n_attn: c.n_attn, n_recur: c.n_recur, heads: c.seq_heads, attn, recur, interval };
         spec.check().map_err(|e| e.to_string())?;
         Ok(spec)
     }
