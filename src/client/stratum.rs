@@ -55,6 +55,17 @@ const MAX_QUEUED_OPENINGS: usize = 32;
 
 /// The traced self-check under the attention rule has been started in this process (once).
 static TRACE_SELF_TEST_STARTED: AtomicBool = AtomicBool::new(false);
+/// An unchanged capability set is declared again after this long. The declaration has no pool ack,
+/// so one lost to a startup race or a bridge registry reset would otherwise stand until the set
+/// changes (suprnova's `REDECLARE_EVERY`).
+const REDECLARE_EVERY: Duration = Duration::from_secs(90);
+
+/// Whether `ids` must be declared: on a new connection (even when empty, which clears what the
+/// bridge kept from an earlier session), on any change (nonempty to empty included, or the pool
+/// keeps routing requests for a model we no longer serve), and when the last declaration is stale.
+fn redeclare_due(declared: Option<&[String]>, ids: &[String], since_last: Option<Duration>) -> bool {
+    declared != Some(ids) || since_last.map_or(true, |t| t >= REDECLARE_EVERY)
+}
 
 // ── Phase 2 OPoI — inference cache & task types ─────────────────────────────
 
@@ -314,6 +325,9 @@ pub struct StratumHandler {
     /// Pool openings waiting for the inference card: the request, its result id, when it came.
     openings: std::collections::VecDeque<(ai::AiOpening, u32, std::time::Instant)>,
     started: std::time::Instant,
+    /// The model set last sent in `mining.declare_capabilities` on this connection, and when.
+    declared_model_ids: Option<Vec<String>>,
+    last_declare_at: Option<std::time::Instant>,
 }
 
 #[async_trait(?Send)]
@@ -337,11 +351,12 @@ impl Client for StratumHandler {
                         // no block task, as supr 0.15.1+ does (0.15.0 still hashes a task root, which
                         // makes every post-H15 block invalid), and H14 before the gate — so advertise
                         // the current supr release. Past the gate the pool refused 0.15.1 (2026-10-31,
-                        // after supr 0.15.3/0.15.4 shipped traced answers). This build serves supr's
-                        // pool trace protocol too (traced `mining.ai_request`, `mining.ai_opening`) for
-                        // attention-only tiers. Bump this single string if the pool raises the floor
-                        // again. (Real build: keryx-miner/CARGO_PKG_VERSION.)
-                        "keryx-miner-supr/0.15.4".to_string(),
+                        // after supr 0.15.3/0.15.4 shipped traced answers; 0.15.5 makes every Windows
+                        // 0.15.4 rig update). This build serves supr's pool trace protocol too (traced
+                        // `mining.ai_request`, `mining.ai_opening`) for tiers 0, 1 and 3. Bump this
+                        // string and the `mining.hello` version if the pool raises the floor again.
+                        // (Real build: keryx-miner/CARGO_PKG_VERSION.)
+                        "keryx-miner-supr/0.15.5".to_string(),
                         KERYX_STRATUM_DAA_CAPABILITY.into(),
                     )),
                 )),
@@ -376,31 +391,10 @@ impl Client for StratumHandler {
             })
             .await?;
 
-        // Declare loaded SLM models so the bridge can challenge with the right model.
-        // PoW-only mode serves no inference, so it must announce ZERO models — otherwise the
-        // bridge challenges a model we won't answer, our empty response makes the pool drop the
-        // socket, and the supervisor loops on short sessions.
-        let model_ids: Vec<String> = if keryx_miner::pow_only() {
-            Vec::new()
-        } else {
-            keryx_miner::slm::loaded_model_ids()
-                .into_iter()
-                .map(|id| hex::encode(id))
-                .collect()
-        };
-        if !model_ids.is_empty() {
-            info!("OPoI: declaring {} model(s) to pool bridge", model_ids.len());
-            self.send_channel
-                .send(StratumLine {
-                    id: None,
-                    payload: StratumLinePayload::StratumCommand(
-                        StratumCommand::MiningDeclareCapabilities(model_ids),
-                    ),
-                    jsonrpc: None,
-                    error: None,
-                })
-                .await?;
-        }
+        // Declare the models we can serve so the bridge challenges and routes only those; every
+        // job declares again when the set changes (a model finishing its download, the traced
+        // self-check passing) or the declaration goes stale.
+        self.declare_capabilities_if_changed().await?;
         // Miner telemetry (suprnova's `mining.hello`): the static rig identity and whether this rig
         // can serve traced answers. Best effort: a pool that refuses it turns telemetry off.
         let hello = self.hello();
@@ -524,6 +518,8 @@ impl StratumHandler {
             telemetry_on: true,
             openings: std::collections::VecDeque::new(),
             started: std::time::Instant::now(),
+            declared_model_ids: None,
+            last_declare_at: None,
         }))
     }
 
@@ -749,6 +745,7 @@ impl StratumHandler {
                             // Remember the real daa so plain `Short` notifies can inherit it (PoM gate).
                             LAST_DAA_SCORE.store(daa_score, Ordering::Relaxed);
                             keryx_miner::slm::note_chain_daa(daa_score);
+                            self.declare_capabilities_if_changed().await?;
                             // OPoI hard gate (mirrors solo grpc.rs): no models ready = no mining.
                             if !keryx_miner::pow_only() && keryx_miner::slm::loaded_model_ids().is_empty() {
                                 if self.block_template_ctr.load(Ordering::SeqCst) % 200 == 0 {
@@ -809,6 +806,7 @@ impl StratumHandler {
                             self.block_template_ctr
                                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v + 1) % 10_000))
                                 .unwrap();
+                            self.declare_capabilities_if_changed().await?;
                             // OPoI hard gate (mirrors solo grpc.rs): no models ready = no mining.
                             if !keryx_miner::pow_only() && keryx_miner::slm::loaded_model_ids().is_empty() {
                                 if self.block_template_ctr.load(Ordering::SeqCst) % 200 == 0 {
@@ -1215,6 +1213,38 @@ impl StratumHandler {
         }
     }
 
+    /// The models this rig can serve now, as declared to the pool.
+    fn serveable_model_hex() -> Vec<String> {
+        keryx_miner::slm::serveable_model_ids(LAST_DAA_SCORE.load(Ordering::Relaxed)).into_iter().map(hex::encode).collect()
+    }
+
+    /// Sends `mining.declare_capabilities` when [`redeclare_due`]: called at authorize and on every
+    /// job, so the pool learns a change on the next job and an unchanged set every 90 s.
+    async fn declare_capabilities_if_changed(&mut self) -> Result<(), Error> {
+        let ids = Self::serveable_model_hex();
+        if !redeclare_due(self.declared_model_ids.as_deref(), &ids, self.last_declare_at.map(|t| t.elapsed())) {
+            return Ok(());
+        }
+        if self.declared_model_ids.as_ref() != Some(&ids) {
+            info!(
+                "OPoI: declaring {} model(s) to pool bridge ({})",
+                ids.len(),
+                ids.iter().map(|m| &m[..8.min(m.len())]).collect::<Vec<_>>().join(",")
+            );
+        }
+        self.send_channel
+            .send(StratumLine {
+                id: None,
+                payload: StratumLinePayload::StratumCommand(StratumCommand::MiningDeclareCapabilities(ids.clone())),
+                jsonrpc: None,
+                error: None,
+            })
+            .await?;
+        self.declared_model_ids = Some(ids);
+        self.last_declare_at = Some(std::time::Instant::now());
+        Ok(())
+    }
+
     /// The model this rig serves, with its tier.
     fn served_model() -> Option<([u8; 32], u8)> {
         if keryx_miner::pow_only() {
@@ -1237,7 +1267,7 @@ impl StratumHandler {
         };
         serde_json::json!({
             "v": 1,
-            "miner": { "name": "keryx-miner-supr", "version": "0.15.4", "build": "vulkan", "features": ["pom-v2", "opoi", "pom-vulkan"] },
+            "miner": { "name": "keryx-miner-supr", "version": "0.15.5", "build": "vulkan", "features": ["pom-v2", "opoi", "pom-vulkan"] },
             "trace": Self::trace_flag(),
             "host": { "os": std::env::consts::OS, "cpu_cores": std::thread::available_parallelism().map_or(1, |n| n.get()) },
             "model": model,
@@ -1254,7 +1284,7 @@ impl StratumHandler {
             + s.invalid_pom.load(Ordering::Relaxed)
             + s.rejected_other.load(Ordering::Relaxed);
         let hashrate = f64::from_bits(crate::miner::LAST_HASHRATE.load(Ordering::Relaxed));
-        let models: Vec<String> = Self::served_model().map(|(m, _)| hex::encode(m)).into_iter().collect();
+        let models = Self::serveable_model_hex();
         serde_json::json!({
             "v": 1,
             "uptime_s": self.started.elapsed().as_secs(),
@@ -1267,7 +1297,8 @@ impl StratumHandler {
 
     /// Past the attention gate, once per process: the traced self-check of the served model under
     /// the attention rule, mining paused while it runs. A rig whose check passes reports
-    /// `"trace": 1` and serves traced pool requests; one that fails serves none of them.
+    /// `"trace": 1`, declares the model and serves traced pool requests; one that fails declares
+    /// no model and serves none of them.
     async fn maybe_start_trace_self_test(&mut self, daa_score: u64, miner: &mut MinerManager) {
         if !keryx_miner::trace::attention_active(daa_score) || TRACE_SELF_TEST_STARTED.load(Ordering::SeqCst) {
             return;
@@ -1291,7 +1322,7 @@ impl StratumHandler {
             let ok = keryx_miner::slm::check_attention_trace(&model_id, tier);
             drop(guard);
             if ok {
-                info!("Trace: traced pool answers enabled (the pool learns it from the next telemetry report)");
+                info!("Trace: traced pool answers enabled (the model is declared to the pool with the next job)");
             }
         });
     }
@@ -1510,6 +1541,7 @@ impl StratumHandler {
         self.block_template_ctr.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v + 1) % 10_000)).unwrap();
         LAST_DAA_SCORE.store(daa_score, Ordering::Relaxed);
         keryx_miner::slm::note_chain_daa(daa_score);
+        self.declare_capabilities_if_changed().await?;
         // OPoI hard gate (mirrors solo grpc.rs): no models ready = no mining.
         if !keryx_miner::pow_only() && keryx_miner::slm::loaded_model_ids().is_empty() {
             if self.block_template_ctr.load(Ordering::SeqCst) % 200 == 0 {
@@ -1815,6 +1847,37 @@ mod proof_encoding_tests {
         let line: StratumLine = serde_json::from_str(r#"{"id":12,"result":false,"error":null}"#).unwrap();
         assert_eq!(line.id, Some(12));
         assert!(matches!(line.payload, StratumLinePayload::StratumResult { result: StratumResult::Plain(Some(false)) }));
+    }
+
+    #[test]
+    fn capabilities_are_declared_on_change_and_when_stale() {
+        let m = vec!["ab".repeat(32)];
+        let none: Vec<String> = Vec::new();
+        let fresh = Some(Duration::from_secs(5));
+        let stale = Some(REDECLARE_EVERY);
+        // A new connection declares, even nothing: the bridge may keep an earlier session's set.
+        assert!(redeclare_due(None, &none, None));
+        assert!(redeclare_due(None, &m, None));
+        // An unchanged, fresh declaration is not repeated every job...
+        assert!(!redeclare_due(Some(&m[..]), &m, fresh));
+        assert!(!redeclare_due(Some(&none[..]), &none, fresh));
+        // ...but a stale one is, and any change goes out at once, losing the last model included.
+        assert!(redeclare_due(Some(&m[..]), &m, stale));
+        assert!(redeclare_due(Some(&none[..]), &m, fresh));
+        assert!(redeclare_due(Some(&m[..]), &none, fresh));
+    }
+
+    #[test]
+    fn an_empty_declaration_is_sent_as_empty_params() {
+        let line = StratumLine {
+            id: None,
+            payload: StratumLinePayload::StratumCommand(StratumCommand::MiningDeclareCapabilities(Vec::new())),
+            jsonrpc: None,
+            error: None,
+        };
+        let v = serde_json::to_value(&line).unwrap();
+        assert_eq!(v["method"], "mining.declare_capabilities");
+        assert_eq!(v["params"], serde_json::json!([]));
     }
 }
 

@@ -137,7 +137,10 @@ keryx-node v1.6.6:
   (`keryx-pool-traces/` beside the executable, or `KERYX_POOL_TRACE_DIR`) and builds the openings
   when the pool sends `mining.ai_opening`, replaying the answer on the GPU. Past the gate the miner
   runs the self-check once at its first job (mining pauses meanwhile) and reports `"trace": 1` in
-  its `mining.hello`/`mining.telemetry` once it passed.
+  its `mining.hello`/`mining.telemetry` once it passed. As suprnova's miner does, it declares
+  (`mining.declare_capabilities`) only the models it can serve: past the gate, only those whose
+  self-check passed; the set goes out again on every change, as an empty list when nothing is
+  left, and every 90 s.
 - **Solo AI answers stay skipped past the gate**: solo audits (attention phases through the node,
   deadlines) are not wired up.
 - **Solo mining past the gate is not viable with this build.** Every request is audited against the
