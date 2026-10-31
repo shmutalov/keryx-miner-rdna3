@@ -126,3 +126,8 @@ sha3 = { git = "https://github.com/elichai/hashes", branch = "cSHAKE" }
 # keryx-vulkan joins the workspace. No candle-kernels patch — there is no CUDA kernel build.
 members = ["inference", "verifiable-inference", "keryx-vulkan"]
 default-members = ["."]
+
+# Local development of the llama.cpp fork (attention-rule trace); replaced by a pinned rev on release.
+[patch."https://github.com/shmutalov/llama-cpp-rs"]
+llama-cpp-2 = { path = "D:/Projects/mine/llama-cpp-rs/llama-cpp-2" }
+llama-cpp-sys-2 = { path = "D:/Projects/mine/llama-cpp-rs/llama-cpp-sys-2" }

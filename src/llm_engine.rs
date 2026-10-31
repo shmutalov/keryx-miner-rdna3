@@ -78,7 +78,7 @@ pub const LLAMA_LOG_TARGET: &str = "llama.cpp";
 
 /// llama.cpp warnings every request triggers by design — each runs a fresh context sized to the
 /// request, far below the model's training context. Logged at debug, not warn.
-const EXPECTED_LLAMA_WARNINGS: &[&str] = &["the full capacity of the model will not be utilized"];
+const EXPECTED_LLAMA_WARNINGS: &[&str] = &["the full capacity of the model will not be utilized", "attention rotation force disabled"];
 
 /// llama.cpp/ggml log callback: their output goes to the miner's logger under
 /// [`LLAMA_LOG_TARGET`] instead of raw stderr. INFO (the metadata dump at every model load, the
@@ -120,6 +120,24 @@ fn emit_llama_log(level: ggml_log_level, line: &str) {
         _ => log::Level::Trace,
     };
     log::log!(target: LLAMA_LOG_TARGET, level, "{line}");
+}
+
+/// Sets a variable llama.cpp/ggml read through the C runtime's `getenv`. On Windows `set_var`
+/// only updates the OS environment block, and the C runtime keeps its own copy (upstream keryx
+/// 25fa0eb), so the variable is put there too.
+fn set_llama_env(name: &str, value: &str) {
+    std::env::set_var(name, value);
+    #[cfg(windows)]
+    {
+        extern "C" {
+            fn _putenv_s(name: *const c_char, value: *const c_char) -> std::os::raw::c_int;
+        }
+        let (Ok(n), Ok(v)) = (std::ffi::CString::new(name), std::ffi::CString::new(value)) else { return };
+        // SAFETY: two NUL-terminated strings that outlive the call.
+        unsafe {
+            _putenv_s(n.as_ptr(), v.as_ptr());
+        }
+    }
 }
 
 fn backend() -> Result<&'static LlamaBackend> {
@@ -206,11 +224,25 @@ const CAPTURE_CAP: usize = 4 << 20;
 /// ggml device index of the inference GPU: the pinned, only visible one on a multi-GPU rig.
 const TRACE_DEVICE: usize = 0;
 
+/// One layer of the sequence layout: (layer, kind, slot, heads, head_dim); kind 1 = grouped-query
+/// attention, 2 = latent attention, 3/4 = gated/key-wise delta-rule recurrence.
+pub type SeqLayer = [u32; 5];
+
+/// A captured span of one sequence leaf: the whole chunks covering it and the chaining value of
+/// every chunk of the leaf.
+#[derive(Clone, Debug, Default)]
+pub struct SeqCapture {
+    pub bytes: Vec<u8>,
+    pub cvs: Vec<[u8; 32]>,
+}
+
 /// The manifest (BLAKE3 of its bytes) and position capacity the GPU trace is configured with.
 struct TraceConfig {
     manifest: [u8; 32],
     max_pos: u32,
     leaves: usize,
+    /// Sequence leaves committed beside the position leaves (attention rule).
+    seq: Option<SeqSpec>,
 }
 
 /// The request-bound prefix of a traced prompt: its token ids, the token count of the prompt head
@@ -244,6 +276,8 @@ pub struct TracedGeneration {
     pub n_pos: u32,
     pub ubatch: Vec<u32>,
     pub leaves: Vec<[u8; 32]>,
+    /// Sequence leaf hashes, under the attention rule.
+    pub seq: Option<Vec<[u8; 32]>>,
 }
 
 /// A traced evaluation of raw tokens: the batch size and leaves of every position.
@@ -266,21 +300,227 @@ fn trace_error(fallback: &str) -> anyhow::Error {
 }
 
 /// Feeds `tokens` at positions `start..` in batches of at most [`TRACE_UBATCH`], announcing each
-/// batch to the trace before its decode; only position `logits_at` produces logits.
-fn feed_traced(ctx: &mut LlamaContext<'_>, batch: &mut LlamaBatch, tokens: &[LlamaToken], start: usize, logits_at: Option<usize>) -> Result<()> {
+/// batch to the trace before its decode; only position `logits_at` produces logits. Each batch is
+/// committed as the node expects the run of a prompt of `n_prompt` positions to be batched
+/// (`verify::expected_ubatch`: 512-token prompt batches, CUDA's MMQ layouts past 8 tokens, one token
+/// per generated position). A batch never straddles a 512-position boundary: batches start on
+/// multiples of [`TRACE_UBATCH`], which divides 512, and the prompt is fed apart from the answer.
+fn feed_traced(ctx: &mut LlamaContext<'_>, batch: &mut LlamaBatch, tokens: &[LlamaToken], start: usize, logits_at: Option<usize>, n_prompt: usize) -> Result<()> {
+    let n_prompt = n_prompt.min(u32::MAX as usize) as u32;
     for (c, chunk) in tokens.chunks(TRACE_UBATCH as usize).enumerate() {
         let base = start + c * TRACE_UBATCH as usize;
         batch.clear();
         for (j, &tok) in chunk.iter().enumerate() {
             batch.add(tok, (base + j) as i32, &[0], Some(base + j) == logits_at)?;
         }
+        let declared = keryx_verifiable_inference::verify::expected_ubatch(base as u64, n_prompt);
+        let last = keryx_verifiable_inference::verify::expected_ubatch((base + chunk.len() - 1) as u64, n_prompt);
+        if last != declared || (declared as usize) < chunk.len() {
+            return Err(anyhow!("a traced batch at {base} straddles a committed batch"));
+        }
         // SAFETY: plain call into the backend.
-        if unsafe { llama_cpp_sys_2::ggml_backend_vk_keryx_trace_ubatch(TRACE_DEVICE, base as u32, chunk.len() as u32) } != 0 {
+        if unsafe { llama_cpp_sys_2::ggml_backend_vk_keryx_trace_ubatch_as(TRACE_DEVICE, base as u32, chunk.len() as u32, declared) } != 0 {
             return Err(trace_error("trace batch refused"));
         }
         ctx.decode(batch)?;
     }
     Ok(())
+}
+
+// -- Sequence leaves (H15 attention rule) ---------------------------------------------------------
+//
+// Under the attention rule a response also commits, per attention layer and key/value head, its
+// q8_0 key and value cache rows of every position end to end, and the log softmax mass of every
+// query head at every position. The cache rows come out of the context's own KV cache (the
+// sequence state of llama.cpp: the rows exactly as attention read them); the masses come from the
+// backend, which recomputes them after every flash-attention node of a traced evaluation
+// (`keryx_lse.comp`).
+
+/// One attention layer of the sequence layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SeqAttn {
+    pub layer: u32,
+    pub slot: u32,
+    pub n_head: u32,
+    pub n_head_kv: u32,
+    pub head_dim: u32,
+}
+
+/// The sequence leaves a manifest under the attention rule commits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SeqSpec {
+    pub n_attn: u32,
+    pub n_recur: u32,
+    /// Heads per layer in the leaf layout (`seq_heads`).
+    pub heads: u32,
+    pub attn: Vec<SeqAttn>,
+}
+
+impl SeqSpec {
+    pub fn n_leaves(&self) -> usize {
+        let h = self.heads as usize;
+        2 * h * (self.n_attn + self.n_recur) as usize + h * self.n_attn as usize
+    }
+
+    /// Layers and query heads of the mass capture.
+    fn lse_shape(&self) -> (u32, u32) {
+        (self.attn.iter().map(|a| a.layer + 1).max().unwrap_or(0), self.attn.iter().map(|a| a.n_head).max().unwrap_or(0))
+    }
+
+    /// Whether this engine can commit the layout: grouped-query attention layers only.
+    pub fn check(&self) -> Result<()> {
+        if self.n_recur != 0 {
+            return Err(anyhow!("recurrent layers are not traced by this engine"));
+        }
+        if self.attn.len() != self.n_attn as usize || self.heads == 0 {
+            return Err(anyhow!("inconsistent sequence layout"));
+        }
+        for (i, a) in self.attn.iter().enumerate() {
+            if a.slot as usize != i || a.n_head_kv == 0 || a.n_head_kv > self.heads || a.n_head % a.n_head_kv != 0 || a.head_dim % 32 != 0 {
+                return Err(anyhow!("unsupported attention layer {}", a.layer));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The q8_0 key and value cache rows of one layer, every position end to end.
+struct LayerCache {
+    k: Vec<u8>,
+    v: Vec<u8>,
+    k_row: usize,
+    v_row: usize,
+}
+
+/// Parses the llama.cpp state of sequence 0 (`llama_kv_cache::state_write`): one stream, one range
+/// of cells holding positions `0..n_pos` in order, unrotated q8_0 rows, value rows untransposed.
+fn parse_kv_state(b: &[u8], n_pos: usize) -> Result<Vec<LayerCache>> {
+    let mut o = 0usize;
+    let mut take = |n: usize| -> Result<&[u8]> {
+        let s = b.get(o..o + n).ok_or_else(|| anyhow!("the cache state ends early"))?;
+        o += n;
+        Ok(s)
+    };
+    let u32_at = |s: &[u8]| u32::from_le_bytes(s.try_into().unwrap());
+    // `llama_context::state_seq_get_data`: its magic and the sequence id, then the cache's state.
+    let (magic, seq) = (u32_at(take(4)?), u32_at(take(4)?));
+    if magic != 0xaf14_3cd8 || seq != 0 {
+        return Err(anyhow!("not a state of sequence 0 (magic {magic:#x}, sequence {seq})"));
+    }
+    if u32_at(take(4)?) != 1 {
+        return Err(anyhow!("the cache has several streams"));
+    }
+    let cells = u32_at(take(4)?) as usize;
+    if cells != n_pos {
+        return Err(anyhow!("the cache holds {cells} cells for {n_pos} positions"));
+    }
+    for i in 0..cells {
+        let pos = u32_at(take(4)?);
+        let n_seq = u32_at(take(4)?);
+        let seq = if n_seq == 1 { u32_at(take(4)?) } else { u32::MAX };
+        if pos as usize != i || seq != 0 {
+            return Err(anyhow!("cache cell {i} holds position {pos} of {n_seq} sequences"));
+        }
+    }
+    let v_trans = u32_at(take(4)?);
+    let n_layer = u32_at(take(4)?) as usize;
+    let (rot_k, rot_v) = (u32_at(take(4)?), u32_at(take(4)?));
+    if v_trans != 0 || rot_k != 0 || rot_v != 0 {
+        return Err(anyhow!("the cache is transposed or rotated (v_trans {v_trans}, rotation {rot_k}/{rot_v})"));
+    }
+    let mut layers: Vec<LayerCache> = Vec::with_capacity(n_layer);
+    for which in 0..2 {
+        for l in 0..n_layer {
+            let ty = u32_at(take(4)?);
+            let row = u64::from_le_bytes(take(8)?.try_into().unwrap()) as usize;
+            if ty != llama_cpp_sys_2::GGML_TYPE_Q8_0 as u32 {
+                return Err(anyhow!("cache layer {l} is not q8_0 (type {ty})"));
+            }
+            let rows = take(row * cells)?.to_vec();
+            if which == 0 {
+                layers.push(LayerCache { k: rows, v: Vec::new(), k_row: row, v_row: 0 });
+            } else {
+                layers[l].v = rows;
+                layers[l].v_row = row;
+            }
+        }
+    }
+    if o != b.len() {
+        return Err(anyhow!("{} bytes past the cache state", b.len() - o));
+    }
+    Ok(layers)
+}
+
+/// The bytes of every sequence leaf of `spec`, in leaf order, from the cache rows and the masses
+/// (`[layers][n_pos][heads]`, as the backend reads them back).
+fn seq_leaf_bytes(spec: &SeqSpec, cache: &[LayerCache], lse: &[f32], n_pos: usize) -> Result<Vec<Vec<u8>>> {
+    let (lse_layers, lse_heads) = spec.lse_shape();
+    let (lse_layers, lse_heads) = (lse_layers as usize, lse_heads as usize);
+    if lse.len() != lse_layers * n_pos * lse_heads {
+        return Err(anyhow!("{} masses for {lse_layers} layers of {n_pos} positions", lse.len()));
+    }
+    let heads = spec.heads as usize;
+    let mut out = vec![Vec::new(); spec.n_leaves()];
+    for a in &spec.attn {
+        let lc = cache.get(a.layer as usize).ok_or_else(|| anyhow!("no cache for layer {}", a.layer))?;
+        let hb = a.head_dim as usize / 32 * 34;
+        let nkv = a.n_head_kv as usize;
+        if lc.k_row != nkv * hb || lc.v_row != nkv * hb {
+            return Err(anyhow!("cache rows of layer {} are {}/{} bytes for {nkv} heads of {hb}", a.layer, lc.k_row, lc.v_row));
+        }
+        let g = (a.n_head / a.n_head_kv) as usize;
+        let slot = a.slot as usize;
+        for h in 0..nkv {
+            let kl = 2 * (slot * heads + h);
+            let mut k = Vec::with_capacity(n_pos * hb);
+            let mut v = Vec::with_capacity(n_pos * hb);
+            let mut m = Vec::with_capacity(n_pos * g * 4);
+            for t in 0..n_pos {
+                k.extend_from_slice(&lc.k[t * lc.k_row + h * hb..t * lc.k_row + (h + 1) * hb]);
+                v.extend_from_slice(&lc.v[t * lc.v_row + h * hb..t * lc.v_row + (h + 1) * hb]);
+                for qi in 0..g {
+                    let x = lse[(a.layer as usize * n_pos + t) * lse_heads + h * g + qi];
+                    if !x.is_finite() {
+                        return Err(anyhow!("no softmax mass for layer {} position {t} head {}", a.layer, h * g + qi));
+                    }
+                    m.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+            out[kl] = k;
+            out[kl + 1] = v;
+            out[2 * heads * (spec.n_attn + spec.n_recur) as usize + slot * heads + h] = m;
+        }
+    }
+    Ok(out)
+}
+
+/// Every sequence leaf of the traced evaluation that just ran in `ctx` (its trace ended).
+fn read_seq(ctx: &LlamaContext<'_>, spec: &SeqSpec, n_pos: usize) -> Result<Vec<Vec<u8>>> {
+    use llama_cpp_2::context::session::LlamaStateSeqFlags;
+    let size = ctx.state_seq_get_size_ext(0, LlamaStateSeqFlags::empty());
+    let mut state = vec![0u8; size];
+    // SAFETY: the buffer holds the size llama.cpp reported for this sequence's state.
+    let n = unsafe { ctx.state_seq_get_data_ext(state.as_mut_ptr(), 0, LlamaStateSeqFlags::empty()) };
+    if n != size {
+        return Err(anyhow!("cache state of {n} bytes for {size}"));
+    }
+    let cache = parse_kv_state(&state, n_pos)?;
+    let (layers, heads) = spec.lse_shape();
+    let mut lse = vec![0f32; layers as usize * n_pos * heads as usize];
+    // SAFETY: the buffer holds `layers * n_pos * heads` floats, as the backend writes them.
+    let rc = unsafe { llama_cpp_sys_2::ggml_backend_vk_keryx_lse_read(TRACE_DEVICE, lse.as_mut_ptr(), lse.len(), n_pos as u32) };
+    if rc != 0 {
+        return Err(trace_error(&format!("softmax masses unavailable ({rc})")));
+    }
+    seq_leaf_bytes(spec, &cache, &lse, n_pos)
+}
+
+/// The capture of `[lo, hi)` of a sequence leaf: those bytes and the chaining value of every chunk.
+pub fn seq_capture(leaf: &[u8], lo: u64, hi: u64) -> Result<SeqCapture> {
+    use keryx_verifiable_inference::merkle::{b3_chunk_cv, B3_CHUNK};
+    let bytes = leaf.get(lo as usize..hi as usize).ok_or_else(|| anyhow!("span {lo}..{hi} past a leaf of {} bytes", leaf.len()))?.to_vec();
+    let cvs = if leaf.len() <= B3_CHUNK { vec![*blake3::hash(leaf).as_bytes()] } else { leaf.chunks(B3_CHUNK).enumerate().map(|(i, c)| b3_chunk_cv(c, i as u64)).collect() };
+    Ok(SeqCapture { bytes, cvs })
 }
 
 /// Ends the traced evaluation and reads back its leaves and per-position batch sizes.
@@ -332,9 +572,15 @@ impl LlamaEngine {
         {
             let infer = keryx_vulkan::inference_device_index();
             info!("llm-engine: multi-GPU rig — pinning inference to Vulkan device {infer} (GGML_VK_VISIBLE_DEVICES)");
-            std::env::set_var("GGML_VK_VISIBLE_DEVICES", infer.to_string());
+            set_llama_env("GGML_VK_VISIBLE_DEVICES", &infer.to_string());
         }
 
+        // The attention rule commits the q8_0 cache rows as written and the node reads them as the
+        // plain quantized keys and values: llama.cpp's rotation of a quantized cache (0.6.0) stays
+        // off, as upstream keryx turns it off. Set before any context exists; a user value wins.
+        if std::env::var_os("LLAMA_ATTN_ROT_DISABLE").is_none() {
+            set_llama_env("LLAMA_ATTN_ROT_DISABLE", "1");
+        }
         let backend = backend()?;
         info!("llm-engine: loading {} (Vulkan, all layers on GPU, in-process)", gguf_path);
         // u32::MAX = offload every layer (the crate's "all" sentinel, like -ngl 999). MTP
@@ -471,11 +717,14 @@ impl LlamaEngine {
     /// Configures the canonical trace of the products named by `manifest` (a serialized tier
     /// manifest) for evaluations of up to `max_pos` positions; returns the leaves per position. A
     /// no-op when the GPU already traces this manifest with enough room.
-    pub fn trace_configure(&self, manifest: &[u8], max_pos: u32) -> Result<usize> {
+    pub fn trace_configure(&self, manifest: &[u8], max_pos: u32, seq: Option<&SeqSpec>) -> Result<usize> {
         let digest = *blake3::hash(manifest).as_bytes();
         let mut g = self.trace.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(c) = g.as_ref().filter(|c| c.manifest == digest && c.max_pos >= max_pos) {
+        if let Some(c) = g.as_ref().filter(|c| c.manifest == digest && c.max_pos >= max_pos && c.seq.as_ref() == seq) {
             return Ok(c.leaves);
+        }
+        if let Some(spec) = seq {
+            spec.check()?;
         }
         let _serialize = self.lock.lock().unwrap_or_else(|p| p.into_inner());
         // SAFETY: the manifest outlives the call; the backend copies what it keeps.
@@ -491,24 +740,43 @@ impl LlamaEngine {
         if nl <= 0 {
             return Err(anyhow!("trace configured without leaves"));
         }
-        *g = Some(TraceConfig { manifest: digest, max_pos, leaves: nl as usize });
+        let (layers, heads) = seq.map_or((0, 0), |s| s.lse_shape());
+        // SAFETY: plain call into the backend.
+        let rc = unsafe { llama_cpp_sys_2::ggml_backend_vk_keryx_lse_configure(TRACE_DEVICE, layers, heads) };
+        if rc != 0 {
+            *g = None;
+            return Err(anyhow!("softmax mass capture unavailable ({rc}) for {layers} layers of {heads} heads"));
+        }
+        *g = Some(TraceConfig { manifest: digest, max_pos, leaves: nl as usize, seq: seq.cloned() });
         Ok(nl as usize)
     }
 
-    /// Leaves per position of the configured trace, if it traces `manifest`.
-    fn trace_leaves(&self, manifest: &[u8], n_pos: usize) -> Result<usize> {
+    /// Leaves per position of the configured trace, if it traces `manifest`, and its sequence layout.
+    fn trace_leaves(&self, manifest: &[u8], n_pos: usize) -> Result<(usize, Option<SeqSpec>)> {
         let digest = *blake3::hash(manifest).as_bytes();
         let g = self.trace.lock().unwrap_or_else(|p| p.into_inner());
         match g.as_ref() {
-            Some(c) if c.manifest == digest && c.max_pos as usize >= n_pos => Ok(c.leaves),
+            Some(c) if c.manifest == digest && c.max_pos as usize >= n_pos => Ok((c.leaves, c.seq.clone())),
             _ => Err(anyhow!("the trace is not configured for this manifest and {n_pos} positions")),
         }
     }
 
     /// A context for a traced evaluation: [`TRACE_UBATCH`]-token batches, the KV cache of
-    /// [`new_context`](Self::new_context).
-    fn new_trace_context(&self, backend: &LlamaBackend, n_ctx: u32) -> Result<LlamaContext<'_>> {
-        self.new_context_batched(backend, n_ctx, TRACE_UBATCH, TRACE_UBATCH)
+    /// [`new_context`](Self::new_context). With `q8_cache` (sequence leaves commit the cache rows as
+    /// q8_0) the f16 fallback is refused.
+    fn new_trace_context(&self, backend: &LlamaBackend, n_ctx: u32, q8_cache: bool) -> Result<LlamaContext<'_>> {
+        if !q8_cache {
+            return self.new_context_batched(backend, n_ctx, TRACE_UBATCH, TRACE_UBATCH);
+        }
+        let params = LlamaContextParams::default()
+            .with_n_ctx(NonZeroU32::new(n_ctx))
+            .with_n_batch(TRACE_UBATCH)
+            .with_n_ubatch(TRACE_UBATCH)
+            .with_swa_full(false)
+            .with_flash_attention_policy(llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_ENABLED)
+            .with_type_k(KvCacheType::Q8_0)
+            .with_type_v(KvCacheType::Q8_0);
+        self.model.new_context(backend, params).map_err(|e| anyhow!("llm-engine: no {n_ctx}-token q8_0 flash-attention context for a traced evaluation: {e}"))
     }
 
     /// `text` as tokens: special tokens parsed (the templates' control tokens), and with `bos` a BOS
@@ -585,10 +853,10 @@ impl LlamaEngine {
         if n_prompt as u64 + PROMPT_MARGIN as u64 > n_ctx as u64 {
             return Err(PromptTooLong { tokens: n_prompt, ctx_cap: n_ctx }.into());
         }
-        let nl = self.trace_leaves(manifest, n_ctx as usize)?;
+        let (nl, seq) = self.trace_leaves(manifest, n_ctx as usize)?;
         let _serialize = self.lock.lock().unwrap_or_else(|p| p.into_inner());
         let backend = backend()?;
-        let mut ctx = self.new_trace_context(backend, n_ctx)?;
+        let mut ctx = self.new_trace_context(backend, n_ctx, seq.is_some())?;
         let mut batch = LlamaBatch::new(TRACE_UBATCH as usize, 1);
         // SAFETY: plain call into the backend.
         if unsafe { llama_cpp_sys_2::ggml_backend_vk_keryx_trace_begin(TRACE_DEVICE) } != 0 {
@@ -596,7 +864,7 @@ impl LlamaEngine {
         }
         let mut run = || -> Result<(Vec<LlamaToken>, Vec<u8>)> {
             let mut fed = toks.clone();
-            feed_traced(&mut ctx, &mut batch, &toks, 0, Some(n_prompt - 1))?;
+            feed_traced(&mut ctx, &mut batch, &toks, 0, Some(n_prompt - 1), n_prompt)?;
             // The traced answer is sampled like any other (the trace commits the sampled tokens).
             let mut sampler = self.answer_sampler();
             let mut out = Vec::<u8>::new();
@@ -609,13 +877,13 @@ impl LlamaEngine {
                 let piece = self.model.vocab().token_to_piece(token, false, None);
                 out.extend_from_slice(&piece);
                 fed.push(token);
-                feed_traced(&mut ctx, &mut batch, &[token], fed.len() - 1, Some(fed.len() - 1))?;
+                feed_traced(&mut ctx, &mut batch, &[token], fed.len() - 1, Some(fed.len() - 1), n_prompt)?;
             }
             if answer_bytes_per_position > 0 {
                 let need = (out.len() / answer_bytes_per_position as usize).min(max_tokens);
                 while fed.len() - n_prompt < need && fed.len() + 1 < n_ctx as usize {
                     fed.push(pad);
-                    feed_traced(&mut ctx, &mut batch, &[pad], fed.len() - 1, Some(fed.len() - 1))?;
+                    feed_traced(&mut ctx, &mut batch, &[pad], fed.len() - 1, Some(fed.len() - 1), n_prompt)?;
                 }
             }
             Ok((fed, out))
@@ -628,6 +896,10 @@ impl LlamaEngine {
             }
         };
         let (ubatch, leaves) = read_trace(nl, fed.len())?;
+        let seq = match &seq {
+            Some(spec) => Some(read_seq(&ctx, spec, fed.len())?.iter().map(|b| *blake3::hash(b).as_bytes()).collect()),
+            None => None,
+        };
         Ok(TracedGeneration {
             text: String::from_utf8_lossy(&out).into_owned(),
             tokens: fed.iter().map(|t| t.0).collect(),
@@ -635,6 +907,7 @@ impl LlamaEngine {
             n_pos: fed.len() as u32,
             ubatch,
             leaves,
+            seq,
         })
     }
 
@@ -644,16 +917,16 @@ impl LlamaEngine {
             return Err(anyhow!("{} tokens do not fit a {n_ctx}-token traced context", tokens.len()));
         }
         let toks = self.vocab_tokens(tokens)?;
-        let nl = self.trace_leaves(manifest, n_ctx as usize)?;
+        let (nl, seq) = self.trace_leaves(manifest, n_ctx as usize)?;
         let _serialize = self.lock.lock().unwrap_or_else(|p| p.into_inner());
         let backend = backend()?;
-        let mut ctx = self.new_trace_context(backend, n_ctx)?;
+        let mut ctx = self.new_trace_context(backend, n_ctx, seq.is_some())?;
         let mut batch = LlamaBatch::new(TRACE_UBATCH as usize, 1);
         // SAFETY: plain call into the backend.
         if unsafe { llama_cpp_sys_2::ggml_backend_vk_keryx_trace_begin(TRACE_DEVICE) } != 0 {
             return Err(anyhow!("the trace could not be started"));
         }
-        if let Err(e) = feed_traced(&mut ctx, &mut batch, &toks, 0, Some(toks.len() - 1)) {
+        if let Err(e) = feed_traced(&mut ctx, &mut batch, &toks, 0, Some(toks.len() - 1), toks.len()) {
             abandon_trace();
             return Err(e);
         }
@@ -678,10 +951,10 @@ impl LlamaEngine {
             return Err(anyhow!("capture past the traced positions"));
         }
         let toks = self.vocab_tokens(tokens)?;
-        let nl = self.trace_leaves(manifest, n_ctx as usize)?;
+        let (nl, seq) = self.trace_leaves(manifest, n_ctx as usize)?;
         let _serialize = self.lock.lock().unwrap_or_else(|p| p.into_inner());
         let backend = backend()?;
-        let mut ctx = self.new_trace_context(backend, n_ctx)?;
+        let mut ctx = self.new_trace_context(backend, n_ctx, seq.is_some())?;
         let mut batch = LlamaBatch::new(TRACE_UBATCH as usize, 1);
         let pos: Vec<u32> = caps.iter().map(|c| c.0).collect();
         let leaf: Vec<u32> = caps.iter().map(|c| c.1).collect();
@@ -703,9 +976,9 @@ impl LlamaEngine {
             // chunk holding the last capture; generated positions one by one.
             let step = TRACE_UBATCH as usize;
             let prompt_end = if last < n_prompt { n_prompt.min((last / step + 1) * step) } else { n_prompt };
-            feed_traced(&mut ctx, &mut batch, &toks[..prompt_end], 0, Some(n_prompt - 1))?;
+            feed_traced(&mut ctx, &mut batch, &toks[..prompt_end], 0, Some(n_prompt - 1), n_prompt)?;
             for p in n_prompt..=last {
-                feed_traced(&mut ctx, &mut batch, &toks[p..=p], p, Some(p))?;
+                feed_traced(&mut ctx, &mut batch, &toks[p..=p], p, Some(p), n_prompt)?;
             }
             Ok(())
         };
@@ -724,6 +997,49 @@ impl LlamaEngine {
             }
         }
         Ok(out.chunks(slot_bytes).zip(&lens).map(|(c, &l)| c[..(l as usize).min(slot_bytes)].to_vec()).collect())
+    }
+
+    /// Replays a traced evaluation whole, as it ran (see [`replay_multi`](Self::replay_multi)), and
+    /// returns the bytes of the sequence leaves `leaves` (every leaf when empty), in that order.
+    pub fn replay_seq(&self, manifest: &[u8], tokens: &[i32], n_prompt: u32, n_ctx: u32, leaves: &[u32]) -> Result<Vec<Vec<u8>>> {
+        let n_prompt = n_prompt as usize;
+        if n_prompt == 0 || tokens.len() < n_prompt || tokens.len() > n_ctx as usize {
+            return Err(anyhow!("a replay of {} tokens ({n_prompt} prompt) does not fit a {n_ctx}-token context", tokens.len()));
+        }
+        let toks = self.vocab_tokens(tokens)?;
+        let (_, seq) = self.trace_leaves(manifest, n_ctx as usize)?;
+        let spec = seq.ok_or_else(|| anyhow!("the trace commits no sequence leaves"))?;
+        if leaves.iter().any(|&l| l as usize >= spec.n_leaves()) {
+            return Err(anyhow!("replay of a sequence leaf past the {}", spec.n_leaves()));
+        }
+        let _serialize = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        let backend = backend()?;
+        let mut ctx = self.new_trace_context(backend, n_ctx, true)?;
+        let mut batch = LlamaBatch::new(TRACE_UBATCH as usize, 1);
+        // SAFETY: plain call into the backend.
+        if unsafe { llama_cpp_sys_2::ggml_backend_vk_keryx_trace_begin(TRACE_DEVICE) } != 0 {
+            return Err(anyhow!("the trace could not be started"));
+        }
+        let mut run = || -> Result<()> {
+            feed_traced(&mut ctx, &mut batch, &toks[..n_prompt], 0, Some(n_prompt - 1), n_prompt)?;
+            for p in n_prompt..toks.len() {
+                feed_traced(&mut ctx, &mut batch, &toks[p..=p], p, Some(p), n_prompt)?;
+            }
+            Ok(())
+        };
+        if let Err(e) = run() {
+            abandon_trace();
+            return Err(e);
+        }
+        // SAFETY: plain call into the backend; ends the evaluation (every dispatch landed).
+        if unsafe { llama_cpp_sys_2::ggml_backend_vk_keryx_trace_end(TRACE_DEVICE) } != 0 {
+            return Err(trace_error("replay failed"));
+        }
+        let mut all = read_seq(&ctx, &spec, toks.len())?;
+        if leaves.is_empty() {
+            return Ok(all);
+        }
+        Ok(leaves.iter().map(|&l| std::mem::take(&mut all[l as usize])).collect())
     }
 }
 
@@ -1020,6 +1336,96 @@ mod tests {
         // `slm` recognizes the refusal through anyhow.
         let wrapped: anyhow::Error = e.into();
         assert!(wrapped.is::<PromptTooLong>());
+    }
+
+    /// A llama.cpp sequence state of `cells` positions and the given layers' K and V rows.
+    fn kv_state(cells: u32, layers: &[(Vec<u8>, Vec<u8>)], row: u64) -> Vec<u8> {
+        let mut b = Vec::new();
+        for v in [0xaf14_3cd8u32, 0, 1, cells] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        for i in 0..cells {
+            for v in [i, 1, 0] {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        for v in [0u32, layers.len() as u32, 0, 0] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        for which in 0..2 {
+            for (k, v) in layers {
+                b.extend_from_slice(&(llama_cpp_sys_2::GGML_TYPE_Q8_0 as u32).to_le_bytes());
+                b.extend_from_slice(&row.to_le_bytes());
+                b.extend_from_slice(if which == 0 { k } else { v });
+            }
+        }
+        b
+    }
+
+    /// Sequence leaves are the per-head cache rows of every position end to end and the masses of
+    /// each head's query group, in the node's leaf order.
+    #[test]
+    fn sequence_leaves_follow_the_node_layout() {
+        let (n_pos, hb) = (3usize, 34usize);
+        let spec = SeqSpec { n_attn: 1, n_recur: 0, heads: 2, attn: vec![SeqAttn { layer: 0, slot: 0, n_head: 4, n_head_kv: 2, head_dim: 32 }] };
+        spec.check().unwrap();
+        let k: Vec<u8> = (0..n_pos * 2 * hb).map(|i| i as u8).collect();
+        let v: Vec<u8> = (0..n_pos * 2 * hb).map(|i| (i as u8).wrapping_mul(7)).collect();
+        let state = kv_state(n_pos as u32, &[(k.clone(), v.clone())], 2 * hb as u64);
+        let cache = parse_kv_state(&state, n_pos).unwrap();
+        assert!(parse_kv_state(&state, n_pos + 1).is_err());
+        assert!(parse_kv_state(&state[..state.len() - 1], n_pos).is_err());
+        let lse: Vec<f32> = (0..n_pos * 4).map(|i| i as f32 * 0.5).collect();
+        let leaves = seq_leaf_bytes(&spec, &cache, &lse, n_pos).unwrap();
+        assert_eq!(leaves.len(), spec.n_leaves());
+        let layout = keryx_verifiable_inference::seq::SeqLayout { n_attn: 1, n_recur: 0, heads: 2 };
+        for h in 0..2usize {
+            let want_k: Vec<u8> = (0..n_pos).flat_map(|t| k[t * 2 * hb + h * hb..t * 2 * hb + (h + 1) * hb].to_vec()).collect();
+            let want_v: Vec<u8> = (0..n_pos).flat_map(|t| v[t * 2 * hb + h * hb..t * 2 * hb + (h + 1) * hb].to_vec()).collect();
+            assert_eq!(leaves[layout.kcache(0, h as u64).unwrap() as usize], want_k);
+            assert_eq!(leaves[layout.vcache(0, h as u64).unwrap() as usize], want_v);
+            let want_m: Vec<u8> = (0..n_pos).flat_map(|t| (0..2).flat_map(move |qi| (((t * 4 + h * 2 + qi) as f32) * 0.5).to_le_bytes())).collect();
+            assert_eq!(leaves[layout.lse(0, h as u64).unwrap() as usize], want_m);
+        }
+        // An unwritten mass is an error, never a value.
+        let mut holes = lse.clone();
+        holes[5] = f32::NAN;
+        assert!(seq_leaf_bytes(&spec, &cache, &holes, n_pos).is_err());
+        // A rotated cache is refused.
+        let mut rotated = state.clone();
+        let rot = 16 + 12 * n_pos + 8;
+        rotated[rot..rot + 4].copy_from_slice(&64u32.to_le_bytes());
+        assert!(parse_kv_state(&rotated, n_pos).is_err());
+    }
+
+    /// A capture holds the asked bytes and the chaining value of every chunk of its leaf, which
+    /// the opening's range proof is built from.
+    #[test]
+    fn sequence_captures_prove_against_the_leaf() {
+        use keryx_verifiable_inference::merkle::b3_root;
+        let leaf: Vec<u8> = (0..5000u32).map(|i| (i * 13) as u8).collect();
+        let c = seq_capture(&leaf, 1024, 3072).unwrap();
+        assert_eq!(c.bytes, leaf[1024..3072]);
+        assert_eq!(c.cvs.len(), 5);
+        assert_eq!(b3_root(&c.cvs), *blake3::hash(&leaf).as_bytes());
+        let small = seq_capture(&leaf[..100], 0, 100).unwrap();
+        assert_eq!(small.cvs, vec![*blake3::hash(&leaf[..100]).as_bytes()]);
+        assert!(seq_capture(&leaf, 4096, 6000).is_err());
+    }
+
+    /// Traced batches commit the batch size the node expects: 512-token prompt batches, the rest
+    /// of the prompt as one batch, one position per generated token.
+    #[test]
+    fn traced_batches_commit_the_expected_batch_size() {
+        use keryx_verifiable_inference::verify::expected_ubatch;
+        assert_eq!(expected_ubatch(0, 970), 512);
+        assert_eq!(expected_ubatch(511, 970), 512);
+        assert_eq!(expected_ubatch(512, 970), 458);
+        assert_eq!(expected_ubatch(969, 970), 458);
+        assert_eq!(expected_ubatch(970, 970), 1);
+        assert_eq!(expected_ubatch(512, 517), 5);
+        // TRACE_UBATCH divides 512, so no 8-token batch straddles a committed batch.
+        assert_eq!(512 % TRACE_UBATCH, 0);
     }
 
     #[test]

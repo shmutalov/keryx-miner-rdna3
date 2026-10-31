@@ -968,10 +968,11 @@ impl KeryxdHandler {
                 self.inference_rx = Some(job);
                 return;
             }
-            // Under the attention rule an answer must also commit sequence leaves, which this
-            // engine does not trace. The miss is struck like any unanswered cohort assignment.
+            // Under the attention rule a solo answer's audit runs in attention phases through the
+            // node, which this client does not drive (the pool path serves traced answers). The miss
+            // is struck like any unanswered cohort assignment.
             if traced && keryx_miner::trace::attention_active(self.last_known_daa) {
-                warn!("Inference: solo request id={} skipped — answers past the attention gate need sequence leaves this build does not trace; the miss counts as a service strike (mine through a pool)", stable_id);
+                warn!("Inference: solo request id={} skipped — solo audits past the attention gate are not supported by this build; the miss counts as a service strike (mine through a pool)", stable_id);
                 return;
             }
             // Second guard: re-check readiness at execution time (files could have been deleted).
@@ -982,7 +983,7 @@ impl KeryxdHandler {
             info!("Inference: spawning LLM inference (max_tokens={}{})", max_tokens, if tier.is_some() { ", traced" } else { "" });
             tokio::task::spawn_blocking(move || {
                 let result = match tier {
-                    Some(tier) => keryx_miner::slm::load_and_run_traced_inference(&model_id, &prompt, max_tokens, tier, prompt_len, &request_hash, &label),
+                    Some(tier) => keryx_miner::slm::load_and_run_traced_inference(&model_id, &prompt, max_tokens, tier, prompt_len, &request_hash, false, &label),
                     None => keryx_miner::slm::load_and_run_inference(&model_id, &prompt, max_tokens, &label)
                         .map(|text| keryx_miner::slm::Generated { text, trace: None }),
                 };
@@ -1689,7 +1690,7 @@ impl KeryxdHandler {
         let response_length = result.split_whitespace().count() as u32;
         // The trace commitment rides after the private body only.
         let trace = trace.filter(|_| private_body.is_some());
-        let commitment = trace.as_ref().map(|t| t.trace.record.commitment());
+        let commitment = trace.as_ref().map(|t| t.trace.commitment());
         // H6 service-bond era: sign the response with the escrow key (payload V2) so it counts
         // as served for the tier cohort — an unsigned response no longer cancels a strike. The
         // era rule mirrors the node's: V2 is rejected before the gate, so v1 is kept below it.

@@ -10,6 +10,7 @@ use tokio_util::codec::Framed;
 
 mod ai;
 mod statum_codec;
+mod traces;
 
 use crate::client::stratum::statum_codec::{ErrorCode, MiningNotify, MiningSubmit, NewLineJsonCodecError, StratumLine};
 use crate::client::stratum::statum_codec::{
@@ -45,6 +46,15 @@ const MAX_CHAT_REQ_ID_BYTES: usize = 256;
 const MAX_CHAT_PROMPT_BYTES: usize = 4 * 1024;
 const MAX_CHAT_TOKENS: usize = 2_048;
 const MAX_CHAT_DEADLINE_MS: u64 = 120_000;
+/// Seconds between `mining.telemetry` reports (suprnova's default; its floor is 30 s).
+const TELEMETRY_INTERVAL_SECS: u64 = 120;
+/// Longest a pool opening waits in the queue for the inference card.
+const OPENING_QUEUE_TIMEOUT: Duration = Duration::from_secs(600);
+/// Openings queued at most.
+const MAX_QUEUED_OPENINGS: usize = 32;
+
+/// The traced self-check under the attention rule has been started in this process (once).
+static TRACE_SELF_TEST_STARTED: AtomicBool = AtomicBool::new(false);
 
 // ── Phase 2 OPoI — inference cache & task types ─────────────────────────────
 
@@ -296,6 +306,14 @@ pub struct StratumHandler {
     challenge_in_flight: Arc<AtomicBool>,
     /// Stratum id of the in-flight `mining.ai_response`, until the bridge acknowledges it.
     ai_response_pending: Arc<Mutex<Option<u32>>>,
+    /// Ids of our requests whose answers are no share results: `mining.hello`, `mining.telemetry`
+    /// and `mining.ai_opening_result`.
+    aux_ids: Arc<std::sync::Mutex<HashSet<u32>>>,
+    /// Miner telemetry stays on until the pool refuses `mining.hello`/`mining.telemetry`.
+    telemetry_on: bool,
+    /// Pool openings waiting for the inference card: the request, its result id, when it came.
+    openings: std::collections::VecDeque<(ai::AiOpening, u32, std::time::Instant)>,
+    started: std::time::Instant,
 }
 
 #[async_trait(?Send)]
@@ -319,10 +337,10 @@ impl Client for StratumHandler {
                         // no block task, as supr 0.15.1+ does (0.15.0 still hashes a task root, which
                         // makes every post-H15 block invalid), and H14 before the gate — so advertise
                         // the current supr release. Past the gate the pool refused 0.15.1 (2026-10-31,
-                        // after supr 0.15.3/0.15.4 shipped traced answers). This build traces nothing:
-                        // a traced `mining.ai_request` (supr's optional 8th param) fails to decode and
-                        // is skipped, i.e. left unanswered. Bump this single string if the pool raises
-                        // the floor again. (Real build: keryx-miner/CARGO_PKG_VERSION.)
+                        // after supr 0.15.3/0.15.4 shipped traced answers). This build serves supr's
+                        // pool trace protocol too (traced `mining.ai_request`, `mining.ai_opening`) for
+                        // attention-only tiers. Bump this single string if the pool raises the floor
+                        // again. (Real build: keryx-miner/CARGO_PKG_VERSION.)
                         "keryx-miner-supr/0.15.4".to_string(),
                         KERYX_STRATUM_DAA_CAPABILITY.into(),
                     )),
@@ -383,11 +401,18 @@ impl Client for StratumHandler {
                 })
                 .await?;
         }
+        // Miner telemetry (suprnova's `mining.hello`): the static rig identity and whether this rig
+        // can serve traced answers. Best effort: a pool that refuses it turns telemetry off.
+        let hello = self.hello();
+        self.send_aux(StratumCommand::MiningHello((hello,))).await;
         Ok(())
     }
 
     async fn listen(&mut self, miner: &mut MinerManager) -> Result<(), Error> {
         info!("Waiting for stuff");
+        let mut telemetry = tokio::time::interval(Duration::from_secs(TELEMETRY_INTERVAL_SECS));
+        telemetry.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        telemetry.tick().await; // the hello went out at register
         loop {
             {
                 // Devfund payout rotation: the pool authorizes one payout address per session, so
@@ -405,9 +430,19 @@ impl Client for StratumHandler {
                     return Ok(());
                 }
             }
-            match self.stream.try_next().await? {
-                Some(msg) => self.handle_message(msg, miner).await?,
-                None => return Err("stratum message payload is empty".into()),
+            tokio::select! {
+                msg = self.stream.try_next() => match msg? {
+                    Some(msg) => self.handle_message(msg, miner).await?,
+                    None => return Err("stratum message payload is empty".into()),
+                },
+                // The stream future is dropped once this branch runs; a dropped `try_next` loses
+                // nothing (the framed reader keeps its buffer).
+                _ = telemetry.tick() => {
+                    if self.telemetry_on {
+                        let report = self.telemetry_report();
+                        self.send_aux(StratumCommand::MiningTelemetry((report,))).await;
+                    }
+                }
             }
         }
     }
@@ -485,6 +520,10 @@ impl StratumHandler {
             inference_cache,
             challenge_in_flight: Arc::new(AtomicBool::new(false)),
             ai_response_pending: Arc::new(Mutex::new(None)),
+            aux_ids: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            telemetry_on: true,
+            openings: std::collections::VecDeque::new(),
+            started: std::time::Instant::now(),
         }))
     }
 
@@ -616,6 +655,10 @@ impl StratumHandler {
                         match result {
                             StratumResult::Plain(Some(true)) | StratumResult::Eth((true, _)) => {
                                 let rid = id.expect("We checked id is not none");
+                                if self.take_aux(rid) {
+                                    debug!("Pool acknowledged request {rid}");
+                                    return Ok(());
+                                }
                                 self.proof_encoding.answered(rid);
                                 let removed = self.shares_stats.shares_pending.lock().unwrap().remove(&rid);
                                 if removed.is_some() {
@@ -645,6 +688,10 @@ impl StratumHandler {
                                 // pending share that is a rejection; anything else is a reply we cannot
                                 // attribute. Neither is a reason to drop the connection.
                                 let rid = id.expect("We checked id is not none");
+                                if self.take_aux(rid) {
+                                    debug!("Pool answered request {rid} with {:?}", other);
+                                    return Ok(());
+                                }
                                 if self.take_ai_response_ack(id).await {
                                     warn!("AI response not accepted by the pool: result {:?}", other);
                                     return Ok(());
@@ -797,8 +844,12 @@ impl StratumHandler {
                             self.handle_challenge(model_id_hex, nonce_hex, miner).await;
                             Ok(())
                         }
-                        StratumCommand::MiningAiRequest(fields) => {
-                            self.handle_ai_request(fields, miner).await;
+                        StratumCommand::MiningAiRequest(params) => {
+                            self.handle_ai_request(params.fields, params.ext, miner).await;
+                            Ok(())
+                        }
+                        StratumCommand::MiningAiOpening(params) => {
+                            self.handle_ai_opening(params, miner).await;
                             Ok(())
                         }
                         StratumCommand::MiningInferenceRequest(req) => {
@@ -822,6 +873,17 @@ impl StratumHandler {
                 error: Some(StratumError(code, error, _)),
                 ..
             } => {
+                if self.take_aux(id) {
+                    // A pool without the telemetry extension refuses `mining.hello` (error 20 or
+                    // JSON-RPC's method-not-found); stop sending it for this session.
+                    if matches!(code, ErrorCode::Unknown | ErrorCode::Other(-32601)) && self.telemetry_on {
+                        info!("Pool does not take miner telemetry ({}: {}) — not sent this session", code, error);
+                        self.telemetry_on = false;
+                    } else {
+                        warn!("Pool refused request {}: {}: {}", id, code, error);
+                    }
+                    return Ok(());
+                }
                 if self.take_ai_response_ack(Some(id)).await {
                     warn!("AI response rejected by the pool: {}", error);
                     return Ok(());
@@ -910,9 +972,10 @@ impl StratumHandler {
     async fn handle_ai_request(
         &mut self,
         fields: (String, String, String, String, String, u32, String),
+        ext: Option<serde_json::Value>,
         miner: &mut MinerManager,
     ) {
-        let request = match ai::AiRequest::parse(fields) {
+        let request = match ai::AiRequest::parse_ext(fields, ext.as_ref()) {
             Ok(request) => request,
             Err(error) => {
                 warn!("Invalid AI request: {}", error);
@@ -923,6 +986,28 @@ impl StratumHandler {
             warn!("AI request {:.16}: model is not ready", request.task_id);
             return;
         }
+        // H15 traced answer: the tier is the model's own (its manifests define the trace), and this
+        // engine commits stage-2 traces with the sequence leaves of attention-only models.
+        if let Some(t) = request.trace {
+            let own = keryx_miner::models::pom_tier_index(&request.model_id, u64::MAX);
+            let supported = keryx_miner::trace::TierManifest::for_attn(t.tier).map(|m| m.seq_spec());
+            if own != Some(t.tier) || !t.chain || matches!(supported, Some(Err(_)) | None) {
+                warn!(
+                    "AI request {:.16}: a traced answer for tier {} cannot be served (model tier {:?}, chain {}, attention {}: {})",
+                    request.task_id,
+                    t.tier,
+                    own,
+                    t.chain,
+                    t.attention,
+                    match supported {
+                        Some(Err(e)) => e,
+                        None => "no manifest".to_string(),
+                        Some(Ok(_)) => "supported".to_string(),
+                    }
+                );
+                return;
+            }
+        }
         if self.ai_response_pending.lock().await.is_some() || self.challenge_in_flight.swap(true, Ordering::SeqCst) {
             warn!("AI request {:.16}: inference is busy", request.task_id);
             return;
@@ -932,20 +1017,74 @@ impl StratumHandler {
             warn!("Could not pause mining for AI request: {}", error);
             return;
         }
-        info!("AI request {:.16}: running inference (max_tokens={})", request.task_id, request.max_tokens);
+        info!(
+            "AI request {:.16}: running inference (max_tokens={}{})",
+            request.task_id,
+            request.max_tokens,
+            if request.trace.is_some() { ", traced" } else { "" }
+        );
         let sender = self.send_channel.clone();
         // The username this connection authorized with.
-        let worker =
-            if self.worker.is_empty() { self.miner_address.clone() } else { format!("{}.{}", self.miner_address, self.worker) };
+        let worker = self.username();
         let pending = self.ai_response_pending.clone();
         let last_id = self.last_stratum_id.clone();
         task::spawn_blocking(move || {
             let label = format!("pool ai_request {:.16}", request.task_id);
-            let result =
-                keryx_miner::slm::load_and_run_inference(&request.model_id, &request.prompt, request.max_tokens, &label)
-                    .unwrap_or_default();
+            let (result, traced) = match request.trace {
+                Some(t) => {
+                    let g = keryx_miner::slm::load_and_run_traced_inference(
+                        &request.model_id,
+                        &request.prompt,
+                        request.max_tokens,
+                        t.tier,
+                        t.prompt_len,
+                        &request.request_hash_bytes(),
+                        t.attention,
+                        &label,
+                    );
+                    match g {
+                        // A traced request without its trace is no valid answer: say nothing, the pool
+                        // re-dispatches.
+                        Some(g) if g.trace.is_some() => {
+                            let trace = g.trace.unwrap();
+                            let commitment = trace.commitment().to_bytes();
+                            let body = keryx_miner::slm::answer_body(&g.text, Some(&trace));
+                            info!(
+                                "AI request {:.16}: traced answer (root {}, {} prompt / {} positions{}) kept for openings",
+                                request.task_id,
+                                hex::encode(&trace.record.trace_root[..8]),
+                                trace.record.n_prompt,
+                                trace.record.n_pos,
+                                if trace.seq.is_some() { ", sequence leaves" } else { "" }
+                            );
+                            traces::keep(
+                                &request.request_hash,
+                                traces::Kept {
+                                    model_id: request.model_id,
+                                    tier: t.tier,
+                                    request_hash: request.request_hash_bytes(),
+                                    max_tokens: request.max_tokens.min(u32::MAX as usize) as u32,
+                                    at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()),
+                                    trace: Arc::new(trace),
+                                },
+                            );
+                            (g.text, Some((commitment, body)))
+                        }
+                        _ => {
+                            drop(guard);
+                            warn!("AI request {:.16}: no traced answer — left to the pool", request.task_id);
+                            return;
+                        }
+                    }
+                }
+                None => (
+                    keryx_miner::slm::load_and_run_inference(&request.model_id, &request.prompt, request.max_tokens, &label).unwrap_or_default(),
+                    None,
+                ),
+            };
             let id = last_id.fetch_add(1, Ordering::SeqCst);
-            match request.response(id, worker, &result) {
+            let traced = traced.as_ref().map(|(c, b)| (c.as_slice(), b.as_slice()));
+            match request.response(id, worker, &result, traced) {
                 Ok(line) => {
                     *pending.blocking_lock() = Some(id);
                     // The GPU is done: resume mining before the send, which blocks while the pool
@@ -960,6 +1099,198 @@ impl StratumHandler {
                     drop(guard);
                     warn!("AI request {:.16}: {}", request.task_id, error);
                 }
+            }
+        });
+    }
+
+    /// A pool's `mining.ai_opening` (keryx-miner-supr 0.15.3): queues the replay of the kept trace
+    /// of one of our traced answers. [`drive_openings`](Self::drive_openings) runs it once the
+    /// inference card is free and answers with the unsigned opening (`mining.ai_opening_result`):
+    /// the bundle of every piece for the first opening (trace, first attention phase, residual),
+    /// one attention phase otherwise. The pool wraps every piece in the seeded envelope and signs it.
+    async fn handle_ai_opening(&mut self, params: Vec<serde_json::Value>, miner: &mut MinerManager) {
+        let op = match ai::AiOpening::parse(&params) {
+            Ok(op) => op,
+            Err(e) => {
+                warn!("Invalid AI opening request from pool: {}", e);
+                return;
+            }
+        };
+        let id = self.last_stratum_id.fetch_add(1, Ordering::SeqCst);
+        self.aux_ids.lock().unwrap_or_else(|p| p.into_inner()).insert(id);
+        if traces::get(&op.request_hash).is_none() {
+            warn!("AI opening {:.16}: no kept trace for this request", op.request_hash);
+            let worker = self.username();
+            self.send_channel.send(op.result(id, worker, Err("no kept trace for this request"))).await.ok();
+            return;
+        }
+        if self.openings.len() >= MAX_QUEUED_OPENINGS {
+            warn!("AI opening {:.16}: {} openings already queued", op.request_hash, self.openings.len());
+            let worker = self.username();
+            self.send_channel.send(op.result(id, worker, Err("too many openings queued"))).await.ok();
+            return;
+        }
+        self.openings.push_back((op, id, std::time::Instant::now()));
+        self.drive_openings(miner).await;
+    }
+
+    /// Starts the oldest queued opening when the inference card is free (called again at every job,
+    /// so a queued one starts soon after the card frees). An opening that waits too long is
+    /// answered with an error.
+    async fn drive_openings(&mut self, miner: &mut MinerManager) {
+        while let Some((op, id, _)) = self.openings.front().filter(|(_, _, at)| at.elapsed() > OPENING_QUEUE_TIMEOUT) {
+            warn!("AI opening {:.16}: the inference card stayed busy", op.request_hash);
+            let line = op.result(*id, self.username(), Err("inference card busy"));
+            self.openings.pop_front();
+            self.send_channel.send(line).await.ok();
+        }
+        if self.openings.is_empty() || self.challenge_in_flight.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let Some((op, id, _)) = self.openings.pop_front() else { return };
+        let guard = ai::InferenceGuard::new(miner.opoi_challenge_flag(), self.challenge_in_flight.clone());
+        let worker = self.username();
+        let Some(k) = traces::get(&op.request_hash) else {
+            drop(guard);
+            self.send_channel.send(op.result(id, worker, Err("no kept trace for this request"))).await.ok();
+            return;
+        };
+        if let Err(error) = miner.process_block(None).await {
+            warn!("Could not pause mining for an AI opening: {}", error);
+        }
+        info!("AI opening {:.16}: replaying for response {:.16} (phase {})", op.request_hash, op.response_txid_hex, op.path.len());
+        let sender = self.send_channel.clone();
+        task::spawn_blocking(move || {
+            let t0 = std::time::Instant::now();
+            let body = if op.path.is_empty() {
+                keryx_miner::slm::open_trace(&k.model_id, k.tier, &k.trace, &op.seed, op.response_txid, &k.request_hash, k.max_tokens)
+            } else {
+                keryx_miner::slm::open_attention_phase(&k.model_id, k.tier, &k.trace, &op.seed, op.response_txid, &op.path, &op.prev, k.max_tokens)
+            };
+            drop(guard);
+            let line = match &body {
+                Some(b) => {
+                    info!("AI opening {:.16}: built ({} B in {:.1} s)", op.request_hash, b.len(), t0.elapsed().as_secs_f64());
+                    op.result(id, worker, Ok(b))
+                }
+                None => {
+                    warn!("AI opening {:.16}: the replay or its check failed", op.request_hash);
+                    op.result(id, worker, Err("replay failed"))
+                }
+            };
+            if sender.blocking_send(line).is_err() {
+                warn!("AI opening {:.16}: connection closed", op.request_hash);
+            }
+        });
+    }
+
+    /// The username this connection authorized with.
+    fn username(&self) -> String {
+        if self.worker.is_empty() {
+            self.miner_address.clone()
+        } else {
+            format!("{}.{}", self.miner_address, self.worker)
+        }
+    }
+
+    /// True (and cleared) when `id` answers a hello, a telemetry report or an opening result.
+    fn take_aux(&self, id: u32) -> bool {
+        self.aux_ids.lock().unwrap_or_else(|p| p.into_inner()).remove(&id)
+    }
+
+    /// Sends a request whose answer is no share result.
+    async fn send_aux(&mut self, command: StratumCommand) {
+        let id = self.last_stratum_id.fetch_add(1, Ordering::SeqCst);
+        {
+            let mut ids = self.aux_ids.lock().unwrap_or_else(|p| p.into_inner());
+            if ids.len() > 256 {
+                ids.clear();
+            }
+            ids.insert(id);
+        }
+        let line = StratumLine { id: Some(id), payload: StratumLinePayload::StratumCommand(command), jsonrpc: None, error: None };
+        if self.send_channel.send(line).await.is_err() {
+            self.telemetry_on = false;
+        }
+    }
+
+    /// The model this rig serves, with its tier.
+    fn served_model() -> Option<([u8; 32], u8)> {
+        if keryx_miner::pow_only() {
+            return None;
+        }
+        keryx_miner::slm::loaded_model_ids().into_iter().find_map(|m| keryx_miner::models::pom_tier_index(&m, u64::MAX).map(|t| (m, t)))
+    }
+
+    /// 1 once the traced self-check under the attention rule passed on this rig.
+    fn trace_flag() -> u8 {
+        Self::served_model().is_some_and(|(m, _)| keryx_miner::slm::attention_trace_ready(&m)) as u8
+    }
+
+    /// `mining.hello` (schema v1): the miner the subscription names, the trace capability, the host
+    /// and the served model. Display only for the pool.
+    fn hello(&self) -> serde_json::Value {
+        let model = match Self::served_model() {
+            Some((m, tier)) => serde_json::json!({ "loaded": true, "tier": tier, "model_id": hex::encode(m) }),
+            None => serde_json::json!({ "loaded": false }),
+        };
+        serde_json::json!({
+            "v": 1,
+            "miner": { "name": "keryx-miner-supr", "version": "0.15.4", "build": "vulkan", "features": ["pom-v2", "opoi", "pom-vulkan"] },
+            "trace": Self::trace_flag(),
+            "host": { "os": std::env::consts::OS, "cpu_cores": std::thread::available_parallelism().map_or(1, |n| n.get()) },
+            "model": model,
+        })
+    }
+
+    /// `mining.telemetry` (schema v1): uptime, hash rate, trace capability, local share counts and
+    /// the served models.
+    fn telemetry_report(&self) -> serde_json::Value {
+        let s = &self.shares_stats;
+        let rejected = s.low_diff.load(Ordering::Relaxed)
+            + s.duplicate.load(Ordering::Relaxed)
+            + s.invalid_opoi.load(Ordering::Relaxed)
+            + s.invalid_pom.load(Ordering::Relaxed)
+            + s.rejected_other.load(Ordering::Relaxed);
+        let hashrate = f64::from_bits(crate::miner::LAST_HASHRATE.load(Ordering::Relaxed));
+        let models: Vec<String> = Self::served_model().map(|(m, _)| hex::encode(m)).into_iter().collect();
+        serde_json::json!({
+            "v": 1,
+            "uptime_s": self.started.elapsed().as_secs(),
+            "hashrate_total": if hashrate.is_finite() { hashrate.round() as u64 } else { 0 },
+            "trace": Self::trace_flag(),
+            "local_shares": { "acc": s.accepted.load(Ordering::Relaxed), "rej": rejected, "stale": s.stale.load(Ordering::Relaxed) },
+            "models": models,
+        })
+    }
+
+    /// Past the attention gate, once per process: the traced self-check of the served model under
+    /// the attention rule, mining paused while it runs. A rig whose check passes reports
+    /// `"trace": 1` and serves traced pool requests; one that fails serves none of them.
+    async fn maybe_start_trace_self_test(&mut self, daa_score: u64, miner: &mut MinerManager) {
+        if !keryx_miner::trace::attention_active(daa_score) || TRACE_SELF_TEST_STARTED.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some((model_id, tier)) = Self::served_model() else { return };
+        if keryx_miner::trace::TierManifest::for_attn(tier).map(|m| m.seq_spec().is_ok()) != Some(true) {
+            TRACE_SELF_TEST_STARTED.store(true, Ordering::SeqCst);
+            info!("Trace: tier {tier} cannot be traced by this engine — traced pool requests are not served");
+            return;
+        }
+        if self.ai_response_pending.lock().await.is_some() || self.challenge_in_flight.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        TRACE_SELF_TEST_STARTED.store(true, Ordering::SeqCst);
+        let guard = ai::InferenceGuard::new(miner.opoi_challenge_flag(), self.challenge_in_flight.clone());
+        if let Err(error) = miner.process_block(None).await {
+            warn!("Could not pause mining for the trace self-check: {}", error);
+        }
+        info!("Trace: checking traced answers under the attention rule on this GPU (tier {tier}); mining pauses meanwhile");
+        task::spawn_blocking(move || {
+            let ok = keryx_miner::slm::check_attention_trace(&model_id, tier);
+            drop(guard);
+            if ok {
+                info!("Trace: traced pool answers enabled (the pool learns it from the next telemetry report)");
             }
         });
     }
@@ -1186,6 +1517,8 @@ impl StratumHandler {
             return miner.process_block(None).await;
         }
         *self.current_task_slot.lock().await = None;
+        self.drive_openings(miner).await;
+        self.maybe_start_trace_self_test(daa_score, miner).await;
         if keryx_miner::block_task::active(daa_score) {
             let window = keryx_verifiable_inference::block_task::window(daa_score);
             let parents = header.parents.first().map(|p| keryx_miner::block_task::parents_key(&p.parent_hashes));

@@ -13,6 +13,7 @@ pub mod pom_v4;
 pub mod pom_v5;
 pub mod block_task;
 pub mod trace;
+pub mod trace_seq;
 pub mod trace_store;
 pub mod slm;
 pub mod vulkan_worker;

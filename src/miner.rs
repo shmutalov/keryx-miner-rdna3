@@ -11,6 +11,9 @@ use rand::{thread_rng, RngCore};
 use tokio::sync::mpsc::Sender;
 
 use crate::pow::BlockSeed;
+
+/// Aggregate hash rate of the last logging interval (f64 bits), for pool telemetry.
+pub static LAST_HASHRATE: AtomicU64 = AtomicU64::new(0);
 use keryx_miner::{PluginManager, WorkerSpec};
 
 type MinerHandler = std::thread::JoinHandle<Result<(), Error>>;
@@ -689,6 +692,7 @@ impl MinerManager {
             let challenge_active = opoi_challenge_active.load(Ordering::Relaxed)
                 || keryx_miner::pom_gpu::is_loading();
             let total = hashes_tried.swap(0, Ordering::AcqRel);
+            LAST_HASHRATE.store((total as f64 / duration).to_bits(), Ordering::Relaxed);
 
             if total > 0 {
                 // Mining normally: report aggregate + per-device rates.

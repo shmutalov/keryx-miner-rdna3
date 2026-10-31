@@ -6,7 +6,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-const STORE_VERSION: u32 = 2;
+/// 3: a trace carries its sequence leaves (attention rule).
+const STORE_VERSION: u32 = 3;
 const FILE_EXT: &str = "trace";
 
 /// The opening already built for a response: resent as is after a restart.

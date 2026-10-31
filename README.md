@@ -116,12 +116,26 @@ keryx-node v1.6.6:
   seed. A share of the steps lands on pad tiles, and each next offset folds in the walk state.
 - **No block task**: the node dropped it from H15 (`block_task_activation: never`). Headers keep the
   H14 layout, and pool shares and solo blocks need no trace. The block-task code stays dormant.
-- **Verifiable inference** applies to solo AI answers only. The node now requires a prompt to be
-  traced in 512-token batches (CUDA's MMQ layout). This build's Vulkan trace runs 8-token MMVQ
-  batches, so its self-check (trace → replay → the node's verifier, once per model) fails.
-- **Attention rule** (sequence leaves, attention and recurrent openings), from the same H15 gate on
-  both networks. This build does not implement it, so past the gate it skips solo AI requests outright
-  (unreadable private requests still get the fixed error answer).
+- **Verifiable inference.** A traced answer commits the trace of its forward pass, with the prompt
+  committed in 512-token batches (inputs in CUDA's MMQ layouts past 8 tokens), and under the
+  **attention rule** (from the same gate on both networks) its sequence leaves: the q8_0 key and
+  value cache rows of every attention layer and the softmax mass of every query head. This build
+  commits both on Vulkan for **attention-only tiers (tier 1, GLM-4-9B)**: it computes in 8-token
+  batches and commits each input in the layout of its 512-token batch, reads the cache rows back
+  from llama.cpp's KV cache (rotation off) and the masses from a shader that recomputes them after
+  every flash-attention node. Before it serves a traced answer it runs a self-check on the GPU:
+  a traced answer, then its openings (trace, attention phase, residual) under two seeds, checked
+  with the node's own verifier. Tiers with recurrent or latent-cache layers (0, 3, 4) and sliding
+  windows (2) are not traced.
+- **Traced pool answers** (keryx-miner-supr 0.15.3's pool protocol): a pool asks for a traced answer
+  with the optional 8th `mining.ai_request` parameter; the miner answers with the trace commitment
+  and the answer body for the pool to seal and sign, keeps the trace for 9 h
+  (`keryx-pool-traces/` beside the executable, or `KERYX_POOL_TRACE_DIR`) and builds the openings
+  when the pool sends `mining.ai_opening`, replaying the answer on the GPU. Past the gate the miner
+  runs the self-check once at its first job (mining pauses meanwhile) and reports `"trace": 1` in
+  its `mining.hello`/`mining.telemetry` once it passed.
+- **Solo AI answers stay skipped past the gate**: solo audits (attention phases through the node,
+  deadlines) are not wired up.
 - **Solo mining past the gate is not viable with this build.** Every request is audited against the
   whole cohort of its tier (each identity with a proven block of that tier in the last ~5 minutes),
   and every member that does not answer in time takes a service strike, at most one an hour: 5 escrow

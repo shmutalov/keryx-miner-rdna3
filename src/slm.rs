@@ -637,10 +637,12 @@ fn run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize) -> Option
 
 // ── Verifiable inference (H15) ───────────────────────────────────────────────
 //
-// From H15 every answer commits a stage-2 trace of its forward pass (see `trace.rs`) and every
-// block commits the trace of its window's block task. The trace is recorded on the GPU by the
+// From H15 every answer commits a stage-2 trace of its forward pass (see `trace.rs`), and under
+// the attention rule (mainnet: H15 too) the sequence leaves of its attention: the q8_0 key/value
+// cache rows and the softmax masses (see `trace_seq.rs`). The trace is recorded on the GPU by the
 // patched ggml-vulkan backend (`llm_engine`); an opening replays the evaluation to capture the
-// drawn leaves and is checked here exactly as the node checks it before it leaves the miner.
+// drawn leaves and spans and is checked here exactly as the node checks it before it leaves the
+// miner.
 
 /// A generated answer and, when its tier is audited, the trace an opening needs.
 pub struct Generated {
@@ -675,17 +677,86 @@ fn answer_ctx(engine: &InferenceEngine, n_prompt: usize, max_tokens: usize) -> u
     crate::llm_engine::request_ctx(n_prompt, max_tokens, engine.ctx_cap()).unwrap_or(engine.ctx_cap())
 }
 
-/// Engines (model, stage-2 kind) whose self-check passed, and those whose self-check failed.
+/// The manifest a trace of `tier` runs under: the attention rule's (with its sequence layout) or
+/// the plain stage-2 one; with its serialized bytes for the engine.
+struct TraceManifest {
+    m: crate::trace::TierManifest,
+    raw: &'static [u8],
+    seq: Option<crate::llm_engine::SeqSpec>,
+}
+
+fn trace_manifest(tier: u8, attention: bool) -> std::result::Result<TraceManifest, String> {
+    use crate::trace::TierManifest;
+    if !attention {
+        let m = TierManifest::for_chain(tier).ok_or("no stage-2 manifest")?;
+        return Ok(TraceManifest { m, raw: TierManifest::raw_chain(tier).ok_or("no stage-2 manifest")?, seq: None });
+    }
+    let m = TierManifest::for_attn(tier).ok_or("no attention manifest")?;
+    let seq = m.seq_spec()?;
+    Ok(TraceManifest { raw: TierManifest::raw_attn(tier).ok_or("no attention manifest")?, seq: Some(seq), m })
+}
+
+/// Engines (model, trace kind) whose self-check passed, and those whose self-check failed.
 static TRACE_CHECKED: Mutex<Vec<([u8; 32], &'static str)>> = Mutex::new(Vec::new());
 static TRACE_FAILED: Mutex<Vec<([u8; 32], &'static str)>> = Mutex::new(Vec::new());
 
-/// Replays the stage-2 trace `trace` for every leaf the draw of `seed` opens and builds the
-/// opening body; the replay must reproduce every committed leaf.
+fn trace_kind(attention: bool) -> &'static str {
+    if attention {
+        "attention"
+    } else {
+        "stage-2"
+    }
+}
+
+/// Bytes the seeded envelope adds to an opening body.
+const SEEDED_OVERHEAD: usize = 33;
+
+/// Replays `trace` once for the `wanted` `(position, leaf)` captures, checked against its trace.
+fn replay_captures(
+    engine: &InferenceEngine,
+    tm: &TraceManifest,
+    trace: &crate::trace::ResponseTrace,
+    wanted: &[(u32, u32)],
+    n_ctx: u32,
+) -> std::result::Result<crate::trace::Captures, String> {
+    use crate::trace::{captures_match, leaf_cap, Captures};
+    let rec = &trace.record;
+    let slot = wanted.iter().map(|&(_, l)| leaf_cap(&tm.m, l)).max().unwrap_or(0).div_ceil(4) * 4;
+    let bytes = engine.replay_multi(tm.raw, &trace.tokens, rec.n_prompt, wanted, slot, n_ctx).map_err(|e| format!("{e} for captures {wanted:?}"))?;
+    let caps: Captures = wanted.iter().copied().zip(bytes).collect();
+    if !captures_match(rec, &caps) {
+        return Err("the replay does not reproduce the committed trace".to_string());
+    }
+    Ok(caps)
+}
+
+/// Replays `trace` whole for the sequence spans of `plans`.
+fn replay_spans(
+    engine: &InferenceEngine,
+    tm: &TraceManifest,
+    trace: &crate::trace::ResponseTrace,
+    plans: &[crate::trace_seq::SpanPlan],
+    n_ctx: u32,
+) -> std::result::Result<Vec<crate::llm_engine::SeqCapture>, String> {
+    let leaves: Vec<u32> = plans.iter().map(|p| p.leaf).collect();
+    let bytes = engine.replay_seq(tm.raw, &trace.tokens, trace.record.n_prompt, n_ctx, &leaves).map_err(|e| e.to_string())?;
+    plans
+        .iter()
+        .zip(&bytes)
+        .map(|(p, b)| {
+            let (_, lo, hi) = p.capture();
+            crate::llm_engine::seq_capture(b, lo, hi).map_err(|e| e.to_string())
+        })
+        .collect()
+}
+
+/// Replays the stage-2 trace `trace` for every leaf the draw of `seed` opens and builds its trace
+/// and residual opening bodies, checked as the node checks them; the replay must reproduce every
+/// committed leaf.
 #[allow(clippy::too_many_arguments)]
 fn open_chain(
     engine: &InferenceEngine,
-    tier: u8,
-    m: &crate::trace::TierManifest,
+    tm: &TraceManifest,
     pctx: &keryx_verifiable_inference::prefix::PrefixCtx,
     trace: &crate::trace::ResponseTrace,
     seed: &[u8; 32],
@@ -693,31 +764,118 @@ fn open_chain(
     response_txid: [u8; 32],
     index: &crate::pom::WeightIndex,
     n_ctx: u32,
-) -> std::result::Result<Vec<u8>, String> {
-    use crate::trace::{captures_match, chain_opening_body, draw_chain, leaf_cap, Captures, TierManifest};
-    let raw = TierManifest::raw_chain(tier).ok_or("no stage-2 manifest")?;
-    let rec = &trace.record;
+) -> std::result::Result<(Vec<u8>, Vec<u8>), String> {
+    use crate::trace::{chain_opening, draw_chain, verify_chain_opening};
+    use keryx_verifiable_inference::opening::MAX_BODY_LEN;
+    let (m, rec) = (&tm.m, &trace.record);
     let d = draw_chain(m, pctx, rec, seed).ok_or("no stage-2 draw")?;
-    let wanted = d.captures(m.n_products as u64);
-    let slot = wanted.iter().map(|&(_, l)| leaf_cap(m, l)).max().unwrap_or(0).div_ceil(4) * 4;
-    let bytes = engine.replay_multi(raw, &trace.tokens, rec.n_prompt, &wanted, slot, n_ctx).map_err(|e| e.to_string())?;
-    let caps: Captures = wanted.into_iter().zip(bytes).collect();
-    if !captures_match(rec, &caps) {
-        return Err("the replay does not reproduce the committed trace".to_string());
+    let caps = replay_captures(engine, tm, trace, &d.captures(m.n_products as u64), n_ctx)?;
+    let (mut o, mut r) = chain_opening(m, pctx, rec, &trace.tokens, seed, request_hash, response_txid, &d, &caps, index).ok_or("no stage-2 opening")?;
+    o.roots = trace.seq.as_ref().map(|seq| (rec.trace_root, seq.root));
+    r.roots = o.roots;
+    let (body, resid) = (o.encode(), r.encode());
+    for (name, b) in [("stage-2", &body), ("residual", &resid)] {
+        if b.len() + SEEDED_OVERHEAD > MAX_BODY_LEN {
+            return Err(format!("{name} opening of {} B over the cap", b.len()));
+        }
     }
-    chain_opening_body(m, pctx, rec, &trace.tokens, seed, request_hash, response_txid, &d, &caps, index).ok_or_else(|| "no stage-2 opening".to_string())
+    let ctx = m.chain.ok_or("no stage-2 context")?;
+    verify_chain_opening(&m.tier_ctx(index), &ctx, pctx, rec, seed, request_hash, &body, &resid).map_err(|e| format!("stage-2 opening fails its own check: {e}"))?;
+    Ok((body, resid))
 }
 
-/// Traces a fixed prompt carrying a known request id under the stage-2 manifest, and a block task,
-/// then opens and verifies both under two seeds exactly as the node would.
-fn chain_self_check(spec: &ModelSpec, engine: &InferenceEngine, tier: u8) -> std::result::Result<(), String> {
-    use crate::trace::{chain_ctx, prefix_tokens, verify_chain_opening, ResponseTrace, TierManifest, TraceRecord};
-    use keryx_verifiable_inference::block_task::{draw_seed, task_bytes, task_prefix, task_tokens, verify_block_task, TASK_LEN};
-    let m = TierManifest::for_chain(tier).ok_or("no stage-2 manifest")?;
-    let raw = TierManifest::raw_chain(tier).ok_or("no stage-2 manifest")?;
-    let (ctx, pctx) = chain_ctx(tier).ok_or("no stage-2 context")?;
+/// The attention opening of the draw of `seed` at the phase of `path` (`prev`: the partials of the
+/// previous phase), checked as the node checks it.
+#[allow(clippy::too_many_arguments)]
+fn open_attention(
+    engine: &InferenceEngine,
+    tm: &TraceManifest,
+    trace: &crate::trace::ResponseTrace,
+    seed: &[u8; 32],
+    response_txid: [u8; 32],
+    index: &crate::pom::WeightIndex,
+    path: &[u64],
+    prev: Option<&[u8]>,
+    n_ctx: u32,
+) -> std::result::Result<Vec<u8>, String> {
+    use crate::trace_seq::{attn_opening, draw_attn, seq_response_ctx};
+    use keryx_verifiable_inference::attn_blocks::{encode_partials, partials_root, pick_partials};
+    use keryx_verifiable_inference::chain::{attn_query, verify_attn_phase};
+    let (m, rec) = (&tm.m, &trace.record);
+    let seq = trace.seq.as_ref().ok_or("no sequence leaves")?;
+    let d = draw_attn(m, rec, seed).ok_or("no attention draw")?;
+    let caps = replay_captures(engine, tm, trace, &d.captures(path).ok_or("no attention captures")?, n_ctx)?;
+    let plans = d.spans(m, rec.n_pos as u64, path).ok_or("no attention spans")?;
+    let spans = replay_spans(engine, tm, trace, &plans, n_ctx)?;
+    let full = attn_opening(m, rec, seq, index, &d, &caps, &spans, response_txid, path, prev).map_err(|e| format!("{e} (slot {}, head {}, t {}, path {path:?})", d.slot, d.head, d.t))?;
+    let ctx = m.chain.ok_or("no stage-2 context")?;
+    let (tier, resp) = (m.tier_ctx(index), seq_response_ctx(rec, seq));
+    let parent_root = prev.and_then(|b| partials_root(b, d.dv));
+    let verify = |op: &keryx_verifiable_inference::opening::AttnOpening| verify_attn_phase(&tier, &ctx, &resp, seed, path, parent_root.as_ref(), op);
+    let op = if d.leaf(path) {
+        full
+    } else {
+        let (q, scale) = attn_query(&tier, &ctx, &resp, seed, &full).map_err(|e| format!("attention query {e:?}"))?;
+        let (keys, values) = d.rows(&full, path).ok_or("no cache rows")?;
+        let p0 = d.tree.node(path).ok_or("no node")?.0;
+        let partials = pick_partials(&q, scale, &keys, &values, p0, &d.tree, path, |p| verify(&d.phase_fields(&full, path, encode_partials(p))).is_ok())
+            .ok_or_else(|| format!("no partials verify at layer {}, position {}, path {path:?}", d.layer, d.t))?;
+        d.phase_fields(&full, path, partials)
+    };
+    verify(&op).map_err(|e| format!("attention phase {e:?} at layer {}, position {}, path {path:?}", d.layer, d.t))?;
+    let body = op.encode();
+    if body.len() + SEEDED_OVERHEAD > keryx_verifiable_inference::opening::MAX_BODY_LEN {
+        return Err(format!("attention opening of {} B over the cap", body.len()));
+    }
+    Ok(body)
+}
+
+/// Every opening of a stage-2 response, one transaction each: the trace opening, the first
+/// attention phase under the attention rule, then the residual opening.
+#[allow(clippy::too_many_arguments)]
+fn open_pieces(
+    engine: &InferenceEngine,
+    tm: &TraceManifest,
+    pctx: &keryx_verifiable_inference::prefix::PrefixCtx,
+    trace: &crate::trace::ResponseTrace,
+    seed: &[u8; 32],
+    request_hash: &[u8; 32],
+    response_txid: [u8; 32],
+    index: &crate::pom::WeightIndex,
+    n_ctx: u32,
+) -> std::result::Result<Vec<Vec<u8>>, String> {
+    let (body, resid) = open_chain(engine, tm, pctx, trace, seed, request_hash, response_txid, index, n_ctx)?;
+    let mut bodies = vec![body];
+    if trace.seq.is_some() {
+        if tm.m.chain.is_some_and(|c| c.n_recur > 0) {
+            return Err("recurrent openings are not built by this engine".to_string());
+        }
+        bodies.push(open_attention(engine, tm, trace, seed, response_txid, index, &[], None, n_ctx)?);
+    }
+    bodies.push(resid);
+    Ok(bodies)
+}
+
+/// A trace opening body carrying the residual point of its residual piece, as the block task
+/// commits it.
+fn inline_resid(body: &[u8], resid: &[u8]) -> std::result::Result<Vec<u8>, String> {
+    use keryx_verifiable_inference::opening::{Opening, ResidOpening, MAX_BODY_LEN};
+    let mut o = Opening::decode(body).ok_or("undecodable stage-2 opening")?;
+    o.resid = Some(ResidOpening::decode(resid).ok_or("undecodable residual opening")?.resid);
+    let b = o.encode();
+    if b.len() + SEEDED_OVERHEAD > MAX_BODY_LEN {
+        return Err(format!("block task opening of {} B over the cap", b.len()));
+    }
+    Ok(b)
+}
+
+/// Traces a fixed prompt carrying a known request id under the manifest of `attention`, then
+/// opens every piece under two seeds and checks them exactly as the node would.
+fn chain_self_check(spec: &ModelSpec, engine: &InferenceEngine, tier: u8, attention: bool) -> std::result::Result<(), String> {
+    use crate::trace::{chain_ctx, prefix_tokens, ResponseTrace, SeqTrace, TraceRecord};
+    let tm = trace_manifest(tier, attention)?;
+    let (_, pctx) = chain_ctx(tier).ok_or("no stage-2 context")?;
     let index = weight_index(spec).ok_or("no possession index")?;
-    let tier_ctx = m.tier_ctx(index);
 
     let (head, rest) = format_prompt_parts(spec.name, "Reply with one word.").ok_or("no prefix template")?;
     let request_hash: [u8; 32] = std::array::from_fn(|i| (i * 8 + 3) as u8);
@@ -725,71 +883,78 @@ fn chain_self_check(spec: &ModelSpec, engine: &InferenceEngine, tier: u8) -> std
     let prefix = crate::llm_engine::PromptPrefix { tokens: &tokens, head_tokens: pctx.offset, rest: &rest };
     let max_tokens = 4;
     let g = engine
-        .generate_traced(raw, &head, Some(prefix), max_tokens, 0, 0, |n| answer_ctx(engine, n, max_tokens))
+        .generate_traced(tm.raw, &head, Some(prefix), max_tokens, 0, 0, |n| answer_ctx(engine, n, max_tokens))
         .map_err(|e| e.to_string())?;
     let (lo, hi) = (pctx.offset as usize, pctx.offset as usize + tokens.len());
     if g.tokens.get(lo..hi) != Some(tokens.as_slice()) {
         return Err("the fed prompt does not carry the request prefix".to_string());
     }
     let n_ctx = answer_ctx(engine, g.n_prompt as usize, max_tokens);
-    let record = TraceRecord::new_chain(&m, g.n_prompt, g.ubatch, g.leaves, &g.tokens).ok_or("incomplete stage-2 trace")?;
-    let trace = ResponseTrace { record, tokens: g.tokens };
+    let record = TraceRecord::new_chain(&tm.m, g.n_prompt, g.ubatch, g.leaves, &g.tokens).ok_or("incomplete stage-2 trace")?;
+    let seq = match (attention, g.seq) {
+        (true, Some(leaves)) => Some(SeqTrace::new(leaves).ok_or("empty sequence leaves")?),
+        (true, None) => return Err("no sequence leaves".to_string()),
+        (false, _) => None,
+    };
+    let trace = ResponseTrace { record, tokens: g.tokens, seq };
     for seed in [[0x11u8; 32], [0x77u8; 32]] {
-        let body = open_chain(engine, tier, &m, &pctx, &trace, &seed, &request_hash, [0u8; 32], index, n_ctx)?;
-        verify_chain_opening(&tier_ctx, &ctx, &pctx, &trace.record, &seed, &request_hash, &body)?;
-    }
-
-    let window_seed = [0x5au8; 32];
-    let task: Vec<i32> = task_tokens(&pctx.table, &window_seed).into_iter().map(|t| t as i32).collect();
-    let traced = engine.trace_tokens(raw, &task, crate::llm_engine::TASK_CONTEXT_TOKENS).map_err(|e| e.to_string())?;
-    let record = TraceRecord::new_chain(&m, TASK_LEN, traced.ubatch, traced.leaves, &task).ok_or("incomplete block task trace")?;
-    let task = ResponseTrace { record, tokens: task };
-    for block_hash in [[0x21u8; 32], [0x9cu8; 32]] {
-        let seed = draw_seed(&block_hash);
-        let body = open_chain(engine, tier, &m, &task_prefix(&pctx), &task, &seed, &task_bytes(&window_seed), [0u8; 32], index, crate::llm_engine::TASK_CONTEXT_TOKENS)?;
-        let opening = keryx_verifiable_inference::opening::Opening::decode(&body).ok_or("block task opening does not decode")?;
-        verify_block_task(&tier_ctx, &ctx, &pctx, &task.record.trace_root, &window_seed, &block_hash, &opening).map_err(|e| format!("block task: {e:?}"))?;
+        open_pieces(engine, &tm, &pctx, &trace, &seed, &request_hash, [0u8; 32], index, n_ctx)?;
     }
     Ok(())
 }
 
-/// Arms the stage-2 trace of `tier` on `engine` for evaluations of up to `max_pos` positions. The
-/// first time per model it runs the self-check; a model that fails it is never traced (its
-/// answers and blocks would be refused), and the failure is logged once.
-fn arm_trace(spec: &ModelSpec, engine: &InferenceEngine, tier: u8, max_pos: u32) -> bool {
-    const KIND: &str = "stage-2";
-    let Some(raw) = crate::trace::TierManifest::raw_chain(tier) else { return false };
-    if TRACE_FAILED.lock().unwrap_or_else(|p| p.into_inner()).contains(&(spec.model_id, KIND)) {
+/// Arms the trace of `tier` on `engine` (the attention rule's when `attention`) for evaluations of
+/// up to `max_pos` positions. The first time per model and kind it runs the self-check; a model
+/// that fails it is never traced that way (its answers would be refused), and the failure is
+/// logged once.
+fn arm_trace(spec: &ModelSpec, engine: &InferenceEngine, tier: u8, max_pos: u32, attention: bool) -> bool {
+    let kind = trace_kind(attention);
+    if TRACE_FAILED.lock().unwrap_or_else(|p| p.into_inner()).contains(&(spec.model_id, kind)) {
         return false;
     }
+    let tm = match trace_manifest(tier, attention) {
+        Ok(tm) => tm,
+        Err(e) => {
+            log::warn!("SlmEngine '{}': no {kind} trace for tier {tier} ({e})", spec.name);
+            TRACE_FAILED.lock().unwrap_or_else(|p| p.into_inner()).push((spec.model_id, kind));
+            return false;
+        }
+    };
     // The self-check traces answer contexts too: arm room for both.
     let room = max_pos.max(2_048);
-    if let Err(e) = engine.trace_configure(raw, room) {
-        log::error!("SlmEngine '{}': the canonical trace cannot be configured ({e}) — no traced answers or blocks", spec.name);
-        TRACE_FAILED.lock().unwrap_or_else(|p| p.into_inner()).push((spec.model_id, KIND));
+    if let Err(e) = engine.trace_configure(tm.raw, room, tm.seq.as_ref()) {
+        log::error!("SlmEngine '{}': the {kind} trace cannot be configured ({e}) — no traced answers", spec.name);
+        TRACE_FAILED.lock().unwrap_or_else(|p| p.into_inner()).push((spec.model_id, kind));
         return false;
     }
-    if TRACE_CHECKED.lock().unwrap_or_else(|p| p.into_inner()).contains(&(spec.model_id, KIND)) {
+    if TRACE_CHECKED.lock().unwrap_or_else(|p| p.into_inner()).contains(&(spec.model_id, kind)) {
         return true;
     }
     let t0 = std::time::Instant::now();
-    match chain_self_check(spec, engine, tier) {
+    match chain_self_check(spec, engine, tier, attention) {
         Ok(()) => {
-            TRACE_CHECKED.lock().unwrap_or_else(|p| p.into_inner()).push((spec.model_id, KIND));
-            log::info!("SlmEngine '{}': stage-2 trace self-check passed ({:.1} s) — openings verify as the node does", spec.name, t0.elapsed().as_secs_f64());
+            TRACE_CHECKED.lock().unwrap_or_else(|p| p.into_inner()).push((spec.model_id, kind));
+            log::info!("SlmEngine '{}': {kind} trace self-check passed ({:.1} s) — openings verify as the node does", spec.name, t0.elapsed().as_secs_f64());
             true
         }
         Err(e) => {
-            TRACE_FAILED.lock().unwrap_or_else(|p| p.into_inner()).push((spec.model_id, KIND));
-            // Expected since keryx-node 368f5fe1: a prompt must be traced in 512-token batches (CUDA's
-            // MMQ layout), and this engine traces 8-token MMVQ batches.
-            log::warn!(
-                "SlmEngine '{}': the stage-2 trace self-check failed on this GPU ({e}) — audited (solo) AI requests are left unanswered; mining and pool inference are unaffected",
-                spec.name
-            );
+            TRACE_FAILED.lock().unwrap_or_else(|p| p.into_inner()).push((spec.model_id, kind));
+            log::warn!("SlmEngine '{}': the {kind} trace self-check failed on this GPU ({e}) — traced AI requests are left unanswered", spec.name);
             false
         }
     }
+}
+
+/// Whether the traced self-check of `model_id` under the attention rule has passed on this GPU.
+pub fn attention_trace_ready(model_id: &[u8; 32]) -> bool {
+    TRACE_CHECKED.lock().unwrap_or_else(|p| p.into_inner()).contains(&(*model_id, trace_kind(true)))
+}
+
+/// Runs the traced self-check of the resident `model_id` (tier `tier`) under the attention rule
+/// unless it already ran; whether it passed. Blocking.
+pub fn check_attention_trace(model_id: &[u8; 32], tier: u8) -> bool {
+    let Some((spec, engine)) = engine_for(model_id) else { return false };
+    arm_trace(spec, &engine, tier, engine.ctx_cap(), true)
 }
 
 /// The block task trace of `tier` for the window seeded by `window_seed`, on the engine serving
@@ -797,7 +962,7 @@ fn arm_trace(spec: &ModelSpec, engine: &InferenceEngine, tier: u8, max_pos: u32)
 pub fn run_block_task(model_id: &[u8; 32], tier: u8, window_seed: &[u8; 32]) -> Option<crate::trace::ResponseTrace> {
     use keryx_verifiable_inference::block_task::{task_tokens, TASK_LEN};
     let (spec, engine) = engine_for(model_id)?;
-    if !arm_trace(spec, &engine, tier, crate::llm_engine::TASK_CONTEXT_TOKENS) {
+    if !arm_trace(spec, &engine, tier, crate::llm_engine::TASK_CONTEXT_TOKENS, false) {
         return None;
     }
     let m = crate::trace::TierManifest::for_chain(tier)?;
@@ -817,7 +982,7 @@ pub fn run_block_task(model_id: &[u8; 32], tier: u8, window_seed: &[u8; 32]) -> 
         log::warn!("SlmEngine '{}': incomplete block task trace", spec.name);
     }
     log::debug!("SlmEngine '{}': block task traced in {:.0} ms", spec.name, t0.elapsed().as_secs_f64() * 1e3);
-    Some(crate::trace::ResponseTrace { record: record?, tokens })
+    Some(crate::trace::ResponseTrace { record: record?, tokens, seq: None })
 }
 
 /// The task opening of the block `block_hash` from the task trace of its window, checked as the
@@ -825,16 +990,15 @@ pub fn run_block_task(model_id: &[u8; 32], tier: u8, window_seed: &[u8; 32]) -> 
 pub fn open_block_task(model_id: &[u8; 32], tier: u8, trace: &crate::trace::ResponseTrace, window_seed: &[u8; 32], block_hash: &[u8; 32]) -> Option<Vec<u8>> {
     use keryx_verifiable_inference::block_task::{draw_seed, task_bytes, task_prefix, verify_block_task};
     let (spec, engine) = engine_for(model_id)?;
-    if !arm_trace(spec, &engine, tier, crate::llm_engine::TASK_CONTEXT_TOKENS) {
+    if !arm_trace(spec, &engine, tier, crate::llm_engine::TASK_CONTEXT_TOKENS, false) {
         return None;
     }
     let index = weight_index(spec)?;
-    let m = crate::trace::TierManifest::for_chain(tier)?;
+    let tm = trace_manifest(tier, false).ok()?;
     let (ctx, pctx) = crate::trace::chain_ctx(tier)?;
     let body = match open_chain(
         &engine,
-        tier,
-        &m,
+        &tm,
         &task_prefix(&pctx),
         trace,
         &draw_seed(block_hash),
@@ -842,7 +1006,9 @@ pub fn open_block_task(model_id: &[u8; 32], tier: u8, trace: &crate::trace::Resp
         [0u8; 32],
         index,
         crate::llm_engine::TASK_CONTEXT_TOKENS,
-    ) {
+    )
+    .and_then(|(b, r)| inline_resid(&b, &r))
+    {
         Ok(b) => b,
         Err(e) => {
             log::warn!("SlmEngine '{}': block task opening failed ({e})", spec.name);
@@ -850,7 +1016,7 @@ pub fn open_block_task(model_id: &[u8; 32], tier: u8, trace: &crate::trace::Resp
         }
     };
     let opening = keryx_verifiable_inference::opening::Opening::decode(&body)?;
-    if let Err(e) = verify_block_task(&m.tier_ctx(index), &ctx, &pctx, &trace.record.trace_root, window_seed, block_hash, &opening) {
+    if let Err(e) = verify_block_task(&tm.m.tier_ctx(index), &ctx, &pctx, &trace.record.trace_root, window_seed, block_hash, &opening) {
         log::error!("SlmEngine '{}': block task opening fails its self-check ({e:?})", spec.name);
         return None;
     }
@@ -870,9 +1036,22 @@ fn truncate_answer(mut text: String, max_tokens: usize) -> String {
     text
 }
 
-/// Traced inference for an audited `tier`: the answer and its stage-2 trace, with the request id
-/// `request_hash` in the prompt prefix. `prompt_len` is the request's plaintext prompt length (the
-/// shape rule pads the traced prompt to it). Blocking. `request` names it in the `--log-ai` file.
+/// The private body of a traced answer: the text with its generated token ids (`answer::encode`)
+/// for a stage-2 trace, the plain text otherwise.
+pub fn answer_body(text: &str, trace: Option<&crate::trace::ResponseTrace>) -> Vec<u8> {
+    match trace.filter(|t| t.record.stage == crate::trace::STAGE_CHAIN) {
+        Some(t) => {
+            let ids: Vec<u32> = t.tokens[t.record.n_prompt as usize..].iter().map(|&v| v as u32).collect();
+            keryx_verifiable_inference::answer::encode(text.as_bytes(), &ids)
+        }
+        None => text.as_bytes().to_vec(),
+    }
+}
+
+/// Traced inference for an audited `tier`: the answer and its stage-2 trace (with sequence leaves
+/// when `attention`), with the request id `request_hash` in the prompt prefix. `prompt_len` is the
+/// request's plaintext prompt length (the shape rule pads the traced prompt to it). Blocking.
+/// `request` names it in the `--log-ai` file.
 #[allow(clippy::too_many_arguments)]
 pub fn load_and_run_traced_inference(
     model_id: &[u8; 32],
@@ -881,6 +1060,7 @@ pub fn load_and_run_traced_inference(
     tier: u8,
     prompt_len: u32,
     request_hash: &[u8; 32],
+    attention: bool,
     request: &str,
 ) -> Option<Generated> {
     let started = std::time::Instant::now();
@@ -892,7 +1072,7 @@ pub fn load_and_run_traced_inference(
             .unwrap_or("unknown model");
         ai_log(request, format_args!("prompt ({model}, {}, max_tokens={max_tokens}, traced): {prompt:?}", inference_gpu_label()));
     }
-    let answer = run_traced_inference(model_id, prompt, max_tokens, tier, prompt_len, request_hash);
+    let answer = run_traced_inference(model_id, prompt, max_tokens, tier, prompt_len, request_hash, attention);
     let elapsed = started.elapsed().as_secs_f64();
     match &answer {
         Some(g) => ai_log(request, format_args!("answer ({elapsed:.2} s, {}): {:?}", if g.trace.is_some() { "traced" } else { "untraced" }, g.text)),
@@ -901,14 +1081,13 @@ pub fn load_and_run_traced_inference(
     answer
 }
 
-fn run_traced_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize, tier: u8, prompt_len: u32, request_hash: &[u8; 32]) -> Option<Generated> {
-    use crate::trace::{chain_ctx, prefix_tokens, ResponseTrace, TierManifest, TraceRecord};
+fn run_traced_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize, tier: u8, prompt_len: u32, request_hash: &[u8; 32], attention: bool) -> Option<Generated> {
+    use crate::trace::{chain_ctx, prefix_tokens, ResponseTrace, SeqTrace, TraceRecord};
     let (spec, engine) = engine_for(model_id)?;
-    if !arm_trace(spec, &engine, tier, engine.ctx_cap()) {
+    if !arm_trace(spec, &engine, tier, engine.ctx_cap(), attention) {
         return None;
     }
-    let m = TierManifest::for_chain(tier)?;
-    let raw = TierManifest::raw_chain(tier)?;
+    let tm = trace_manifest(tier, attention).ok()?;
     let (_, pctx) = chain_ctx(tier)?;
     let Some((head, rest)) = format_prompt_parts(spec.name, prompt) else {
         log::error!("SlmEngine '{}': no prefix template — a traced answer cannot be built", spec.name);
@@ -918,7 +1097,7 @@ fn run_traced_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize, ti
     let prefix = crate::llm_engine::PromptPrefix { tokens: &tokens, head_tokens: pctx.offset, rest: &rest };
     let min_prompt = keryx_verifiable_inference::shape::min_prompt_positions(prompt_len);
     let per_position = keryx_verifiable_inference::shape::ANSWER_BYTES_PER_POSITION;
-    let g = match engine.generate_traced(raw, &head, Some(prefix), max_tokens, min_prompt, per_position, |n| answer_ctx(&engine, n, max_tokens)) {
+    let g = match engine.generate_traced(tm.raw, &head, Some(prefix), max_tokens, min_prompt, per_position, |n| answer_ctx(&engine, n, max_tokens)) {
         Ok(g) => g,
         Err(e) if e.is::<crate::llm_engine::PromptTooLong>() => {
             log::warn!("SlmEngine '{}': {e} — response dropped", spec.name);
@@ -934,7 +1113,9 @@ fn run_traced_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize, ti
         log::warn!("SlmEngine '{}': the fed prompt does not carry the request prefix — response dropped", spec.name);
         return None;
     }
-    let record = TraceRecord::new_chain(&m, g.n_prompt, g.ubatch, g.leaves, &g.tokens);
+    let record = TraceRecord::new_chain(&tm.m, g.n_prompt, g.ubatch, g.leaves, &g.tokens);
+    let seq = if attention { g.seq.and_then(SeqTrace::new) } else { None };
+    let record = record.filter(|_| !attention || seq.is_some());
     if record.is_none() {
         log::warn!("SlmEngine '{}': incomplete trace — answering without a commitment", spec.name);
     }
@@ -943,11 +1124,13 @@ fn run_traced_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize, ti
         log::warn!("SlmEngine '{}': empty completion", spec.name);
         return None;
     }
-    Some(Generated { text: truncate_answer(text, max_tokens), trace: record.map(|record| ResponseTrace { record, tokens: g.tokens }) })
+    Some(Generated { text: truncate_answer(text, max_tokens), trace: record.map(|record| ResponseTrace { record, tokens: g.tokens, seq }) })
 }
 
 /// The opening of an audited stage-2 response (`max_tokens` is its request's budget, which sized
-/// the context it ran in), replayed on the engine serving `model_id` and checked as the node would.
+/// the context it ran in), replayed on the engine serving `model_id` and checked as the node
+/// would: the trace opening, then under the attention rule its first attention phase, then the
+/// residual opening, bundled (`trace_seq::bundle`, one transaction each).
 #[allow(clippy::too_many_arguments)]
 pub fn open_trace(
     model_id: &[u8; 32],
@@ -958,31 +1141,59 @@ pub fn open_trace(
     request_hash: &[u8; 32],
     max_tokens: u32,
 ) -> Option<Vec<u8>> {
-    use crate::trace::{chain_ctx, verify_chain_opening, TierManifest, STAGE_CHAIN};
+    use crate::trace::{chain_ctx, STAGE_CHAIN};
     if trace.record.stage != STAGE_CHAIN {
         log::warn!("SlmEngine: only stage-2 traces are opened by this miner");
         return None;
     }
+    let attention = trace.seq.is_some();
     let (spec, engine) = engine_for(model_id)?;
     let n_ctx = answer_ctx(&engine, trace.record.n_prompt as usize, max_tokens as usize);
-    if !arm_trace(spec, &engine, tier, n_ctx.max(engine.ctx_cap())) {
+    if !arm_trace(spec, &engine, tier, n_ctx.max(engine.ctx_cap()), attention) {
         return None;
     }
     let index = weight_index(spec)?;
-    let m = TierManifest::for_chain(tier)?;
-    let (ctx, pctx) = chain_ctx(tier)?;
-    let body = match open_chain(&engine, tier, &m, &pctx, trace, seed, request_hash, response_txid, index, n_ctx) {
-        Ok(b) => b,
+    let tm = trace_manifest(tier, attention).ok()?;
+    let (_, pctx) = chain_ctx(tier)?;
+    match open_pieces(&engine, &tm, &pctx, trace, seed, request_hash, response_txid, index, n_ctx) {
+        Ok(bodies) => Some(crate::trace_seq::bundle(&bodies)),
         Err(e) => {
             log::warn!("SlmEngine '{}': stage-2 opening failed ({e})", spec.name);
-            return None;
+            None
         }
-    };
-    if let Err(e) = verify_chain_opening(&m.tier_ctx(index), &ctx, &pctx, &trace.record, seed, request_hash, &body) {
-        log::error!("SlmEngine '{}': stage-2 opening fails its self-check ({e})", spec.name);
+    }
+}
+
+/// The attention phase of `path` of an audited response, `prev` the partials of its previous
+/// phase; `None` when it cannot be built.
+#[allow(clippy::too_many_arguments)]
+pub fn open_attention_phase(
+    model_id: &[u8; 32],
+    tier: u8,
+    trace: &crate::trace::ResponseTrace,
+    seed: &[u8; 32],
+    response_txid: [u8; 32],
+    path: &[u64],
+    prev: &[u8],
+    max_tokens: u32,
+) -> Option<Vec<u8>> {
+    if trace.seq.is_none() {
         return None;
     }
-    Some(body)
+    let (spec, engine) = engine_for(model_id)?;
+    let n_ctx = answer_ctx(&engine, trace.record.n_prompt as usize, max_tokens as usize);
+    if !arm_trace(spec, &engine, tier, n_ctx.max(engine.ctx_cap()), true) {
+        return None;
+    }
+    let index = weight_index(spec)?;
+    let tm = trace_manifest(tier, true).ok()?;
+    match open_attention(&engine, &tm, trace, seed, response_txid, index, path, Some(prev), n_ctx) {
+        Ok(body) => Some(body),
+        Err(e) => {
+            log::warn!("SlmEngine '{}': attention phase {path:?} failed ({e})", spec.name);
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1104,115 +1315,115 @@ mod tests {
         (tier, crate::models::pom_model_for_tier(u64::MAX, t).expect("the tier's model"))
     }
 
-    /// The stage-2 self-check the miner runs before it traces: a traced answer and a block task on
-    /// this GPU, replayed, opened under two seeds and verified exactly as the node verifies. Run with:
-    ///   [KERYX_TEST_TIER=<0..4>] KERYX_TEST_GGUF=<that tier's model.gguf> cargo test --release --lib -- --ignored --nocapture stage2_trace_self_check
+    /// The engine of a GPU trace test with the tier's possession index ready.
+    fn trace_test_engine(gguf: &str, spec: &crate::models::ModelSpec) -> super::InferenceEngine {
+        let path = gguf.to_string();
+        assert!(crate::pom::get_or_build_index(&spec.model_id, move || crate::pom::WeightIndex::build_from_gguf(&path)));
+        super::InferenceEngine::launch(gguf).expect("engine launch")
+    }
+
+    /// The self-check the miner runs before it traces under the attention rule (as keryxd 1.6.6
+    /// requires): a traced answer on this GPU with its sequence leaves, replayed, opened under two
+    /// seeds (trace, first attention phase, residual) and verified exactly as the node verifies.
+    /// `KERYX_TEST_ATTN=0` runs the plain stage-2 check instead. Run with:
+    ///   [KERYX_TEST_TIER=<0..4>] KERYX_TEST_GGUF=<that tier's model.gguf> cargo test --release --lib -- --ignored --nocapture trace_self_check
     #[test]
     #[ignore = "loads a tier model onto the GPU; set KERYX_TEST_GGUF (and KERYX_TEST_TIER) to run"]
-    fn stage2_trace_self_check() {
+    fn trace_self_check() {
         let _ = env_logger::builder().is_test(true).filter_level(log::LevelFilter::Info).parse_default_env().try_init();
         let Ok(gguf) = std::env::var("KERYX_TEST_GGUF") else {
             eprintln!("SKIP: KERYX_TEST_GGUF not set");
             return;
         };
+        let attention = std::env::var("KERYX_TEST_ATTN").map_or(true, |v| v != "0");
         let (tier, spec) = test_tier();
-        let path = gguf.clone();
-        assert!(crate::pom::get_or_build_index(&spec.model_id, move || crate::pom::WeightIndex::build_from_gguf(&path)));
-        let engine = super::InferenceEngine::launch(&gguf).expect("engine launch");
-        let raw = crate::trace::TierManifest::raw_chain(tier).expect("the tier's manifest");
-        engine.trace_configure(raw, 2_048).expect("trace configure");
+        let engine = trace_test_engine(&gguf, spec);
+        let tm = super::trace_manifest(tier, attention).expect("the tier's manifest");
+        engine.trace_configure(tm.raw, 2_048, tm.seq.as_ref()).expect("trace configure");
         let t0 = std::time::Instant::now();
-        super::chain_self_check(spec, &engine, tier).expect("stage-2 self-check");
-        eprintln!("stage-2 self-check passed in {:.1} s", t0.elapsed().as_secs_f64());
+        super::chain_self_check(spec, &engine, tier, attention).expect("self-check");
+        eprintln!("{} self-check passed in {:.1} s", super::trace_kind(attention), t0.elapsed().as_secs_f64());
     }
 
-    /// Openings under many seeds, the way production traces: a shape-padded answer to a long prompt
-    /// (so the draws reach generated positions, the head and the padding) and the block task. Run with:
-    ///   [KERYX_TEST_TIER=<0..4>] KERYX_TEST_GGUF=<that tier's model.gguf> [KERYX_TEST_SEEDS=48] cargo test --release --lib -- --ignored --nocapture stage2_openings_many_seeds
+    /// Openings under many seeds the way production traces: a shape-padded answer to a long prompt
+    /// (several 512-position batches of it, so its inputs take the MMQ layouts, and an attention
+    /// tree of two levels past 256 positions), opened whole (trace, first attention phase,
+    /// residual) under each seed, then the second attention phase of every child of the first. Run
+    /// with:
+    ///   [KERYX_TEST_TIER=<0..4>] KERYX_TEST_GGUF=<that tier's model.gguf> [KERYX_TEST_SEEDS=24] [KERYX_TEST_REPEAT=60] \
+    ///     cargo test --release --lib -- --ignored --nocapture attention_openings_many_seeds
     #[test]
     #[ignore = "loads a tier model onto the GPU; set KERYX_TEST_GGUF (and KERYX_TEST_TIER) to run"]
-    fn stage2_openings_many_seeds() {
-        use crate::trace::{chain_ctx, prefix_tokens, verify_chain_opening, ResponseTrace, TierManifest, TraceRecord};
-        use keryx_verifiable_inference::block_task::{draw_seed, task_bytes, task_prefix, task_tokens, verify_block_task, TASK_LEN};
+    fn attention_openings_many_seeds() {
+        use crate::trace::{chain_ctx, prefix_tokens, ResponseTrace, SeqTrace, TraceRecord};
+        use keryx_verifiable_inference::attn_blocks::decode_partials;
+        use keryx_verifiable_inference::opening::{inner_body, AttnOpening};
         use keryx_verifiable_inference::shape;
         let _ = env_logger::builder().is_test(true).filter_level(log::LevelFilter::Info).parse_default_env().try_init();
         let Ok(gguf) = std::env::var("KERYX_TEST_GGUF") else {
             eprintln!("SKIP: KERYX_TEST_GGUF not set");
             return;
         };
-        let n_seeds: u32 = std::env::var("KERYX_TEST_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(48);
+        let n_seeds: u32 = std::env::var("KERYX_TEST_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(24);
+        let repeat: usize = std::env::var("KERYX_TEST_REPEAT").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
         let (tier, spec) = test_tier();
-        let path = gguf.clone();
-        assert!(crate::pom::get_or_build_index(&spec.model_id, move || crate::pom::WeightIndex::build_from_gguf(&path)));
+        let engine = trace_test_engine(&gguf, spec);
         let index = crate::pom::index_for(&spec.model_id).unwrap();
-        let engine = super::InferenceEngine::launch(&gguf).expect("engine launch");
-        let raw = TierManifest::raw_chain(tier).unwrap();
-        let m = TierManifest::for_chain(tier).unwrap();
-        let (ctx, pctx) = chain_ctx(tier).unwrap();
-        let tier_ctx = m.tier_ctx(index);
-        engine.trace_configure(raw, 4_096).expect("trace configure");
+        let tm = super::trace_manifest(tier, true).expect("the attention manifest");
+        let (_, pctx) = chain_ctx(tier).unwrap();
+        engine.trace_configure(tm.raw, 4_096, tm.seq.as_ref()).expect("trace configure");
 
-        let prompt = "List three facts about the Moon, one short sentence each. ".repeat(12);
+        let prompt = "List three facts about the Moon, one short sentence each. ".repeat(repeat);
         let max_tokens = 40usize;
         let (head, rest) = super::format_prompt_parts(spec.name, &prompt).unwrap();
         let request_hash: [u8; 32] = *blake3::hash(b"many-seeds request").as_bytes();
         let tokens = prefix_tokens(&pctx, &request_hash);
         let prefix = crate::llm_engine::PromptPrefix { tokens: &tokens, head_tokens: pctx.offset, rest: &rest };
         let min_prompt = shape::min_prompt_positions(prompt.len() as u32);
+        let t0 = std::time::Instant::now();
         let g = engine
-            .generate_traced(raw, &head, Some(prefix), max_tokens, min_prompt, shape::ANSWER_BYTES_PER_POSITION, |n| super::answer_ctx(&engine, n, max_tokens))
+            .generate_traced(tm.raw, &head, Some(prefix), max_tokens, min_prompt, shape::ANSWER_BYTES_PER_POSITION, |n| super::answer_ctx(&engine, n, max_tokens))
             .expect("traced generation");
         let text = super::truncate_answer(super::strip_think(&g.text).trim().to_string(), max_tokens);
-        eprintln!("answer ({} prompt + {} positions, min prompt {min_prompt}): {text:?}", g.n_prompt, g.n_pos - g.n_prompt);
+        eprintln!("answer ({} prompt + {} positions in {:.1} s): {text:?}", g.n_prompt, g.n_pos - g.n_prompt, t0.elapsed().as_secs_f64());
         assert!(shape::shape_ok(prompt.len() as u32, text.len() as u32, max_tokens as u32, g.n_prompt, g.n_pos), "shape rule");
         let n_ctx = super::answer_ctx(&engine, g.n_prompt as usize, max_tokens);
-        let record = TraceRecord::new_chain(&m, g.n_prompt, g.ubatch, g.leaves, &g.tokens).expect("complete trace");
-        let trace = ResponseTrace { record, tokens: g.tokens };
+        let record = TraceRecord::new_chain(&tm.m, g.n_prompt, g.ubatch, g.leaves, &g.tokens).expect("complete trace");
+        let seq = SeqTrace::new(g.seq.expect("sequence leaves")).expect("sequence leaves");
+        let trace = ResponseTrace { record, tokens: g.tokens, seq: Some(seq) };
         let t0 = std::time::Instant::now();
-        let mut failed = Vec::new();
+        let (mut failed, mut phases, mut phase_failed) = (Vec::new(), 0usize, Vec::new());
         for s in 0..n_seeds {
             let seed = *blake3::hash(&s.to_le_bytes()).as_bytes();
-            let res = super::open_chain(&engine, tier, &m, &pctx, &trace, &seed, &request_hash, [0u8; 32], index, n_ctx)
-                .and_then(|body| verify_chain_opening(&tier_ctx, &ctx, &pctx, &trace.record, &seed, &request_hash, &body));
-            if let Err(e) = res {
-                eprintln!("answer seed {s}: {e}");
-                failed.push(s);
+            let bodies = match super::open_pieces(&engine, &tm, &pctx, &trace, &seed, &request_hash, [0u8; 32], index, n_ctx) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("seed {s}: {e}");
+                    failed.push(s);
+                    continue;
+                }
+            };
+            // The first attention phase: a leaf (done) or partials of children; open every child.
+            let first = AttnOpening::decode(&inner_body(&bodies[1]).unwrap_or_else(|| bodies[1].clone())).expect("attention body");
+            let d = crate::trace_seq::draw_attn(&tm.m, &trace.record, &seed).expect("attention draw");
+            if !d.leaf(&[]) {
+                let n = decode_partials(&first.partials, d.dv).map_or(0, |p| p.len());
+                for i in 0..n as u64 {
+                    phases += 1;
+                    if let Err(e) = super::open_attention(&engine, &tm, &trace, &seed, [0u8; 32], index, &[i], Some(&first.partials), n_ctx) {
+                        eprintln!("seed {s} child {i}: {e}");
+                        phase_failed.push((s, i));
+                    }
+                }
             }
         }
-        eprintln!("answer: {} of {n_seeds} openings verify ({:.1} s)", n_seeds as usize - failed.len(), t0.elapsed().as_secs_f64());
-
-        let window_seed = *blake3::hash(b"many-seeds window").as_bytes();
-        let task: Vec<i32> = task_tokens(&pctx.table, &window_seed).into_iter().map(|t| t as i32).collect();
-        let traced = engine.trace_tokens(raw, &task, crate::llm_engine::TASK_CONTEXT_TOKENS).expect("task trace");
-        let record = TraceRecord::new_chain(&m, TASK_LEN, traced.ubatch, traced.leaves, &task).expect("complete task trace");
-        let task = ResponseTrace { record, tokens: task };
-        let t0 = std::time::Instant::now();
-        let mut task_failed = Vec::new();
-        for s in 0..n_seeds {
-            let block_hash = *blake3::hash(&(s + 1_000_000).to_le_bytes()).as_bytes();
-            let res = super::open_chain(
-                &engine,
-                tier,
-                &m,
-                &task_prefix(&pctx),
-                &task,
-                &draw_seed(&block_hash),
-                &task_bytes(&window_seed),
-                [0u8; 32],
-                index,
-                crate::llm_engine::TASK_CONTEXT_TOKENS,
-            )
-            .and_then(|body| {
-                let opening = keryx_verifiable_inference::opening::Opening::decode(&body).ok_or("no decode")?;
-                verify_block_task(&tier_ctx, &ctx, &pctx, &task.record.trace_root, &window_seed, &block_hash, &opening).map_err(|e| format!("{e:?}"))
-            });
-            if let Err(e) = res {
-                eprintln!("task block {s}: {e}");
-                task_failed.push(s);
-            }
-        }
-        eprintln!("block task: {} of {n_seeds} openings verify ({:.1} s)", n_seeds as usize - task_failed.len(), t0.elapsed().as_secs_f64());
-        assert!(failed.is_empty() && task_failed.is_empty(), "answer seeds {failed:?}, task blocks {task_failed:?}");
+        eprintln!(
+            "{} of {n_seeds} openings verify, {} of {phases} second attention phases ({:.1} s)",
+            n_seeds as usize - failed.len(),
+            phases - phase_failed.len(),
+            t0.elapsed().as_secs_f64()
+        );
+        assert!(failed.is_empty() && phase_failed.is_empty(), "seeds {failed:?}, phases {phase_failed:?}");
     }
 
     /// Diagnostic: every plain/gated product at one position of the block task, x and y captured
@@ -1234,7 +1445,7 @@ mod tests {
         let engine = super::InferenceEngine::launch(&gguf).expect("engine launch");
         let raw = crate::trace::TierManifest::raw_chain(tier).expect("the tier's manifest");
         let m = crate::trace::TierManifest::for_chain(tier).unwrap();
-        engine.trace_configure(raw, 2_048).expect("trace configure");
+        engine.trace_configure(raw, 2_048, None).expect("trace configure");
         let (_, pctx) = crate::trace::chain_ctx(tier).unwrap();
         let task: Vec<i32> = keryx_verifiable_inference::block_task::task_tokens(&pctx.table, &[0x5au8; 32]).into_iter().map(|t| t as i32).collect();
         let n_ctx = crate::llm_engine::TASK_CONTEXT_TOKENS;

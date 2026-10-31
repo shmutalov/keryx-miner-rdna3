@@ -172,12 +172,28 @@ pub(crate) enum StratumCommand {
     #[serde(rename = "mining.declare_capabilities")]
     MiningDeclareCapabilities(Vec<String>),
     // Pool-dispatched inference: bridge → miner
-    // (task_id == request_hash, txid, request_hash, model_hex, prompt_b64, max_tokens, reward).
+    // (task_id == request_hash, txid, request_hash, model_hex, prompt_b64, max_tokens, reward), plus
+    // (keryx-miner-supr 0.15.3) an OPTIONAL 8th object `{"trace":{"tier","prompt_len","chain",
+    // "attention"}}` asking for an H15 traced answer.
     #[serde(rename = "mining.ai_request")]
-    MiningAiRequest((String, String, String, String, String, u32, String)),
-    // miner → bridge: (worker, task_id, request_hash, model_hex, result_b64).
+    MiningAiRequest(AiRequestParams),
+    // miner → bridge: (worker, task_id, request_hash, model_hex, result_b64), plus for a traced
+    // answer a 6th object `{"trace": hex TraceCommitment, "body": hex answer::encode(text, ids)}`.
     #[serde(rename = "mining.ai_response")]
-    MiningAiResponse((String, String, String, String, String)),
+    MiningAiResponse(Vec<Value>),
+    // Pool → miner (0.15.3): build the opening of a traced answer this rig produced:
+    // [request_hash, response_txid, seed_hex, attention_path (u64s), prev_partials_hex(, record_url)].
+    #[serde(rename = "mining.ai_opening")]
+    MiningAiOpening(Vec<Value>),
+    // miner → pool: [worker, request_hash, response_txid, attention_path, body_hex, error].
+    #[serde(rename = "mining.ai_opening_result")]
+    MiningAiOpeningResult(Vec<Value>),
+    // Miner telemetry (suprnova v0.7.0 proposal, schema v1): the static rig identity, once per
+    // session, then periodic metrics; both carry `"trace": 0|1` (H15 serving capability).
+    #[serde(rename = "mining.hello")]
+    MiningHello((Value,)),
+    #[serde(rename = "mining.telemetry")]
+    MiningTelemetry((Value,)),
     // Phase 2 OPoI: bridge → miner — "model_id_hex:nonce_hex" capability challenge
     #[serde(rename = "mining.challenge")]
     MiningChallenge((String, String)),
@@ -197,6 +213,45 @@ pub(crate) enum StratumCommand {
         params: (String, String),
         worker: String,
     },*/ //{"id":9,"method":"mining.submit_hashrate","jsonrpc":"2.0","worker":"rig","params":["0x00000000000000000000000000000000","0x85198cd10b915d560722cdfdf490d4d93892d2cc3fa5f2ff2195d499d04ee54c"]}
+}
+
+/// `mining.ai_request` params: the positional 7-tuple and the optional 0.15.3 trace object.
+#[derive(Debug, Clone)]
+pub(crate) struct AiRequestParams {
+    pub fields: (String, String, String, String, String, u32, String),
+    pub ext: Option<Value>,
+}
+
+impl<'de> Deserialize<'de> for AiRequestParams {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let v: Vec<Value> = Vec::deserialize(d)?;
+        if v.len() != 7 && v.len() != 8 {
+            return Err(D::Error::custom(format!("mining.ai_request takes 7 or 8 params, got {}", v.len())));
+        }
+        let s = |i: usize| v[i].as_str().map(str::to_string).ok_or_else(|| D::Error::custom(format!("mining.ai_request param {i} must be a string")));
+        let n = v[5].as_u64().and_then(|n| u32::try_from(n).ok()).ok_or_else(|| D::Error::custom("mining.ai_request max_tokens must be a u32"))?;
+        Ok(Self { fields: (s(0)?, s(1)?, s(2)?, s(3)?, s(4)?, n, s(6)?), ext: v.get(7).cloned().filter(|x| !x.is_null()) })
+    }
+}
+
+impl Serialize for AiRequestParams {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        let f = &self.fields;
+        let mut v = vec![
+            Value::from(f.0.clone()),
+            Value::from(f.1.clone()),
+            Value::from(f.2.clone()),
+            Value::from(f.3.clone()),
+            Value::from(f.4.clone()),
+            Value::from(f.5),
+            Value::from(f.6.clone()),
+        ];
+        if let Some(e) = &self.ext {
+            v.push(e.clone());
+        }
+        v.serialize(ser)
+    }
 }
 
 /// `mining.inference_request` params (wire format of keryx-miner-supr's H6 chat extension).
