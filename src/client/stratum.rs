@@ -316,11 +316,14 @@ impl Client for StratumHandler {
                         // version, raising the floor at every hardfork (H4 >= 0.7.0, H5.2 >= 0.9.2,
                         // H10 >= 0.12.0 — the mandatory one-way-seed release, H14 >= 0.14.0). This
                         // build mines the H15 consensus of keryx-node 1.6.6: PoM v5 (context pad) and
-                        // no block task, as supr 0.15.1 does (0.15.0 still hashes a task root, which
+                        // no block task, as supr 0.15.1+ does (0.15.0 still hashes a task root, which
                         // makes every post-H15 block invalid), and H14 before the gate — so advertise
-                        // the current supr release. Bump this single string if the pool raises the
-                        // floor again. (Real build: keryx-miner/CARGO_PKG_VERSION.)
-                        "keryx-miner-supr/0.15.1".to_string(),
+                        // the current supr release. Past the gate the pool refused 0.15.1 (2026-10-31,
+                        // after supr 0.15.3/0.15.4 shipped traced answers). This build traces nothing:
+                        // a traced `mining.ai_request` (supr's optional 8th param) fails to decode and
+                        // is skipped, i.e. left unanswered. Bump this single string if the pool raises
+                        // the floor again. (Real build: keryx-miner/CARGO_PKG_VERSION.)
+                        "keryx-miner-supr/0.15.4".to_string(),
                         KERYX_STRATUM_DAA_CAPABILITY.into(),
                     )),
                 )),
