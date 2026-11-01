@@ -54,22 +54,24 @@ REM     git-ignored. ---
 
 REM ----------------------------------------------------------------------------
 cd /d "%~dp0"
+REM A release package has the miner next to this file, and it runs from here. A source checkout
+REM runs it from target\release, next to its models and ipfs.exe.
 set "RELEASE_DIR=%~dp0target\release\"
+if exist "%~dp0keryx-miner-rdna3.exe" set "RELEASE_DIR=%~dp0"
 set "MINER=%RELEASE_DIR%keryx-miner-rdna3.exe"
 
-REM The miner runs from target\release, next to its models and ipfs.exe. If cargo builds
-REM elsewhere (a target dir set in .cargo\config.toml or CARGO_TARGET_DIR, e.g. a short path for
-REM MSVC), ask cargo where, and copy a newer build in on every (re)start. Skipped when cargo is
-REM not installed or builds into target\ itself.
+REM Source checkout only: if cargo builds elsewhere (a target dir set in .cargo\config.toml or
+REM CARGO_TARGET_DIR, e.g. a short path for MSVC), ask cargo where, and copy a newer build in on
+REM every (re)start. Skipped in a release package, when cargo is not installed, or when it builds
+REM into target\ itself.
 set "BUILT="
-for /f "usebackq delims=" %%d in (`powershell -NoProfile -Command "try { $t = (cargo metadata --format-version 1 --no-deps 2>$null | ConvertFrom-Json).target_directory; if ($t) { [IO.Path]::GetFullPath($t) } } catch {}"`) do set "BUILT=%%d\release\keryx-miner-rdna3.exe"
+if exist "%~dp0Cargo.toml" for /f "usebackq delims=" %%d in (`powershell -NoProfile -Command "try { $t = (cargo metadata --format-version 1 --no-deps 2>$null | ConvertFrom-Json).target_directory; if ($t) { [IO.Path]::GetFullPath($t) } } catch {}"`) do set "BUILT=%%d\release\keryx-miner-rdna3.exe"
 if /i "%BUILT%"=="%MINER%" set "BUILT="
 
 call :sync_build
 if not exist "%MINER%" (
-    echo ERROR: miner binary not found at:
-    echo   %MINER%
-    echo Build it first:  cargo build --release
+    echo ERROR: keryx-miner-rdna3.exe is neither next to this file nor in target\release.
+    echo From a source checkout, build it first:  cargo build --release
     echo.
     pause
     exit /b 1
