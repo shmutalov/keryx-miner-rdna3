@@ -47,10 +47,10 @@ REM Cap each inference request at 32K tokens. The model allows 64K, which fits t
 REM 7900 XT with only ~0.3 GiB of VRAM to spare.
 set KERYX_LLAMA_CTX=32768
 
-REM --- Telegram notifications (optional): copy telegram.conf.example to telegram.conf
-REM     next to this file and fill in the bot token and chat id (README, "Telegram
-REM     notifications"). Alerts arrive on their own; send /stats to the bot for numbers.
-REM     telegram.conf is git-ignored. ---
+REM --- Telegram bot (optional): copy telegram.conf.example to telegram.conf next to
+REM     this file and fill in the bot token and chat id (README, "Telegram bot"). Alerts
+REM     arrive on their own; send /stats to the bot for numbers. telegram.conf is
+REM     git-ignored. ---
 
 REM ----------------------------------------------------------------------------
 cd /d "%~dp0"
@@ -83,7 +83,7 @@ echo.
 
 :run
 call :sync_build
-"%MINER%" --mining-address "%MINING_ADDRESS%" --keryxd-address "%POOL%" --worker "%WORKER%" --high --h15-tier light
+"%MINER%" --mining-address "%MINING_ADDRESS%" --keryxd-address "%POOL%" --worker "%WORKER%" --light --h15-tier light
 
 echo.
 echo Miner exited (code %errorlevel%). Restarting in 5s -- close this window to stop.
