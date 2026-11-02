@@ -453,16 +453,19 @@ impl MinerManager {
                             task_state = None;
                         }
                         // The template as mined: with its task root once the block task applies.
-                        let (pph, time, target_le) = {
+                        let (pph, time, target_le, nonce_mask, nonce_fixed) = {
                             let s: &pow::State = task_state.as_ref().map_or(state.as_ref().unwrap(), |ts| &ts.2);
                             let mut pph = [0u8; 32];
                             pph.copy_from_slice(&s.pow_hash_header[0..32]);
                             let time = u64::from_le_bytes(s.pow_hash_header[32..40].try_into().unwrap());
-                            (pph, time, s.target.to_le_bytes())
+                            (pph, time, s.target.to_le_bytes(), s.nonce_mask, s.nonce_fixed)
                         };
                         let batch = keryx_miner::pom_gpu::v4_batch();
-                        let found = keryx_miner::pom_gpu::mine_v4(pom_device, &pph, time, &target_le, pom_nonce, batch, daa);
-                        pom_nonce = pom_nonce.wrapping_add(batch);
+                        // The walk kernel grinds a plain run of nonces and ignores the pool's extranonce,
+                        // so keep the whole run inside the sub-range the pool assigned to this miner.
+                        let start = keryx_miner::pom_gpu::pom_batch_start(pom_nonce, batch, nonce_mask, nonce_fixed);
+                        let found = keryx_miner::pom_gpu::mine_v4(pom_device, &pph, time, &target_le, start, batch, daa);
+                        pom_nonce = start.wrapping_add(batch);
                         hashes_tried.fetch_add(batch, Ordering::AcqRel);
                         worker_hashes_tried.fetch_add(batch, Ordering::AcqRel);
                         if let Some(nonce) = found {

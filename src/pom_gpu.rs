@@ -214,6 +214,24 @@ pub fn v4_batch() -> u64 {
     })
 }
 
+/// First nonce of the next PoM batch of `batch` nonces: `cursor` confined to the nonce sub-range a
+/// pool assigns (`nonce_mask` = the bits the miner may vary, `nonce_fixed` = the extranonce bits the
+/// pool requires on every share). The PoM kernel grinds the plain run `[start, start + batch)`, so
+/// unlike kHeavyHash it cannot apply the mask itself: the whole run has to lie inside the sub-range
+/// or the pool rejects the share ("extranonce mismatch") and drops the connection. A cursor too close
+/// to the end of the sub-range restarts at its beginning. Solo mining (`nonce_mask == u64::MAX`) uses
+/// the full nonce space, so the cursor is returned as is.
+pub fn pom_batch_start(cursor: u64, batch: u64, nonce_mask: u64, nonce_fixed: u64) -> u64 {
+    if nonce_mask == u64::MAX {
+        return cursor;
+    }
+    let mut free = cursor & nonce_mask;
+    if nonce_mask.checked_sub(batch.saturating_sub(1)).is_none_or(|last_start| free > last_start) {
+        free = 0;
+    }
+    free | (nonce_fixed & !nonce_mask)
+}
+
 /// Runs `log` at most once every 30 s per device and `kind`.
 pub fn log_throttled(device_id: u32, kind: &'static str, log: impl FnOnce()) {
     static LAST: OnceLock<Mutex<HashMap<(u32, &'static str), std::time::Instant>>> = OnceLock::new();
@@ -509,4 +527,43 @@ fn install_shared(idx: &'static crate::pom::WeightIndex, model_id: &[u8; 32]) ->
         walk.v4_kernel()
     );
     Ok(Resident::Shared { walk: Arc::new(walk), _engine: engine })
+}
+
+#[cfg(test)]
+mod nonce_range_tests {
+    use super::pom_batch_start;
+
+    const EXTRA_0003: u64 = 0x0003 << 48;
+    const MASK_48: u64 = (1 << 48) - 1;
+
+    #[test]
+    fn solo_keeps_the_whole_nonce_space() {
+        assert_eq!(pom_batch_start(0xdead_beef_0123_4567, 1 << 15, u64::MAX, 0), 0xdead_beef_0123_4567);
+    }
+
+    #[test]
+    fn pool_extranonce_lands_in_bits_48_to_64() {
+        let start = pom_batch_start(0xdead_beef_0123_4567, 1 << 15, MASK_48, EXTRA_0003);
+        assert_eq!(start >> 48, 0x0003);
+        assert_eq!(start & MASK_48, 0xbeef_0123_4567);
+    }
+
+    #[test]
+    fn whole_batch_stays_in_the_sub_range() {
+        let batch = 1u64 << 15;
+        // A cursor a few nonces short of the end of the sub-range: the run would carry into the
+        // extranonce bits, so it restarts at the beginning.
+        let start = pom_batch_start(MASK_48 - 10, batch, MASK_48, EXTRA_0003);
+        assert_eq!(start, EXTRA_0003);
+        // The last start that still fits keeps its place.
+        let last = MASK_48 - (batch - 1);
+        let start = pom_batch_start(last, batch, MASK_48, EXTRA_0003);
+        assert_eq!(start, EXTRA_0003 | last);
+        assert_eq!((start + batch - 1) >> 48, 0x0003);
+    }
+
+    #[test]
+    fn a_batch_wider_than_the_sub_range_starts_at_zero() {
+        assert_eq!(pom_batch_start(5, 1 << 20, 0xffff, 0xab << 16), 0xab << 16);
+    }
 }
