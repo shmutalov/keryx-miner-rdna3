@@ -359,8 +359,8 @@ automatically at every start.)
 
 ## Status & limitations
 
-- ✅ **Mainnet past H15** (keryx-node v1.6.6): suprnova accepts the miner as `keryx-miner-supr/0.15.5`
-  and its shares; on a 7900 XT tier 1 (GLM-4-9B) mines at about 1.6 M nonces/s with the v5 pad.
+- ✅ **Mainnet past H15** (keryx-node v1.6.6): suprnova accepted the miner (tested as
+  `keryx-miner-supr/0.15.5`) and its shares; on a 7900 XT tier 1 (GLM-4-9B) mines at about 1.6 M nonces/s with the v5 pad.
 - ✅ **Traced answers** pass the node's own verifier on the GPU: the self-check (trace, then its
   openings under two seeds) passes for tiers 0, 1 and 3. End to end, traced pool answers and their
   openings were tested against a stand-in pool speaking suprnova's protocol.
@@ -381,7 +381,7 @@ automatically at every start.)
   each miss is a service strike ([details](#consensus-this-build-mines)). Mine through a pool.
 - ⚠️ **Pool version gate:** suprnova refuses miners that don't advertise a recent enough
   `keryx-miner-supr` version (the floor moves with each hardfork — `0.7.0+` at H4, `0.12.0+` at
-  H10, `0.14.0+` at H14, above `0.15.1` at H15). This fork advertises `0.15.5` and subscribes as
+  H10, `0.14.0+` at H14, above `0.15.1` at H15). This fork advertises `0.15.8` and subscribes as
   `keryx-stratum-v3`. Single string in `client/stratum.rs`.
 - ⚠️ **Known benign:** an occasional panic in `MinerManager`'s shutdown/reconnect path (a worker
   thread exits before the drop-time join) — harmless under a supervised restart loop; a clean-up
