@@ -1,13 +1,15 @@
-if [ "$#" -ne "2" ]
+if [ "$#" -ne "2" ] && [ "$#" -ne "3" ]
   then
-    echo "No arguments supplied. Call using createmanifest.sh <VERSION_NUMBER> <MINER BINARY NAME>"
+    echo "No arguments supplied. Call using createmanifest.sh <VERSION_NUMBER> <MINER BINARY NAME> [<MINER NAME>]"
     exit
 fi
+# Miner (package) name: keryx-miner-rdna3, or keryx-miner-rdna3-noavx for the plain x86-64 build.
+name="${3:-keryx-miner-rdna3}"
 cat > h-manifest.conf << EOF
 # The name of the miner (rdna3 fork: distinct from the official "keryx-miner" so it installs into
 # its OWN /hive/miners/custom/keryx-miner-rdna3 folder and never inherits the official miner's
 # leftover CUDA/OpenCL plugin .so files).
-CUSTOM_NAME=keryx-miner-rdna3
+CUSTOM_NAME=$name
 
 # Optional version of your custom miner package
 CUSTOM_VERSION=$1

@@ -340,6 +340,47 @@ fn tokio_blocking_threads() -> Option<usize> {
         .map(|n| n.clamp(2, 64))
 }
 
+/// CPU variant of a release build: "avx2" or "noavx" (set by deploy.yaml next to the GGML_*
+/// switches that pick ggml's CPU instruction set). None for local builds.
+const CPU_VARIANT: Option<&str> = option_env!("KERYX_CPU_VARIANT");
+
+/// The avx2 release build compiles ggml's CPU backend with AVX2 + FMA + F16C + BMI2 (MSVC:
+/// /arch:AVX2). On a CPU without them (Celeron/Pentium) it dies with 0xC000001D (illegal
+/// instruction) as soon as llama.cpp initializes, with nothing in the log to explain why. Refuse
+/// to start instead, and name the build that runs on this CPU.
+#[cfg(target_arch = "x86_64")]
+fn check_cpu_variant() -> Result<(), Error> {
+    if CPU_VARIANT != Some("avx2") {
+        return Ok(());
+    }
+    let missing: Vec<&str> = [
+        ("sse4.2", is_x86_feature_detected!("sse4.2")),
+        ("avx", is_x86_feature_detected!("avx")),
+        ("avx2", is_x86_feature_detected!("avx2")),
+        ("fma", is_x86_feature_detected!("fma")),
+        ("f16c", is_x86_feature_detected!("f16c")),
+        ("bmi2", is_x86_feature_detected!("bmi2")),
+    ]
+    .into_iter()
+    .filter_map(|(name, present)| (!present).then_some(name))
+    .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    error!(
+        "This build needs a CPU with AVX2; this one lacks {}. Download the -noavx build of the same release \
+         (win64: keryx-miner-<version>-win64-amd64-noavx.zip, linux: ...-linux-amd64-noavx.tgz, HiveOS: \
+         keryx-miner-rdna3-noavx-<version>.tgz). It mines and serves AI just as fast: all inference runs on the GPU.",
+        missing.join(", ")
+    );
+    Err(format!("CPU lacks {} required by the avx2 build", missing.join(", ")).into())
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn check_cpu_variant() -> Result<(), Error> {
+    Ok(())
+}
+
 fn main() -> Result<(), Error> {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.worker_threads(tokio_worker_threads()).enable_all();
@@ -384,6 +425,7 @@ async fn run() -> Result<(), Error> {
         std::env::set_var("KERYX_LOG_AI", file);
     }
     env_logger::builder().filter_level(opt.log_level()).parse_default_env().init();
+    check_cpu_variant()?;
     if let Some(path) = keryx_miner::slm::ai_log_path() {
         warn!(
             "AI log on (--log-ai / KERYX_LOG_AI): every inference prompt and answer, private requests included, is appended to {}",
@@ -394,7 +436,11 @@ async fn run() -> Result<(), Error> {
     // SIGTERM, which previously had no handler and required SIGKILL.
     spawn_shutdown_handler();
     info!("=================================================================================");
-    info!("              Keryx-Miner-RDNA3 GPU {}", env!("CARGO_PKG_VERSION"));
+    info!(
+        "              Keryx-Miner-RDNA3 GPU {}{}",
+        env!("CARGO_PKG_VERSION"),
+        CPU_VARIANT.map(|v| format!(" ({v})")).unwrap_or_default()
+    );
     info!(" Mining for: {}", opt.mining_address.as_deref().unwrap_or("(recovery mode)"));
     info!("=================================================================================");
     if let Ok(dir) = std::env::var("KERYX_MODELS_DIR") {

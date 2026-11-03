@@ -18,11 +18,35 @@ permissions:
 # older Hive images can't run this fork anyway. Building on newer runners than 22.04 would still
 # break rigs with "GLIBC_2.3x not found".
 
+# Two CPU variants per OS (matrix `cpu`):
+#   avx2  — ggml's CPU backend with SSE4.2 + AVX + AVX2 + FMA + F16C + BMI2 (MSVC: /arch:AVX2),
+#           what ggml defaults to with GGML_NATIVE off. Unsuffixed asset names, as before.
+#   noavx — plain x86-64 (`-noavx` assets). Celeron/Pentium rigs have no AVX and the avx2 build
+#           died there with 0xC000001D (illegal instruction) the moment llama.cpp initialized.
+# All inference runs on the GPU (no CPU layers), so both are equally fast. llama-cpp-sys-2's
+# build.rs forwards GGML_* env vars to CMake; it only turns these ON itself when rustc's target
+# features include them, which the default x86_64 targets don't. KERYX_CPU_VARIANT is baked into
+# the binary (option_env!): the avx2 build refuses to start on a CPU that lacks those features and
+# names the -noavx build instead. Values quoted: bare ON/OFF are YAML 1.1 booleans.
+
 jobs:
   build-windows:
-    name: Build windows
+    name: Build windows (${{ matrix.cpu }})
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { cpu: avx2, simd: "ON", suffix: "" }
+          - { cpu: noavx, simd: "OFF", suffix: "-noavx" }
     env:
+      KERYX_CPU_VARIANT: ${{ matrix.cpu }}
+      GGML_SSE42: ${{ matrix.simd }}
+      GGML_AVX: ${{ matrix.simd }}
+      GGML_AVX2: ${{ matrix.simd }}
+      GGML_FMA: ${{ matrix.simd }}
+      GGML_F16C: ${{ matrix.simd }}
+      GGML_BMI2: ${{ matrix.simd }}
       # Fetch git deps with the git CLI (honours core.longpaths for the llama.cpp submodule).
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
       # Short target dir: ggml's nested vulkan-shaders-gen TryCompile paths exceed MAX_PATH
@@ -66,7 +90,7 @@ jobs:
         run: |
           cargo build --release --bin keryx-miner-rdna3
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          $asset = "keryx-miner-$env:TAG-win64-amd64"
+          $asset = "keryx-miner-$env:TAG-win64-amd64${{ matrix.suffix }}"
           New-Item -ItemType Directory $asset | Out-Null
           Copy-Item "$env:CARGO_TARGET_DIR/release/keryx-miner-rdna3.exe" $asset/
           foreach ($f in @('start-miner.bat', 'README.md', 'telegram.conf.example')) { if (Test-Path $f) { Copy-Item $f $asset/ } }
@@ -76,7 +100,7 @@ jobs:
       - name: Upload artifacts (always)
         uses: actions/upload-artifact@v7
         with:
-          name: windows-assets
+          name: windows-assets-${{ matrix.cpu }}
           path: keryx-miner-*.zip
 
       - name: Attach to release
@@ -86,15 +110,28 @@ jobs:
           files: keryx-miner-*.zip
 
   build-linux:
-    name: Build linux + hiveos
+    name: Build linux + hiveos (${{ matrix.cpu }})
     runs-on: ubuntu-latest
     # glibc 2.35 floor — matches the 22.04-based HiveOS images RDNA3 rigs run.
     container: ubuntu:22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { cpu: avx2, simd: "ON", suffix: "" }
+          - { cpu: noavx, simd: "OFF", suffix: "-noavx" }
     defaults:
       run:
         shell: bash
     env:
       DEBIAN_FRONTEND: noninteractive
+      KERYX_CPU_VARIANT: ${{ matrix.cpu }}
+      GGML_SSE42: ${{ matrix.simd }}
+      GGML_AVX: ${{ matrix.simd }}
+      GGML_AVX2: ${{ matrix.simd }}
+      GGML_FMA: ${{ matrix.simd }}
+      GGML_F16C: ${{ matrix.simd }}
+      GGML_BMI2: ${{ matrix.simd }}
     steps:
       - name: Install system toolchain
         run: |
@@ -147,7 +184,7 @@ jobs:
         run: |
           set -euxo pipefail
           cargo build --release --bin keryx-miner-rdna3
-          asset="keryx-miner-${TAG}-linux-amd64"
+          asset="keryx-miner-${TAG}-linux-amd64${{ matrix.suffix }}"
           mkdir "$asset"
           cp target/release/keryx-miner-rdna3 "$asset/"
           cp README.md telegram.conf.example "$asset/" 2>/dev/null || true
@@ -169,16 +206,19 @@ jobs:
       # process (inference in-process, PoM walk over shared weights) — no llama-server child for
       # h-run.sh to manage. Bundles the Vulkan loader; needs a Vulkan-capable amdgpu driver ICD
       # (h-config.sh installs mesa-vulkan-drivers if none is present).
+      # The noavx variant is its own miner name, keryx-miner-rdna3-noavx (file
+      # keryx-miner-rdna3-noavx-<ver>.tgz, folder keryx-miner-rdna3-noavx/), so the naming rule
+      # above holds; the binary inside keeps its name, and both share /hive/miners/custom/models.
       - name: Package HiveOS flightsheet
         run: |
           set -euxo pipefail
-          pkg="keryx-miner-rdna3"
+          pkg="keryx-miner-rdna3${{ matrix.suffix }}"
           # Bare numeric version: strip the leading "v" AND the "-rdna3" tag suffix. The suffix in
           # the filename re-broke the installer's name derivation for v0.3.19 (it derived
           # "keryx-miner-rdna3-0.3.19" from "keryx-miner-rdna3-0.3.19-rdna3.tgz") — the version
           # MUST be the last dash-segment of the filename, with nothing after it.
           ver="${TAG#v}"; ver="${ver%-rdna3}"
-          ( cd integrations/hiveos && bash createmanifest.sh "$ver" keryx-miner-rdna3 )
+          ( cd integrations/hiveos && bash createmanifest.sh "$ver" keryx-miner-rdna3 "$pkg" )
           mkdir -p "$pkg"
           cp integrations/hiveos/h-config.sh \
              integrations/hiveos/h-run.sh \
@@ -192,12 +232,12 @@ jobs:
           # this is found even on HiveOS images without libvulkan1 (or with broken apt).
           cp -L /usr/lib/x86_64-linux-gnu/libvulkan.so.1 "$pkg/"
           chmod +x "$pkg"/*.sh "$pkg/keryx-miner-rdna3"
-          tar czvf "keryx-miner-rdna3-${ver}.tgz" "$pkg"
+          tar czvf "${pkg}-${ver}.tgz" "$pkg"
 
       - name: Upload artifacts (always)
         uses: actions/upload-artifact@v7
         with:
-          name: linux-assets
+          name: linux-assets-${{ matrix.cpu }}
           path: |
             keryx-miner-*.tgz
 

@@ -42,6 +42,12 @@ real GPU (`cargo test -p keryx-vulkan`).
 **Run:**
 - An AMD RDNA3 GPU + recent driver (the Vulkan runtime loader `vulkan-1` ships with the AMD
   Adrenalin / Mesa RADV driver — no Vulkan SDK needed at runtime).
+- Any x86-64 CPU, but pick the matching release build. The default assets need **AVX2** (Intel
+  Core 4th gen / Haswell and newer, any AMD Ryzen). Rigs with a **Celeron or Pentium** (no AVX)
+  take the `-noavx` assets: `…-win64-amd64-noavx.zip`, `…-linux-amd64-noavx.tgz`, or the HiveOS
+  package `keryx-miner-rdna3-noavx-<version>.tgz`. Both are equally fast, since all inference runs
+  on the GPU. The AVX2 build exits with a message naming the `-noavx` build when the CPU lacks
+  AVX2.
 
 ---
 
