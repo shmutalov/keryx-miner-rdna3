@@ -261,7 +261,7 @@ impl State {
             // v5 (H15): the walk also reads the tier's context pad, seeded by the mined model.
             let pad = if self.daa_score >= pom::pom_v5_activation_daa() {
                 let model_id = keryx_miner::pom_gpu::mining_model(self.daa_score)?.model_id;
-                let n = keryx_miner::pom_v5::POM_V5_PAD_TILES_H14.get(tier as usize).copied().filter(|n| *n > 0)?;
+                let n = Some(keryx_miner::pom_v5::pom_v5_pad_tiles(tier, self.daa_score)).filter(|n| *n > 0)?;
                 Some((keryx_miner::pom_v5::v5_pad_seed(tier, &model_id, &index.r_t), n))
             } else {
                 None

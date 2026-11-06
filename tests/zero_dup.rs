@@ -7,7 +7,7 @@
 
 use keryx_miner::llm_engine::LlamaEngine;
 use keryx_miner::pom::{pom_block_seed_v4_era, pom_pow_value, pom_seed_state_v4_era, pph_words_for_era, pph_words_v4, WeightIndex};
-use keryx_miner::pom_v5::{v5_pad_seed, v5_pad_seed_words, walk_final_v5, POM_V5_PAD_TILES_H14};
+use keryx_miner::pom_v5::{pom_v5_pad_tiles, v5_pad_seed, v5_pad_seed_words, walk_final_v5};
 use keryx_vulkan::pom_walk::{words4, PomWalkGpu};
 use keryx_vulkan::pom_walk_v4::V4Job;
 
@@ -142,13 +142,14 @@ fn shared_walk_matches_streamed_blob() {
 
     // 6c. PoM v5 (H15): the v4 walk over the weights and the tier's context pad (filled on the
     //     device of each walk), shared vs blob, each winner confirmed by the host walk over the
-    //     GGUF: it passes and no nonce before it does. KERYX_TEST_TIER (default 0) picks the pad;
-    //     the model id is tier 0's. The two walks hold their pads in turn: with this test's second
-    //     weight copy, two tier-1 pads would not fit a 20 GB card (the miner holds one of each).
+    //     GGUF: it passes and no nonce before it does. KERYX_TEST_TIER (default 0) picks the pad,
+    //     at its current (H16) size like the seed era; the model id is tier 0's. The two walks
+    //     hold their pads in turn: with this test's second weight copy, two tier-1 pads would not
+    //     fit a 20 GB card (the miner holds one of each).
     let tier: usize = std::env::var("KERYX_TEST_TIER").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let pad_seed = v5_pad_seed(tier as u8, &keryx_miner::models::QWEN3_5_9B_ABLITERATED.model_id, &idx.r_t);
     let pad_words = v5_pad_seed_words(&pad_seed);
-    let pad_tiles = POM_V5_PAD_TILES_H14[tier];
+    let pad_tiles = pom_v5_pad_tiles(tier as u8, u64::MAX);
     let ts5: u64 = 1_790_000_000_000;
     let v5_job = |target_le: [u8; 32]| V4Job {
         pow_words: pph_words_for_era(&pph, true),
@@ -220,7 +221,7 @@ fn shared_walk_rate() {
     let engine = LlamaEngine::launch(&gguf).expect("engine launch");
     let (shared, _) = engine.build_shared_walk().expect("shared walk");
     let pad_words = v5_pad_seed_words(&[0x3cu8; 32]);
-    let pad_tiles = POM_V5_PAD_TILES_H14[tier];
+    let pad_tiles = pom_v5_pad_tiles(tier as u8, u64::MAX);
     let pph = [0x5au8; 32];
     let ts: u64 = 1_790_000_000_000;
     let job = V4Job {

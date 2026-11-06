@@ -1442,6 +1442,10 @@ pub fn is_testnet() -> bool {
 pub const H15_ACTIVATION_DAA: u64 = 140_115_000;
 /// Testnet H15 gate. MUST equal the node's `TESTNET_H15_ACTIVATION_DAA`.
 const TESTNET_H15_ACTIVATION_DAA: u64 = 3_500;
+/// Mainnet H16 gate. MUST equal the node's `H16_ACTIVATION_DAA`.
+pub const H16_ACTIVATION_DAA: u64 = 147_000_000;
+/// Testnet H16 gate. MUST equal the node's `TESTNET_H16_ACTIVATION_DAA`.
+const TESTNET_H16_ACTIVATION_DAA: u64 = 180_000;
 
 /// Picks the gate value for the selected network (`--testnet`).
 #[inline(always)]
@@ -1550,6 +1554,13 @@ pub fn pom_v4_activation_daa() -> u64 {
 /// Node `pom_v5_activation`: the walk also reads the tier's context pad.
 pub fn pom_v5_activation_daa() -> u64 {
     gate(H15_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA)
+}
+
+/// Node `pad_margin_activation` (H16): from this DAA the context pad of every tier is 200 MiB
+/// smaller (`pom_v5::POM_V5_PAD_TILES_H16`). MUST equal the node's gate: mainnet 147_000_000,
+/// testnet 180_000.
+pub fn pad_margin_activation_daa() -> u64 {
+    gate(H16_ACTIVATION_DAA, TESTNET_H16_ACTIVATION_DAA)
 }
 
 /// Block task gate: headers carry `task_root`, hashed into the pre-PoW and block hashes.
@@ -2300,6 +2311,21 @@ mod tests {
         let proof =
             build_proof_v2(0, &pph, seed, idx.n_chunks, 256, |o| idx.read_chunk(o), |o| idx.merkle_path(o), true, true);
         assert!(verify_proof_v2(&proof, &pph, seed, idx.n_chunks, 256, &idx.r_t, &[0xff; 32], true, true));
+    }
+}
+
+#[cfg(test)]
+mod h16_gate_tests {
+    use super::*;
+
+    #[test]
+    fn h16_gates_match_the_node() {
+        assert!(!is_testnet());
+        assert_eq!(pad_margin_activation_daa(), H16_ACTIVATION_DAA);
+        assert_eq!(H16_ACTIVATION_DAA, 147_000_000);
+        assert!(H16_ACTIVATION_DAA > H15_ACTIVATION_DAA);
+        assert_eq!(TESTNET_H16_ACTIVATION_DAA, 180_000);
+        assert!(TESTNET_H16_ACTIVATION_DAA > TESTNET_H15_ACTIVATION_DAA);
     }
 }
 

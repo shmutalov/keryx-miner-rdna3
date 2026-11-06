@@ -254,7 +254,7 @@ fn v5_pad(daa: u64) -> Option<([u64; 4], u64)> {
     let spec = mining_model(daa)?;
     let tier = crate::models::pom_tier_index(&spec.model_id, daa)?;
     let index = crate::pom::index_for(&spec.model_id)?;
-    let tiles = crate::pom_v5::POM_V5_PAD_TILES_H14.get(tier as usize).copied().filter(|&n| n > 0)?;
+    let tiles = Some(crate::pom_v5::pom_v5_pad_tiles(tier, daa)).filter(|&n| n > 0)?;
     let seed = crate::pom_v5::v5_pad_seed(tier, &spec.model_id, &index.r_t);
     Some((crate::pom_v5::v5_pad_seed_words(&seed), tiles))
 }

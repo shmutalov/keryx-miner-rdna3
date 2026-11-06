@@ -9,8 +9,9 @@ inference (OPoI — Optimistic Proof of Inference).
 > with Vulkan and runs the OPoI models on **llama.cpp (Vulkan), linked into the miner**, so it
 > builds and runs on an AMD-only host.
 
-Current release: mines the **H15** consensus (keryx-node v1.6.6, live on mainnet since DAA
-140,115,000 on 2026-10-30) and serves **traced AI answers through a pool**. It can report to a
+Current release: mines the **H15** consensus (live on mainnet since DAA 140,115,000 on 2026-10-30)
+and the **H16** gate after it (keryx-node v1.6.7, mainnet DAA 147,000,000), and serves **traced AI
+answers through a pool**. It can report to a
 **[Telegram bot](#telegram-bot)**: alerts as they happen, stats on `/stats`.
 
 ---
@@ -108,7 +109,7 @@ for the era before the gate. The v5 walk runs at about 1.6 M nonces/s on a 7900 
 
 ### Consensus this build mines
 
-The rules of **keryx-node v1.6.6**. **PoM v5** (H15, below) builds on the v4 matrix walk (the D=32
+The rules of **keryx-node v1.6.7**. **PoM v5** (H15, below) builds on the v4 matrix walk (the D=32
 re-walk, mainnet DAA 79,210,000) with the **H10 keccak walk seed** (mainnet DAA 87,360,000; both
 from DAA 1 on testnet), taken since **H14** (private inference, mainnet DAA 121,985,000; testnet
 6,000) over the H14-tagged pre-PoW hash. Each nonce walks a 32×32 int8 state through 256 chained
@@ -162,6 +163,16 @@ rules of keryx-node v1.6.6:
   and every member that does not answer in time takes a service strike, at most one an hour: 5 escrow
   claims burned, then all pending escrow, then a 24 h suspension of the miner cut (blocks stay valid
   but pay nothing). Mine through a pool: the pool is the cohort identity there, and answers for it.
+
+**H16 (mainnet DAA 147,000,000; testnet 180,000)** — keryx-node v1.6.7. The one mining change: the
+context pad of every tier shrinks by 200 MiB (204,800 tiles; tier 0 624 → 424 MiB, tier 1
+3,138 → 2,938 MiB, tier 3 6,320 → 6,120 MiB). The pad seed, the walk and the proof stay the same,
+but the pad size sets the walk's offsets, so a block on the wrong table is invalid. Each job takes
+the table of its own DAA score (a job below the gate still walks the old pad), and the GPU refills
+the pad when the size changes. The rest of H16 is service-ledger accounting in the node (where
+suspensions are judged, one strike per request, a uniform strike ladder, untraced answers on an
+audited tier not serving their request, audit deadlines extended while a key keeps serving) and
+new solo request-status RPCs, which this build does not use.
 
 ### Solo mining: escrow delegation cert (required since H6)
 
@@ -387,7 +398,7 @@ automatically at every start.)
   each miss is a service strike ([details](#consensus-this-build-mines)). Mine through a pool.
 - ⚠️ **Pool version gate:** suprnova refuses miners that don't advertise a recent enough
   `keryx-miner-supr` version (the floor moves with each hardfork — `0.7.0+` at H4, `0.12.0+` at
-  H10, `0.14.0+` at H14, above `0.15.1` at H15). This fork advertises `0.15.8` and subscribes as
+  H10, `0.14.0+` at H14, above `0.15.1` at H15). This fork advertises `0.16.0` (supr's H16 release) and subscribes as
   `keryx-stratum-v3`. Single string in `client/stratum.rs`.
 - ⚠️ **Known benign:** an occasional panic in `MinerManager`'s shutdown/reconnect path (a worker
   thread exits before the drop-time join) — harmless under a supervised restart loop; a clean-up

@@ -17,6 +17,16 @@ pub const POM_V5_TILE_ENTRIES: u64 = (POM_V4_TILE_BYTES / POM_V5_P_ENTRY_BYTES) 
 pub const POM_V5_P_ROUNDS: u32 = 1_920;
 /// Context pad tiles of each H14 tier; 0 = no pad. Mirror of the node's `POM_V5_PAD_TILES_H14`.
 pub const POM_V5_PAD_TILES_H14: [u64; 5] = [638_976, 3_213_312, 4_804_608, 6_471_680, 2_450_432];
+/// Context pad tiles of each H14 tier from the node's `pad_margin_activation` (H16): 204_800 tiles
+/// (200 MiB) fewer each. Mirror of the node's `POM_V5_PAD_TILES_H16`.
+pub const POM_V5_PAD_TILES_H16: [u64; 5] = [434_176, 3_008_512, 4_599_808, 6_266_880, 2_245_632];
+
+/// Context pad tiles of `tier` for a block at `daa`; 0 = no pad. Follows each block's own DAA, so
+/// a job below the H16 gate (an old job, a reorg) still walks the H14 pad.
+pub fn pom_v5_pad_tiles(tier: u8, daa: u64) -> u64 {
+    let table = if daa >= crate::pom::pad_margin_activation_daa() { &POM_V5_PAD_TILES_H16 } else { &POM_V5_PAD_TILES_H14 };
+    table.get(tier as usize).copied().unwrap_or(0)
+}
 
 const PAD_DOMAIN: &[u8] = b"KERYX-POM-V5-PAD";
 /// IV folded into the pad seed words.
@@ -243,5 +253,26 @@ mod tests {
         let (proof, fs) = build_proof_v5(1, 0x55AA, &index, &seed, 61).unwrap();
         assert_eq!(fs, 5_477_356_865_520_795_736);
         assert_eq!(verify_proof_v5(0x55AA, &proof, &index.r_t, index.n_chunks, &seed, 61).unwrap(), fs);
+    }
+
+    #[test]
+    fn pad_tables_are_frozen() {
+        assert_eq!(POM_V5_PAD_TILES_H14, [638_976, 3_213_312, 4_804_608, 6_471_680, 2_450_432]);
+        assert_eq!(POM_V5_PAD_TILES_H16, [434_176, 3_008_512, 4_599_808, 6_266_880, 2_245_632]);
+        for t in 0..POM_V5_PAD_TILES_H14.len() {
+            assert_eq!(POM_V5_PAD_TILES_H16[t], POM_V5_PAD_TILES_H14[t] - 204_800);
+            assert!(POM_V5_PAD_TILES_H16[t] > 0);
+        }
+    }
+
+    #[test]
+    fn pad_tiles_switch_at_the_gate() {
+        let gate = crate::pom::pad_margin_activation_daa();
+        assert!(gate > crate::pom::pom_v5_activation_daa());
+        for t in 0..POM_V5_PAD_TILES_H14.len() {
+            assert_eq!(pom_v5_pad_tiles(t as u8, gate - 1), POM_V5_PAD_TILES_H14[t]);
+            assert_eq!(pom_v5_pad_tiles(t as u8, gate), POM_V5_PAD_TILES_H16[t]);
+        }
+        assert_eq!(pom_v5_pad_tiles(POM_V5_PAD_TILES_H14.len() as u8, gate), 0);
     }
 }
