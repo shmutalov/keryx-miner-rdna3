@@ -1213,7 +1213,12 @@ pub fn open_trace(
     let tm = trace_manifest(tier, attention).ok()?;
     let (_, pctx) = chain_ctx(tier)?;
     match open_pieces(&engine, &tm, &pctx, trace, seed, request_hash, response_txid, index, n_ctx) {
-        Ok(bodies) => Some(crate::trace_seq::bundle(&bodies)),
+        Ok(bodies) => {
+            if let Some(p) = bodies.iter().find_map(|b| attn_partials(b)) {
+                keep_partials(phase_key(&response_txid, seed, &[]), p);
+            }
+            Some(crate::trace_seq::bundle(&bodies))
+        }
         Err(e) => {
             log::warn!("SlmEngine '{}': stage-2 opening failed ({e})", spec.name);
             None
@@ -1221,8 +1226,45 @@ pub fn open_trace(
     }
 }
 
-/// The attention phase of `path` of an audited response, `prev` the partials of its previous
-/// phase; `None` when it cannot be built.
+/// Partials of the attention phases this rig built, by (response, seed, path). The next phase of
+/// a draw starts from its parent's partials, which a pool may not send back (upstream keryx-miner
+/// v0.6.0 never does), so the rig keeps them instead of replaying the draw from its first phase.
+static PHASE_PARTIALS: Mutex<std::collections::VecDeque<(Vec<u8>, Vec<u8>)>> = Mutex::new(std::collections::VecDeque::new());
+/// Phases kept: a few draws of a few levels each, for every answer still under audit.
+const PHASE_PARTIALS_KEPT: usize = 256;
+
+fn phase_key(response_txid: &[u8; 32], seed: &[u8; 32], path: &[u64]) -> Vec<u8> {
+    let mut k = Vec::with_capacity(64 + 8 * path.len());
+    k.extend_from_slice(response_txid);
+    k.extend_from_slice(seed);
+    path.iter().for_each(|p| k.extend_from_slice(&p.to_le_bytes()));
+    k
+}
+
+/// The partials an attention body carries for its next phase; None for a leaf or another piece.
+fn attn_partials(body: &[u8]) -> Option<Vec<u8>> {
+    use keryx_verifiable_inference::opening::{inner_body, AttnOpening};
+    let inner = inner_body(body).unwrap_or_else(|| body.to_vec());
+    AttnOpening::decode(&inner).map(|o| o.partials).filter(|p| !p.is_empty())
+}
+
+fn keep_partials(key: Vec<u8>, partials: Vec<u8>) {
+    let mut kept = PHASE_PARTIALS.lock().unwrap_or_else(|p| p.into_inner());
+    kept.retain(|(k, _)| *k != key);
+    kept.push_back((key, partials));
+    while kept.len() > PHASE_PARTIALS_KEPT {
+        kept.pop_front();
+    }
+}
+
+fn kept_partials(key: &[u8]) -> Option<Vec<u8>> {
+    PHASE_PARTIALS.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|(k, _)| k == key).map(|(_, p)| p.clone())
+}
+
+/// The attention phase of `path` (non-empty) of an audited response, `prev` the partials of its
+/// previous phase; `None` when it cannot be built. With `prev` empty the phases before `path` are
+/// rebuilt from the last one this rig kept, else from the draw's first phase (a full opening of
+/// `request_hash`'s trace), as upstream keryx-miner v0.6.0 does.
 #[allow(clippy::too_many_arguments)]
 pub fn open_attention_phase(
     model_id: &[u8; 32],
@@ -1230,11 +1272,12 @@ pub fn open_attention_phase(
     trace: &crate::trace::ResponseTrace,
     seed: &[u8; 32],
     response_txid: [u8; 32],
+    request_hash: &[u8; 32],
     path: &[u64],
     prev: &[u8],
     max_tokens: u32,
 ) -> Option<Vec<u8>> {
-    if trace.seq.is_none() {
+    if trace.seq.is_none() || path.is_empty() {
         return None;
     }
     let (spec, engine) = engine_for(model_id)?;
@@ -1244,7 +1287,36 @@ pub fn open_attention_phase(
     }
     let index = weight_index(spec)?;
     let tm = trace_manifest(tier, true).ok()?;
-    match open_attention(&engine, &tm, trace, seed, response_txid, index, path, Some(prev), n_ctx) {
+    let key = |p: &[u64]| phase_key(&response_txid, seed, p);
+    let built = (|| -> std::result::Result<Vec<u8>, String> {
+        // The first phase to build, and the partials of the one before it.
+        let (start, mut partials) = if !prev.is_empty() {
+            (path.len(), prev.to_vec())
+        } else if let Some((i, p)) = (0..path.len()).rev().find_map(|i| kept_partials(&key(&path[..i])).map(|p| (i, p))) {
+            (i + 1, p)
+        } else {
+            log::info!("SlmEngine '{}': attention phase {path:?} came without its parent's partials — rebuilding them", spec.name);
+            let (_, pctx) = crate::trace::chain_ctx(tier).ok_or("no stage-2 context")?;
+            let bodies = open_pieces(&engine, &tm, &pctx, trace, seed, request_hash, response_txid, index, n_ctx)?;
+            let p = bodies.iter().find_map(|b| attn_partials(b)).ok_or("the first attention phase is a leaf")?;
+            keep_partials(key(&[]), p.clone());
+            (1, p)
+        };
+        let mut body = Vec::new();
+        for i in start..=path.len() {
+            body = open_attention(&engine, &tm, trace, seed, response_txid, index, &path[..i], Some(&partials), n_ctx)?;
+            match attn_partials(&body) {
+                Some(p) => {
+                    keep_partials(key(&path[..i]), p.clone());
+                    partials = p;
+                }
+                None if i < path.len() => return Err(format!("phase {:?} is a leaf", &path[..i])),
+                None => {}
+            }
+        }
+        Ok(body)
+    })();
+    match built {
         Ok(body) => Some(body),
         Err(e) => {
             log::warn!("SlmEngine '{}': attention phase {path:?} failed ({e})", spec.name);
@@ -1431,6 +1503,8 @@ mod tests {
         engine.trace_configure(tm.raw, 4_096, tm.seq.as_ref()).expect("trace configure");
 
         let prompt = "List three facts about the Moon, one short sentence each. ".repeat(repeat);
+        // KERYX_TEST_NUL=1: NUL bytes in the prompt, which a pool request may carry.
+        let prompt = if std::env::var("KERYX_TEST_NUL").is_ok_and(|v| v == "1") { prompt.replace(". ", ".\0 ") } else { prompt };
         let max_tokens = 40usize;
         let (head, rest) = super::format_prompt_parts(spec.name, &prompt).unwrap();
         let request_hash: [u8; 32] = *blake3::hash(b"many-seeds request").as_bytes();

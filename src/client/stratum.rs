@@ -5,6 +5,11 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// How long an unacknowledged `mining.ai_response` holds off further requests. Without a limit a
+/// pool that never acknowledges one (an id-less reply, a lost line) would get every later request
+/// on the connection refused as busy.
+const AI_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 
@@ -320,8 +325,9 @@ pub struct StratumHandler {
     inference_cache: InferenceCache,
     /// True while a capability challenge inference is in flight — prevents duplicate spawns.
     challenge_in_flight: Arc<AtomicBool>,
-    /// Stratum id of the in-flight `mining.ai_response`, until the bridge acknowledges it.
-    ai_response_pending: Arc<Mutex<Option<u32>>>,
+    /// Stratum id of the in-flight `mining.ai_response` and when it went out, until the bridge
+    /// acknowledges it or [`AI_ACK_TIMEOUT`] passes.
+    ai_response_pending: Arc<Mutex<Option<(u32, std::time::Instant)>>>,
     /// Ids of our requests whose answers are no share results: `mining.hello`, `mining.telemetry`
     /// and `mining.ai_opening_result`.
     aux_ids: Arc<std::sync::Mutex<HashSet<u32>>>,
@@ -853,7 +859,7 @@ impl StratumHandler {
                             Ok(())
                         }
                         StratumCommand::MiningAiRequest(params) => {
-                            self.handle_ai_request(params.fields, params.ext, miner).await;
+                            self.handle_ai_request(id, params.fields, params.ext, miner).await;
                             Ok(())
                         }
                         StratumCommand::MiningAiOpening(params) => {
@@ -954,7 +960,7 @@ impl StratumHandler {
                         Err(error.into())
                     }
                     // Pool-specific/unrecognized code — treat as a rejected share, never fatal.
-                    ErrorCode::Other(_) => {
+                    ErrorCode::Busy | ErrorCode::Other(_) => {
                         warn!("Share rejected with unrecognized error code {} (Job id: {:?}): {}", code, jobid, error);
                         Ok(())
                     }
@@ -964,10 +970,32 @@ impl StratumHandler {
         }
     }
 
+    /// True while a `mining.ai_response` awaits the pool's ack, for at most [`AI_ACK_TIMEOUT`].
+    async fn ai_ack_outstanding(&self) -> bool {
+        let mut pending = self.ai_response_pending.lock().await;
+        match *pending {
+            Some((id, at)) if at.elapsed() >= AI_ACK_TIMEOUT => {
+                warn!("AI response (stratum id {id}) never acknowledged by the pool — taking requests again");
+                *pending = None;
+                false
+            }
+            other => other.is_some(),
+        }
+    }
+
+    /// Tells the pool this rig will not answer its `mining.ai_request` `pool_id` (code 46), so it
+    /// re-dispatches at once instead of waiting out its deadline (keryx-miner-supr 0.16.1,
+    /// keryx-miner v0.6.0). Nothing when the request came without an id.
+    async fn refuse_ai(&self, pool_id: Option<u32>, reason: &str) {
+        if let Some(id) = pool_id {
+            self.send_channel.send(StratumLine::error_reply(id, ErrorCode::Busy, reason)).await.ok();
+        }
+    }
+
     /// True (and cleared) when `id` acknowledges the in-flight `mining.ai_response`.
     async fn take_ai_response_ack(&self, id: Option<u32>) -> bool {
         let mut pending = self.ai_response_pending.lock().await;
-        if id.is_some() && *pending == id {
+        if id.is_some() && pending.map(|(p, _)| p) == id {
             *pending = None;
             true
         } else {
@@ -977,9 +1005,11 @@ impl StratumHandler {
 
     /// Pool-dispatched inference (`mining.ai_request`): pause mining, run the request on the
     /// served model, and answer with `mining.ai_response`. One request at a time, shared with
-    /// capability challenges; a busy or unready miner declines by staying silent.
+    /// capability challenges; a busy or unready miner, or a failed inference, declines with a busy
+    /// reply (46) to the request's `pool_id`, or silently when it had none.
     async fn handle_ai_request(
         &mut self,
+        pool_id: Option<u32>,
         fields: (String, String, String, String, String, u32, String),
         ext: Option<serde_json::Value>,
         miner: &mut MinerManager,
@@ -995,6 +1025,7 @@ impl StratumHandler {
         if keryx_miner::pow_only() || !keryx_miner::slm::is_model_ready(&request.model_id) {
             warn!("AI request {:.16}: model is not ready", request.task_id);
             crate::notify::ai_missed();
+            self.refuse_ai(pool_id, "busy: model not ready").await;
             return;
         }
         // H15 traced answer: the tier is the model's own (its manifests define the trace), and this
@@ -1018,18 +1049,21 @@ impl StratumHandler {
                     }
                 );
                 crate::notify::ai_missed();
+                self.refuse_ai(pool_id, "busy: this trace cannot be served").await;
                 return;
             }
         }
-        if self.ai_response_pending.lock().await.is_some() || self.challenge_in_flight.swap(true, Ordering::SeqCst) {
+        if self.ai_ack_outstanding().await || self.challenge_in_flight.swap(true, Ordering::SeqCst) {
             warn!("AI request {:.16}: inference is busy", request.task_id);
             crate::notify::ai_missed();
+            self.refuse_ai(pool_id, "busy: inference running").await;
             return;
         }
         let guard = ai::InferenceGuard::new(miner.opoi_challenge_flag(), self.challenge_in_flight.clone());
         if let Err(error) = miner.process_block(None).await {
             warn!("Could not pause mining for AI request: {}", error);
             crate::notify::ai_missed();
+            self.refuse_ai(pool_id, "busy: mining could not pause").await;
             return;
         }
         info!(
@@ -1043,6 +1077,11 @@ impl StratumHandler {
         let worker = self.username();
         let pending = self.ai_response_pending.clone();
         let last_id = self.last_stratum_id.clone();
+        let refuse = move |sender: &Sender<StratumLine>, reason: &str| {
+            if let Some(id) = pool_id {
+                sender.blocking_send(StratumLine::error_reply(id, ErrorCode::Busy, reason)).ok();
+            }
+        };
         task::spawn_blocking(move || {
             let label = format!("pool ai_request {:.16}", request.task_id);
             let (result, traced) = match request.trace {
@@ -1058,7 +1097,7 @@ impl StratumHandler {
                         &label,
                     );
                     match g {
-                        // A traced request without its trace is no valid answer: say nothing, the pool
+                        // A traced request without its trace is no valid answer: refuse it, the pool
                         // re-dispatches.
                         Some(g) if g.trace.is_some() => {
                             let trace = g.trace.unwrap();
@@ -1089,6 +1128,7 @@ impl StratumHandler {
                             drop(guard);
                             warn!("AI request {:.16}: no traced answer — left to the pool", request.task_id);
                             crate::notify::ai_missed();
+                            refuse(&sender, "busy: inference failed");
                             return;
                         }
                     }
@@ -1102,7 +1142,7 @@ impl StratumHandler {
             let traced = traced.as_ref().map(|(c, b)| (c.as_slice(), b.as_slice()));
             match request.response(id, worker, &result, traced) {
                 Ok(line) => {
-                    *pending.blocking_lock() = Some(id);
+                    *pending.blocking_lock() = Some((id, std::time::Instant::now()));
                     // The GPU is done: resume mining before the send, which blocks while the pool
                     // connection is backed up. `pending` keeps further requests out until the ack.
                     drop(guard);
@@ -1116,6 +1156,7 @@ impl StratumHandler {
                     drop(guard);
                     warn!("AI request {:.16}: {}", request.task_id, error);
                     crate::notify::ai_missed();
+                    refuse(&sender, "busy: inference failed");
                 }
             }
         });
@@ -1183,7 +1224,17 @@ impl StratumHandler {
             let body = if op.path.is_empty() {
                 keryx_miner::slm::open_trace(&k.model_id, k.tier, &k.trace, &op.seed, op.response_txid, &k.request_hash, k.max_tokens)
             } else {
-                keryx_miner::slm::open_attention_phase(&k.model_id, k.tier, &k.trace, &op.seed, op.response_txid, &op.path, &op.prev, k.max_tokens)
+                keryx_miner::slm::open_attention_phase(
+                    &k.model_id,
+                    k.tier,
+                    &k.trace,
+                    &op.seed,
+                    op.response_txid,
+                    &k.request_hash,
+                    &op.path,
+                    &op.prev,
+                    k.max_tokens,
+                )
             };
             drop(guard);
             let line = match &body {
@@ -1330,7 +1381,7 @@ impl StratumHandler {
             info!("Trace: tier {tier} cannot be traced by this engine — traced pool requests are not served");
             return;
         }
-        if self.ai_response_pending.lock().await.is_some() || self.challenge_in_flight.swap(true, Ordering::SeqCst) {
+        if self.ai_ack_outstanding().await || self.challenge_in_flight.swap(true, Ordering::SeqCst) {
             return;
         }
         TRACE_SELF_TEST_STARTED.store(true, Ordering::SeqCst);
@@ -1394,7 +1445,7 @@ impl StratumHandler {
             sender.send(inference_result(req.req_id, Err("model not ready"))).await.ok();
             return;
         }
-        if self.ai_response_pending.lock().await.is_some() || self.challenge_in_flight.swap(true, Ordering::SeqCst) {
+        if self.ai_ack_outstanding().await || self.challenge_in_flight.swap(true, Ordering::SeqCst) {
             info!("chat[{}]: inference busy — replying busy", req.req_id);
             sender.send(inference_result(req.req_id, Err("busy"))).await.ok();
             return;

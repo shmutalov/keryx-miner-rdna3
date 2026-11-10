@@ -155,7 +155,12 @@ rules of keryx-node v1.6.6:
   its `mining.hello`/`mining.telemetry` once it passed. As suprnova's miner does, it declares
   (`mining.declare_capabilities`) only the models it can serve: past the gate, only those whose
   self-check passed; the set goes out again on every change, as an empty list when nothing is
-  left, and every 90 s.
+  left, and every 90 s. It also takes the variants of the upstream keryx-miner v0.6 bridge: a
+  trace request without `prompt_len` (the length of the prompt sent stands in), an attention phase
+  without the previous phase's partials (rebuilt from the kept trace), and any prompt bytes (NUL
+  bytes, invalid UTF-8, a compressed prompt). A request it will not answer (busy, model not ready,
+  trace it cannot build, failed inference) gets a busy reply (error 46) so the pool re-dispatches
+  at once, and an answer the pool never acknowledges stops holding off new requests after 30 s.
 - **Solo AI answers stay skipped past the gate**: solo audits (attention phases through the node,
   deadlines) are not wired up.
 - **Solo mining past the gate is not viable with this build.** Every request is audited against the

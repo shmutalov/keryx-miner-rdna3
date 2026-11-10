@@ -13,7 +13,8 @@ const MAX_PAYLOAD_BYTES: usize = 1_048_576;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct TraceAsk {
     pub tier: u8,
-    /// Length of the request's plaintext prompt (the shape rule pads the traced prompt to it).
+    /// Length of the request's plaintext prompt (the shape rule pads the traced prompt to it); the
+    /// length of the prompt bytes sent when the pool leaves it out.
     pub prompt_len: u32,
     /// Stage-2 (chain) trace.
     pub chain: bool,
@@ -22,10 +23,16 @@ pub(super) struct TraceAsk {
 }
 
 impl TraceAsk {
-    fn parse(ext: &serde_json::Value) -> Result<Option<Self>, Error> {
+    /// `sent_len`: byte length of the prompt as the pool sent it, the `prompt_len` when the pool
+    /// leaves it out (upstream keryx-miner v0.6.0 makes it optional). Capped like a private prompt.
+    fn parse(ext: &serde_json::Value, sent_len: usize) -> Result<Option<Self>, Error> {
         let Some(t) = ext.get("trace").filter(|t| !t.is_null()) else { return Ok(None) };
         let tier = t.get("tier").and_then(|v| v.as_u64()).filter(|v| *v < 16).ok_or("trace.tier missing")? as u8;
-        let prompt_len = t.get("prompt_len").and_then(|v| v.as_u64()).and_then(|v| u32::try_from(v).ok()).ok_or("trace.prompt_len missing")?;
+        let cap = keryx_inference::MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN as u32;
+        let prompt_len = match t.get("prompt_len").filter(|v| !v.is_null()) {
+            None => (sent_len as u32).min(cap),
+            Some(v) => v.as_u64().and_then(|v| u32::try_from(v).ok()).ok_or("trace.prompt_len is not a u32")?.min(cap),
+        };
         let chain = t.get("chain").and_then(|v| v.as_bool()).unwrap_or(true);
         let attention = t.get("attention").and_then(|v| v.as_bool()).unwrap_or(true);
         // `trace.upload` (pool custody of the compact record) is optional and not used: the trace
@@ -54,10 +61,6 @@ impl AiRequest {
     /// `[task_id, txid, request_hash, model_id_hex, prompt_base64, max_tokens, reward]` and the
     /// optional trace object; task_id must equal request_hash (case-insensitive), ids are 64 hex.
     pub fn parse_ext(fields: (String, String, String, String, String, u32, String), ext: Option<&serde_json::Value>) -> Result<Self, Error> {
-        let trace = match ext {
-            Some(e) => TraceAsk::parse(e)?,
-            None => None,
-        };
         let (task_id, txid, request_hash, model_hex, prompt_b64, max_tokens, reward) = fields;
         if !task_id.eq_ignore_ascii_case(&request_hash) || max_tokens == 0 || max_tokens > i32::MAX as u32 {
             return Err("Invalid AI task metadata".into());
@@ -71,10 +74,19 @@ impl AiRequest {
         if prompt_b64.len() > MAX_PAYLOAD_BYTES.div_ceil(3) * 4 {
             return Err("AI prompt is too large".into());
         }
-        let prompt = String::from_utf8(BASE64.decode(prompt_b64)?)?;
-        if prompt.len() > MAX_PAYLOAD_BYTES || prompt.contains('\0') {
+        let raw = BASE64.decode(prompt_b64)?;
+        if raw.len() > MAX_PAYLOAD_BYTES {
             return Err("Invalid AI prompt".into());
         }
+        // The node takes any bytes as a prompt, so a request is answered whatever they are
+        // (upstream 77ff767, supr 0.16.1): a compressed one (`00 'K' 'Z' 01` + DEFLATE) is
+        // inflated, invalid UTF-8 is replaced, and NUL bytes are kept: the engine tokenizes the
+        // prompt's bytes with their length and formats it without a C string.
+        let prompt = crate::client::grpc::decode_private_prompt(&raw);
+        let trace = match ext {
+            Some(e) => TraceAsk::parse(e, raw.len())?,
+            None => None,
+        };
         let mut model_id = [0; 32];
         hex::decode_to_slice(&model_hex, &mut model_id)?;
         Ok(Self { task_id, request_hash, model_hex, model_id, prompt, max_tokens: max_tokens as usize, trace })
@@ -143,13 +155,12 @@ impl AiOpening {
             None | Some(serde_json::Value::Null) => Vec::new(),
             _ => return Err("attention path must be an array".into()),
         };
+        // The previous phase's partials only save a replay: upstream keryx-miner v0.6.0 ignores
+        // them, so a bridge may leave them out, and the rig rebuilds them from its kept trace.
         let prev = match v.get(4).and_then(|x| x.as_str()) {
-            Some(s) if !s.is_empty() => hex::decode(s)?,
+            Some(s) if !s.is_empty() && !path.is_empty() => hex::decode(s)?,
             _ => Vec::new(),
         };
-        if path.is_empty() != prev.is_empty() {
-            return Err("an attention phase needs both its path and the previous partials".into());
-        }
         Ok(Self { request_hash, response_txid, response_txid_hex, seed, path, prev })
     }
 
@@ -215,6 +226,45 @@ mod tests {
         assert!(req.response(8, "w".into(), "", None).is_err(), "never send an empty answer");
     }
 
+    /// Any prompt bytes are served: NUL bytes kept, invalid UTF-8 replaced, a compressed prompt
+    /// inflated. Only the size cap and broken base64 refuse a request.
+    #[test]
+    fn odd_prompts_are_served() {
+        use std::io::Write;
+        let with = |raw: &[u8]| {
+            let mut f = fields("");
+            f.4 = BASE64.encode(raw);
+            f
+        };
+        assert_eq!(AiRequest::parse(with(b"Say hel\0lo")).unwrap().prompt, "Say hel\0lo");
+        assert_eq!(AiRequest::parse(with(&[b'h', b'i', 0xFF])).unwrap().prompt, "hi\u{FFFD}");
+        let text = "abc ".repeat(2_000);
+        let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
+        enc.write_all(text.as_bytes()).unwrap();
+        let mut packed = vec![0x00, b'K', b'Z', 0x01];
+        packed.extend(enc.finish().unwrap());
+        assert_eq!(AiRequest::parse(with(&packed)).unwrap().prompt, text);
+        assert!(AiRequest::parse(with(&vec![b'a'; MAX_PAYLOAD_BYTES + 1])).is_err());
+        let mut f = fields("x");
+        f.4 = "not base64!".into();
+        assert!(AiRequest::parse(f).is_err());
+    }
+
+    /// `trace.prompt_len` is optional (upstream keryx-miner v0.6.0): without it the length of the
+    /// prompt bytes sent stands in. Either way it is capped like a private prompt.
+    #[test]
+    fn trace_prompt_len_falls_back_to_the_sent_length() {
+        let cap = keryx_inference::MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN as u32;
+        let ask = |trace: serde_json::Value, prompt: &str| AiRequest::parse_ext(fields(prompt), Some(&serde_json::json!({ "trace": trace }))).map(|r| r.trace.unwrap().prompt_len);
+        assert_eq!(ask(serde_json::json!({"tier": 1, "prompt_len": 17}), "Hello").unwrap(), 17);
+        assert_eq!(ask(serde_json::json!({"tier": 1}), "Hello").unwrap(), 5);
+        assert_eq!(ask(serde_json::json!({"tier": 1, "prompt_len": null}), "Hello").unwrap(), 5);
+        assert_eq!(ask(serde_json::json!({"tier": 1}), &"a".repeat(cap as usize + 9)).unwrap(), cap);
+        assert_eq!(ask(serde_json::json!({"tier": 1, "prompt_len": u32::MAX}), "Hello").unwrap(), cap);
+        assert!(ask(serde_json::json!({"tier": 1, "prompt_len": "17"}), "Hello").is_err());
+        assert!(ask(serde_json::json!({"prompt_len": 17}), "Hello").is_err(), "the tier stays required");
+    }
+
     #[test]
     fn traced_requests_and_openings_round_trip() {
         use super::super::statum_codec::{StratumCommand, StratumLine, StratumLinePayload};
@@ -245,8 +295,14 @@ mod tests {
         assert_eq!((op.path.clone(), op.prev.clone(), op.seed), (vec![2, 0], vec![0xbe, 0xef], [0xbb; 32]));
         let first = serde_json::json!(["11".repeat(32), "aa".repeat(32), "bb".repeat(32), [], ""]);
         assert!(AiOpening::parse(first.as_array().unwrap()).unwrap().path.is_empty());
-        let bad = serde_json::json!(["11".repeat(32), "aa".repeat(32), "bb".repeat(32), [1], ""]);
-        assert!(AiOpening::parse(bad.as_array().unwrap()).is_err());
+        // A phase may come without the previous partials (upstream keryx-miner v0.6.0 sends none),
+        // and partials without a phase are ignored.
+        for no_prev in [serde_json::json!(["11".repeat(32), "aa".repeat(32), "bb".repeat(32), [1], ""]), serde_json::json!(["11".repeat(32), "aa".repeat(32), "bb".repeat(32), [1]])] {
+            let op = AiOpening::parse(no_prev.as_array().unwrap()).unwrap();
+            assert_eq!((op.path, op.prev), (vec![1], Vec::new()));
+        }
+        let stray = serde_json::json!(["11".repeat(32), "aa".repeat(32), "bb".repeat(32), [], "beef"]);
+        assert!(AiOpening::parse(stray.as_array().unwrap()).unwrap().prev.is_empty());
         let r = serde_json::to_value(op.result(3, "w".into(), Ok(&[0xb0, 1]))).unwrap();
         assert_eq!(r["method"], "mining.ai_opening_result");
         assert_eq!(r["params"][4], "b001");

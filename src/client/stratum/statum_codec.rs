@@ -21,6 +21,9 @@ pub enum ErrorCode {
     NotSubscribed,
     InvalidOpoiTag,
     InvalidPomProof,
+    /// 46, miner → pool reply to a `mining.ai_request`: this rig will not answer it, so the pool
+    /// re-dispatches at once (keryx-miner-supr 0.16.1, keryx-miner v0.6.0).
+    Busy,
     Other(i64),
 }
 
@@ -35,6 +38,7 @@ impl From<i64> for ErrorCode {
             25 => ErrorCode::NotSubscribed,
             26 => ErrorCode::InvalidOpoiTag,
             27 => ErrorCode::InvalidPomProof,
+            46 => ErrorCode::Busy,
             other => ErrorCode::Other(other),
         }
     }
@@ -51,6 +55,7 @@ impl From<ErrorCode> for i64 {
             ErrorCode::NotSubscribed => 25,
             ErrorCode::InvalidOpoiTag => 26,
             ErrorCode::InvalidPomProof => 27,
+            ErrorCode::Busy => 46,
             ErrorCode::Other(other) => other,
         }
     }
@@ -67,6 +72,7 @@ impl Display for ErrorCode {
             ErrorCode::NotSubscribed => write!(f, "NotSubscribed"),
             ErrorCode::InvalidOpoiTag => write!(f, "InvalidOpoiTag"),
             ErrorCode::InvalidPomProof => write!(f, "InvalidPomProof"),
+            ErrorCode::Busy => write!(f, "Busy"),
             ErrorCode::Other(code) => write!(f, "Other({})", code),
         }
     }
@@ -311,6 +317,18 @@ pub(crate) struct StratumLine {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) jsonrpc: Option<String>,
     pub(crate) error: Option<StratumError>,
+}
+
+impl StratumLine {
+    /// Error reply to the pool's command `id`: `{"id":id,"result":null,"jsonrpc":"2.0","error":[code,message,null]}`.
+    pub(crate) fn error_reply(id: u32, code: ErrorCode, message: &str) -> Self {
+        Self {
+            id: Some(id),
+            payload: StratumLinePayload::StratumResult { result: StratumResult::Plain(None) },
+            jsonrpc: Some("2.0".into()),
+            error: Some(StratumError(code, message.into(), None)),
+        }
+    }
 }
 
 /// An error occurred while encoding or decoding a line.
@@ -603,5 +621,15 @@ mod tests {
         assert!(matches!(line.payload, StratumLinePayload::StratumCommand(StratumCommand::MiningSetDifficulty(_))));
         let mut bad = BytesMut::from("{\"id\":3,\"result\":{\"weird\":true}}\n");
         assert!(codec.decode(&mut bad).is_err());
+    }
+
+    /// The busy reply to a pool's `mining.ai_request` (code 46), and the same code from a pool.
+    #[test]
+    fn busy_reply_wire_format() {
+        let json = serde_json::to_value(StratumLine::error_reply(17, ErrorCode::Busy, "busy: inference running")).unwrap();
+        assert_eq!(json, serde_json::json!({"id": 17, "result": null, "jsonrpc": "2.0", "error": [46, "busy: inference running", null]}));
+        let line: StratumLine = serde_json::from_str(r#"{"id":5,"result":null,"error":[46,"busy",null]}"#).unwrap();
+        assert!(matches!(line.error, Some(StratumError(ErrorCode::Busy, _, _))));
+        assert_eq!(i64::from(ErrorCode::from(46)), 46);
     }
 }
