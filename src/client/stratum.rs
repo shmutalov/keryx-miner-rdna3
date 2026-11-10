@@ -365,12 +365,14 @@ impl Client for StratumHandler {
                         // after supr 0.15.3/0.15.4 shipped traced answers; 0.15.5 makes every Windows
                         // 0.15.4 rig update). supr 0.15.6–0.15.8 changed no wire protocol. supr 0.16.0
                         // is its H16 release (keryx-node 1.6.7: the 200 MiB smaller context pad from
-                        // DAA 147,000,000, again no wire change), which this build mines too, so it
-                        // advertises that. This build serves supr's pool trace protocol too
-                        // (traced `mining.ai_request`, `mining.ai_opening`) for tiers 0, 1 and 3. Bump
-                        // this string and the `mining.hello` version if the pool raises the floor again.
+                        // DAA 147,000,000, again no wire change), which this build mines too. supr
+                        // 0.16.1–0.16.3 added the busy reply (46) and NUL-byte prompts, which this
+                        // build has too, so it advertises 0.16.3. This build serves supr's pool trace
+                        // protocol too (traced `mining.ai_request`, `mining.ai_opening`) for tiers 0,
+                        // 1 and 3. Bump this string and the `mining.hello` version if the pool raises
+                        // the floor again.
                         // (Real build: keryx-miner/CARGO_PKG_VERSION.)
-                        "keryx-miner-supr/0.16.0".to_string(),
+                        "keryx-miner-supr/0.16.3".to_string(),
                         KERYX_STRATUM_DAA_CAPABILITY.into(),
                     )),
                 )),
@@ -1339,7 +1341,7 @@ impl StratumHandler {
         };
         serde_json::json!({
             "v": 1,
-            "miner": { "name": "keryx-miner-supr", "version": "0.16.0", "build": "vulkan", "features": ["pom-v2", "opoi", "pom-vulkan"] },
+            "miner": { "name": "keryx-miner-supr", "version": "0.16.3", "build": "vulkan", "features": ["pom-v2", "opoi", "pom-vulkan"] },
             "trace": Self::trace_flag(),
             "host": { "os": std::env::consts::OS, "cpu_cores": std::thread::available_parallelism().map_or(1, |n| n.get()) },
             "model": model,

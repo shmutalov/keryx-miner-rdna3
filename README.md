@@ -403,7 +403,7 @@ automatically at every start.)
   each miss is a service strike ([details](#consensus-this-build-mines)). Mine through a pool.
 - ⚠️ **Pool version gate:** suprnova refuses miners that don't advertise a recent enough
   `keryx-miner-supr` version (the floor moves with each hardfork — `0.7.0+` at H4, `0.12.0+` at
-  H10, `0.14.0+` at H14, above `0.15.1` at H15). This fork advertises `0.16.0` (supr's H16 release) and subscribes as
+  H10, `0.14.0+` at H14, above `0.15.1` at H15). This fork advertises `0.16.3` (supr's current H16 release) and subscribes as
   `keryx-stratum-v3`. Single string in `client/stratum.rs`.
 - ⚠️ **Known benign:** an occasional panic in `MinerManager`'s shutdown/reconnect path (a worker
   thread exits before the drop-time join) — harmless under a supervised restart loop; a clean-up
