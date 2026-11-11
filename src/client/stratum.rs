@@ -5,17 +5,18 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-
-/// How long an unacknowledged `mining.ai_response` holds off further requests. Without a limit a
-/// pool that never acknowledges one (an id-less reply, a lost line) would get every later request
-/// on the connection refused as busy.
-const AI_ACK_TIMEOUT: Duration = Duration::from_secs(30);
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 
 mod ai;
 mod statum_codec;
 mod traces;
+
+/// How long an unacknowledged `mining.ai_response` holds off further requests. Without a limit a
+/// pool that never acknowledges one (an id-less reply, a lost line) would get every later request
+/// on the connection refused as busy.
+const AI_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 
 use crate::client::stratum::statum_codec::{ErrorCode, MiningNotify, MiningSubmit, NewLineJsonCodecError, StratumLine};
 use crate::client::stratum::statum_codec::{
@@ -462,9 +463,60 @@ impl Client for StratumHandler {
     }
 }
 
+/// Whether `url` names a stratum pool: `stratum+tcp://`, or `stratum+ssl://` / `stratum+tls://`
+/// over TLS (upstream keryx-miner dfca69d).
+pub fn is_stratum_url(url: &str) -> bool {
+    STRATUM_SCHEMES.iter().any(|p| url.starts_with(p))
+}
+
+const STRATUM_SCHEMES: [&str; 3] = ["stratum+tcp://", "stratum+ssl://", "stratum+tls://"];
+
+/// TLS options of a stratum connection.
+pub struct TlsSettings {
+    /// Extra PEM certificate authority trusted besides the public roots (`--pool-ca-file`).
+    pub ca_file: Option<String>,
+}
+
+trait PoolIo: AsyncRead + AsyncWrite + Send + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> PoolIo for T {}
+
+/// The TLS session over `socket` to the pool at `address` (`host:port`), its certificate checked
+/// against the public web roots (webpki-roots) and the extra CA of `settings`.
+async fn tls_wrap(socket: TcpStream, address: &str, settings: &TlsSettings) -> Result<Box<dyn PoolIo>, Error> {
+    use tokio_rustls::rustls::{self, pki_types::pem::PemObject, pki_types::CertificateDer, pki_types::ServerName, RootCertStore};
+
+    let mut roots = RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+    if let Some(path) = &settings.ca_file {
+        let mut added = 0;
+        for cert in CertificateDer::pem_file_iter(path).map_err(|e| format!("pool CA file {}: {}", path, e))? {
+            roots.add(cert.map_err(|e| format!("pool CA file {}: {}", path, e))?)?;
+            added += 1;
+        }
+        if added == 0 {
+            return Err(format!("pool CA file {}: no certificate", path).into());
+        }
+    }
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let host = tls_host(address);
+    let name = ServerName::try_from(host.to_string()).map_err(|e| format!("pool host {}: {}", host, e))?;
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let stream = tokio::time::timeout(Duration::from_secs(10), connector.connect(name, socket)).await??;
+    Ok(Box::new(stream))
+}
+
+/// The host of `host:port` (brackets of an IPv6 literal dropped), the name the certificate must carry.
+fn tls_host(address: &str) -> &str {
+    address.rsplit_once(':').map_or(address, |(h, _)| h).trim_start_matches('[').trim_end_matches(']')
+}
+
 impl StratumHandler {
+    #[allow(clippy::too_many_arguments)]
     pub async fn connect(
         address: String,
+        tls: Option<TlsSettings>,
         miner_address: String,
         worker: String,
         password: String,
@@ -472,9 +524,17 @@ impl StratumHandler {
         block_template_ctr: Option<Arc<AtomicU16>>,
         ipfs_url: String,
     ) -> Result<Box<Self>, Error> {
-        info!("Connecting to {}", address);
+        info!("Connecting to {}{}", address, if tls.is_some() { " (TLS)" } else { "" });
         let proof_encoding = Arc::new(ProofEncoding::for_pool(&address));
-        let socket = TcpStream::connect(address).await?;
+        let tcp = TcpStream::connect(&address).await?;
+        let socket: Box<dyn PoolIo> = match &tls {
+            Some(settings) => {
+                let stream = tls_wrap(tcp, &address, settings).await?;
+                info!("TLS session established with {}", address);
+                stream
+            }
+            None => Box::new(tcp),
+        };
 
         let client = Framed::new(socket, NewLineJsonCodec::new());
         let (send_channel, recv) = mpsc::channel::<StratumLine>(3);
@@ -2014,5 +2074,49 @@ mod notify_v4_tests {
         let mut with_root = got.clone();
         with_root.task_root = "44".repeat(32);
         assert_eq!(pre_pow(&with_root), pre_pow(&got));
+    }
+}
+
+#[cfg(test)]
+mod tls_url_tests {
+    use super::{is_stratum_url, tls_host};
+
+    #[test]
+    fn stratum_schemes_and_tls_host() {
+        for url in ["stratum+tcp://krx.suprnova.cc:4404", "stratum+ssl://krx.cryo-pool.com:5555", "stratum+tls://pool:443"] {
+            assert!(is_stratum_url(url), "{url}");
+        }
+        for url in ["grpc://127.0.0.1:22110", "stratum://pool:1", "krx.cryo-pool.com:5555"] {
+            assert!(!is_stratum_url(url), "{url}");
+        }
+        assert_eq!(tls_host("krx.cryo-pool.com:5555"), "krx.cryo-pool.com");
+        assert_eq!(tls_host("[2001:db8::1]:443"), "2001:db8::1");
+        assert_eq!(tls_host("pool.example"), "pool.example");
+    }
+}
+
+/// Network check of the TLS path against a live pool: handshake with the public roots, then one
+/// `mining.subscribe` round trip. No mining, no shares. Run with:
+///   KERYX_TEST_TLS_POOL=krx.cryo-pool.com:5555 cargo test --release --bin keryx-miner-rdna3 -- --ignored --nocapture tls_pool_subscribe
+#[cfg(test)]
+mod tls_live_tests {
+    use super::{tls_wrap, TlsSettings};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    #[tokio::test]
+    #[ignore = "connects to a live pool; set KERYX_TEST_TLS_POOL=host:port"]
+    async fn tls_pool_subscribe() {
+        let Ok(address) = std::env::var("KERYX_TEST_TLS_POOL") else {
+            eprintln!("SKIP: KERYX_TEST_TLS_POOL not set");
+            return;
+        };
+        let tcp = tokio::net::TcpStream::connect(&address).await.expect("tcp connect");
+        let mut tls = tls_wrap(tcp, &address, &TlsSettings { ca_file: None }).await.expect("TLS handshake against the public roots");
+        tls.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"keryx-miner-supr/0.16.3\",\"keryx-stratum-v3\"],\"jsonrpc\":\"2.0\"}\n").await.unwrap();
+        let mut line = String::new();
+        tokio::time::timeout(std::time::Duration::from_secs(15), BufReader::new(tls).read_line(&mut line)).await.expect("reply in time").unwrap();
+        eprintln!("pool replied over TLS: {}", line.trim());
+        let reply: serde_json::Value = serde_json::from_str(&line).expect("a JSON line");
+        assert_eq!(reply["id"], 1);
     }
 }

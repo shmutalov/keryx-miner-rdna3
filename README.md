@@ -220,7 +220,8 @@ exporting anything. Prebuilt release binaries need none of this.
 
 ### Solo vs pool
 
-`--keryxd-address` takes either a `grpc://` node (solo) or a `stratum+tcp://` pool URL. For pools:
+`--keryxd-address` takes either a `grpc://` node (solo) or a pool URL: `stratum+tcp://` (plain) or
+`stratum+ssl://` / `stratum+tls://` (TLS, e.g. `stratum+ssl://krx.cryo-pool.com:5555`). For pools:
 
 ```bash
 ./keryx-miner-rdna3 --mining-address keryx:YOUR_ADDRESS \
@@ -232,6 +233,9 @@ exporting anything. Prebuilt release binaries need none of this.
 - `--worker` is sent as `address.worker` so the pool credits shares per rig.
 - `--password` is the stratum `mining.authorize` password; on suprnova-style pools it requests a
   fixed difficulty (e.g. `d=1`). Default `x` = the pool's own (vardiff) difficulty.
+- Over TLS the pool's certificate is checked against the public web roots built into the miner
+  (Mozilla's list), so a pool with a normal certificate (Let's Encrypt and the like) needs nothing
+  more. For a pool with its own certificate authority, pass its PEM file with `--pool-ca-file`.
 
 ### Telegram bot
 

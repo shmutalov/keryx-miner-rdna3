@@ -129,8 +129,16 @@ pub struct Opt {
     #[clap(short = 'a', long = "mining-address", help = "The Keryx address for the miner reward")]
     pub mining_address: Option<String>,
 
-    #[clap(short = 's', long = "keryxd-address", default_value = "stratum+tcp://krx.suprnova.cc:4404", help = "keryxd grpc:// address or stratum+tcp:// pool URL")]
+    #[clap(
+        short = 's',
+        long = "keryxd-address",
+        default_value = "stratum+tcp://krx.suprnova.cc:4404",
+        help = "keryxd grpc:// address, or pool URL: stratum+tcp:// (plain) or stratum+ssl:// / stratum+tls:// (TLS)"
+    )]
     pub keryxd_address: String,
+
+    #[clap(long = "pool-ca-file", help = "Extra PEM certificate authority trusted for stratum+ssl:// pools (e.g. a pool's self-signed CA)")]
+    pub pool_ca_file: Option<String>,
 
     #[clap(long = "worker", default_value = "rx7900xt", help = "Pool worker name (sent as address.worker in the stratum login)")]
     pub worker: String,
