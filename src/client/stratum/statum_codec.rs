@@ -623,6 +623,29 @@ mod tests {
         assert!(codec.decode(&mut bad).is_err());
     }
 
+    /// krx.cryo-pool.com (stratum+ssl://, "KaspaStratum/1.0.0", 2026-11-11): a bare `set_extranonce`
+    /// and the short notify with daa_score and bits, as captured from the pool.
+    #[test]
+    fn kaspa_bridge_dialect_decodes() {
+        let mut codec = NewLineJsonCodec::new();
+        let mut buf = BytesMut::from(
+            "{\"jsonrpc\": \"2.0\", \"method\": \"set_extranonce\", \"params\": [\"6008\", 6], \"id\": null}\n\
+             {\"jsonrpc\": \"2.0\", \"method\": \"mining.notify\", \"params\": [\"35101\", [10051431687350573298, 14719079838897840687, 13924008907626787838, 6547557682301440073], 1794412293911, 150527757, 489210981], \"id\": null}\n",
+        );
+        let line = codec.decode(&mut buf).unwrap().unwrap();
+        assert!(matches!(
+            line.payload,
+            StratumLinePayload::StratumCommand(StratumCommand::SetExtranonce(SetExtranonce::SetExtranoncePlain((ref e, 6)))) if e == "6008"
+        ));
+        let line = codec.decode(&mut buf).unwrap().unwrap();
+        match line.payload {
+            StratumLinePayload::StratumCommand(StratumCommand::MiningNotify(MiningNotify::MiningNotifyShortV3((id, h, ts, daa, bits)))) => {
+                assert_eq!((id.as_str(), h[3], ts, daa, bits), ("35101", 6547557682301440073, 1794412293911, 150527757, 489210981));
+            }
+            other => panic!("not a short v3 notify: {other:?}"),
+        }
+    }
+
     /// The busy reply to a pool's `mining.ai_request` (code 46), and the same code from a pool.
     #[test]
     fn busy_reply_wire_format() {
