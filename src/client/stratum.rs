@@ -367,13 +367,14 @@ impl Client for StratumHandler {
                         // 0.15.4 rig update). supr 0.15.6–0.15.8 changed no wire protocol. supr 0.16.0
                         // is its H16 release (keryx-node 1.6.7: the 200 MiB smaller context pad from
                         // DAA 147,000,000, again no wire change), which this build mines too. supr
-                        // 0.16.1–0.16.3 added the busy reply (46) and NUL-byte prompts, which this
-                        // build has too, so it advertises 0.16.3. This build serves supr's pool trace
+                        // 0.16.1–0.16.4 added the busy reply (46), NUL-byte and compressed prompts and
+                        // stratum+ssl://, all of which this build has too, so it advertises 0.16.4.
+                        // This build serves supr's pool trace
                         // protocol too (traced `mining.ai_request`, `mining.ai_opening`) for tiers 0,
                         // 1 and 3. Bump this string and the `mining.hello` version if the pool raises
                         // the floor again.
                         // (Real build: keryx-miner/CARGO_PKG_VERSION.)
-                        "keryx-miner-supr/0.16.3".to_string(),
+                        "keryx-miner-supr/0.16.4".to_string(),
                         KERYX_STRATUM_DAA_CAPABILITY.into(),
                     )),
                 )),
@@ -1401,7 +1402,7 @@ impl StratumHandler {
         };
         serde_json::json!({
             "v": 1,
-            "miner": { "name": "keryx-miner-supr", "version": "0.16.3", "build": "vulkan", "features": ["pom-v2", "opoi", "pom-vulkan"] },
+            "miner": { "name": "keryx-miner-supr", "version": "0.16.4", "build": "vulkan", "features": ["pom-v2", "opoi", "pom-vulkan"] },
             "trace": Self::trace_flag(),
             "host": { "os": std::env::consts::OS, "cpu_cores": std::thread::available_parallelism().map_or(1, |n| n.get()) },
             "model": model,
@@ -2112,7 +2113,7 @@ mod tls_live_tests {
         };
         let tcp = tokio::net::TcpStream::connect(&address).await.expect("tcp connect");
         let mut tls = tls_wrap(tcp, &address, &TlsSettings { ca_file: None }).await.expect("TLS handshake against the public roots");
-        tls.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"keryx-miner-supr/0.16.3\",\"keryx-stratum-v3\"],\"jsonrpc\":\"2.0\"}\n").await.unwrap();
+        tls.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"keryx-miner-supr/0.16.4\",\"keryx-stratum-v3\"],\"jsonrpc\":\"2.0\"}\n").await.unwrap();
         let mut line = String::new();
         tokio::time::timeout(std::time::Duration::from_secs(15), BufReader::new(tls).read_line(&mut line)).await.expect("reply in time").unwrap();
         eprintln!("pool replied over TLS: {}", line.trim());
