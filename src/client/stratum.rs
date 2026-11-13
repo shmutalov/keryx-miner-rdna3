@@ -832,6 +832,11 @@ impl StratumHandler {
                                 }
                                 return miner.process_block(None).await;
                             }
+                            // As on v4 jobs: past the attention gate only a self-checked model is
+                            // declared, so pools on these notify forms (cryo-pool's bridge sends
+                            // short v3) need the check started here too.
+                            self.drive_openings(miner).await;
+                            self.maybe_start_trace_self_test(daa_score, miner).await;
                             // Past the block task gate a v3/v2 job cannot become a valid block.
                             if keryx_miner::block_task::active(daa_score) {
                                 keryx_miner::pom_gpu::log_throttled(u32::MAX, "pool-no-task", || {
@@ -894,6 +899,8 @@ impl StratumHandler {
                                 return miner.process_block(None).await;
                             }
                             *self.current_task_slot.lock().await = None;
+                            self.drive_openings(miner).await;
+                            self.maybe_start_trace_self_test(LAST_DAA_SCORE.load(Ordering::Relaxed), miner).await;
                             miner
                                 .process_block(Some(PartialBlock {
                                     id,
@@ -1434,8 +1441,11 @@ impl StratumHandler {
     /// the attention rule, mining paused while it runs. A rig whose check passes reports
     /// `"trace": 1`, declares the model and serves traced pool requests; one that fails declares
     /// no model and serves none of them.
+    /// An unknown DAA (0: no notify carrying one yet) counts as past the gate, as in
+    /// `slm::serveable_model_ids`, or a pool sending only DAA-less jobs would never get a model.
     async fn maybe_start_trace_self_test(&mut self, daa_score: u64, miner: &mut MinerManager) {
-        if !keryx_miner::trace::attention_active(daa_score) || TRACE_SELF_TEST_STARTED.load(Ordering::SeqCst) {
+        let past_gate = daa_score == 0 || keryx_miner::trace::attention_active(daa_score);
+        if !past_gate || TRACE_SELF_TEST_STARTED.load(Ordering::SeqCst) {
             return;
         }
         let Some((model_id, tier)) = Self::served_model() else { return };
