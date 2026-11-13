@@ -161,13 +161,18 @@ rules of keryx-node v1.6.6:
   bytes, invalid UTF-8, a compressed prompt). A request it will not answer (busy, model not ready,
   trace it cannot build, failed inference) gets a busy reply (error 46) so the pool re-dispatches
   at once, and an answer the pool never acknowledges stops holding off new requests after 30 s.
-- **Solo AI answers stay skipped past the gate**: solo audits (attention phases through the node,
-  deadlines) are not wired up.
-- **Solo mining past the gate is not viable with this build.** Every request is audited against the
-  whole cohort of its tier (each identity with a proven block of that tier in the last ~5 minutes),
-  and every member that does not answer in time takes a service strike, at most one an hour: 5 escrow
+- **Solo AI answers are traced and audited through the node** (since v0.3.35, upstream keryx-miner
+  v0.6.2's solo client): the AiResponse carries the trace commitment, the trace is kept on disk
+  (`escrow_state.traces/` beside the escrow state file) until its audit closes, and when the node
+  draws the answer the miner replays it on the GPU and submits the opening, then each attention
+  phase the node draws next, ahead of their deadlines. Deadlines and seeds come from the node
+  (`GetAwaitedOpenings`), which also tells the miner which queued requests it still awaits; rigs
+  sharing a payout address take requests in turn (`GetServiceProviders`). Replays and inference
+  pause mining on the whole rig. This matters because every request is audited against the whole
+  cohort of its tier (each identity with a proven block of that tier in the last ~5 minutes), and
+  every member that does not answer in time, or fails an opening, takes a service strike: 5 escrow
   claims burned, then all pending escrow, then a 24 h suspension of the miner cut (blocks stay valid
-  but pay nothing). Mine through a pool: the pool is the cohort identity there, and answers for it.
+  but pay nothing). On a pool the pool is the cohort identity, and answers for it.
 
 **H16 (mainnet DAA 147,000,000; testnet 180,000)** — keryx-node v1.6.7. The one mining change: the
 context pad of every tier shrinks by 200 MiB (204,800 tiles; tier 0 624 → 424 MiB, tier 1
@@ -177,7 +182,7 @@ the table of its own DAA score (a job below the gate still walks the old pad), a
 the pad when the size changes. The rest of H16 is service-ledger accounting in the node (where
 suspensions are judged, one strike per request, a uniform strike ladder, untraced answers on an
 audited tier not serving their request, audit deadlines extended while a key keeps serving) and
-new solo request-status RPCs, which this build does not use.
+new solo request-status RPCs, which the solo client uses from v0.3.35.
 
 ### Solo mining: escrow delegation cert (required since H6)
 
@@ -342,8 +347,7 @@ nothing, so ask `/stats` when things are quiet.
 With `ai = 1` the bot also sends each AI request the miner serves: the prompt and the answer, in
 collapsible quotes, as silent messages (the prompt cut at 1,400 characters, the answer at 2,200).
 Solo private requests stay out unless `ai = all`. A pool hands over opened prompts without saying
-which were private, so every pool request is sent. Solo requests this build skips past the H15
-attention gate are sent with "not answered"; node and pool challenges are not sent. **Telegram keeps
+which were private, so every pool request is sent. Node and pool challenges are not sent. **Telegram keeps
 what it is sent**: leave this off if the requesters' prompts must stay on the rig.
 
 Telegram being slow or unreachable never holds up mining: messages wait in a small queue and are
@@ -404,8 +408,11 @@ automatically at every start.)
 - ✅ **VRAM capability gate runs on AMD:** total VRAM is queried via Vulkan (the largest
   device-local heap), not `nvidia-smi`, so the model-vs-VRAM filter announces only the tiers your
   card can actually serve.
-- ⚠️ **Solo mining past H15 is not viable with this build:** solo AI requests go unanswered, and
-  each miss is a service strike ([details](#consensus-this-build-mines)). Mine through a pool.
+- ✅ **Solo traced answers and audits on the public testnet** (keryx-node v1.6.7, 2026-11-13, tier
+  1 GLM-4-9B, `--light --h15-tier light`): 8 private requests answered with traces, 5 audits opened
+  (15 opening transactions plus an attention phase replayed on its own), every opening accepted by
+  the node, no strikes, 2,638 blocks and none rejected. Tiers 0 and 3 were not run solo end to end;
+  their traces pass the GPU self-check.
 - ⚠️ **Pool version gate:** suprnova refuses miners that don't advertise a recent enough
   `keryx-miner-supr` version (the floor moves with each hardfork — `0.7.0+` at H4, `0.12.0+` at
   H10, `0.14.0+` at H14, above `0.15.1` at H15). This fork advertises `0.16.4` (supr's current H16 release) and subscribes as

@@ -1094,6 +1094,13 @@ fn truncate_answer(mut text: String, max_tokens: usize) -> String {
     text
 }
 
+/// Whether the last inference that produced nothing failed for a passing reason, so the solo
+/// client may queue its request again. Upstream's engine hosts models out of process and has such
+/// failures; this one serves from the resident in-process engine, so a failure is final.
+pub fn last_failure_transient() -> bool {
+    false
+}
+
 /// The private body of a traced answer: the text with its generated token ids (`answer::encode`)
 /// for a stage-2 trace, the plain text otherwise.
 pub fn answer_body(text: &str, trace: Option<&crate::trace::ResponseTrace>) -> Vec<u8> {

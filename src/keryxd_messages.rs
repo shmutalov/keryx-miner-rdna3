@@ -1,6 +1,7 @@
 use crate::proto::{
-    kaspad_message::Payload, GetBlockRequestMessage, GetBlockTemplateRequestMessage, GetInfoRequestMessage,
-    GetServiceStrikesRequestMessage, KaspadMessage, NotifyBlockAddedRequestMessage,
+    kaspad_message::Payload, GetAwaitedOpeningsRequestMessage, GetBlockRequestMessage, GetBlockTemplateRequestMessage,
+    GetInfoRequestMessage, GetServiceProvidersRequestMessage, GetServiceStrikesRequestMessage, KaspadMessage,
+    NotifyBlockAddedRequestMessage,
     NotifyNewBlockTemplateRequestMessage,
     NotifyVirtualSelectedParentChainChangedRequestMessage, RpcBlock, RpcTransaction,
     SubmitBlockRequestMessage, SubmitTransactionRequestMessage,
@@ -100,5 +101,17 @@ impl RpcBlock {
         let mut hasher = HeaderHasher::new();
         pow::serialize_header(&mut hasher, self.header.as_ref()?, false);
         Some(hasher.finalize())
+    }
+}
+
+impl From<GetServiceProvidersRequestMessage> for KaspadMessage {
+    fn from(a: GetServiceProvidersRequestMessage) -> Self {
+        KaspadMessage { payload: Some(Payload::GetServiceProvidersRequest(a)) }
+    }
+}
+
+impl From<GetAwaitedOpeningsRequestMessage> for KaspadMessage {
+    fn from(a: GetAwaitedOpeningsRequestMessage) -> Self {
+        KaspadMessage { payload: Some(Payload::GetAwaitedOpeningsRequest(a)) }
     }
 }
