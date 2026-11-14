@@ -586,8 +586,8 @@ impl ResponseTrace {
         c
     }
 
-    /// A small synthetic trace for store tests.
-    #[cfg(test)]
+    /// A small synthetic trace for store tests (the binary's pool trace store tests use it too).
+    #[doc(hidden)]
     pub fn test_sample() -> Self {
         let record = TraceRecord {
             stage: STAGE_1A,

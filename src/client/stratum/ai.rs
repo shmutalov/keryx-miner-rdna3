@@ -8,6 +8,18 @@ use std::sync::{
 
 const MAX_PAYLOAD_BYTES: usize = 1_048_576;
 
+/// `s` cut to at most `max` bytes on a char boundary, with an ellipsis when cut (for log lines).
+pub(super) fn clip(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
 /// The H15 trace a pool asks for (keryx-miner-supr 0.15.3's optional 8th `mining.ai_request`
 /// param `{"trace":{"tier","prompt_len","chain","attention"}}`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +220,14 @@ impl Drop for InferenceGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clip_cuts_on_a_char_boundary() {
+        assert_eq!(clip("short", 10), "short");
+        assert_eq!(clip("abcdef", 3), "abc…");
+        // 'é' is two bytes: a cut inside it backs off to before it.
+        assert_eq!(clip("aé", 2), "a…");
+    }
 
     fn fields(prompt: &str) -> (String, String, String, String, String, u32, String) {
         let h = "ab".repeat(32);

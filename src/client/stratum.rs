@@ -4,7 +4,7 @@ use std::fmt::{Display, Formatter};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
@@ -17,6 +17,30 @@ mod traces;
 /// pool that never acknowledges one (an id-less reply, a lost line) would get every later request
 /// on the connection refused as busy.
 const AI_ACK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A `mining.ai_response` awaiting the pool's ack.
+struct PendingAiResponse {
+    /// Its stratum id.
+    id: u32,
+    /// When its request arrived.
+    received: Instant,
+    /// When it went out.
+    sent: Instant,
+    task_id: String,
+    /// Request hash of a traced answer, whose trace is kept for openings.
+    trace_key: Option<String>,
+}
+
+impl PendingAiResponse {
+    /// How long the answer took and how long the pool took to ack it, for the ack log line.
+    fn timing(&self) -> String {
+        format!(
+            "answered {:.1} s after the request, acked {} ms after the send",
+            self.sent.duration_since(self.received).as_secs_f64(),
+            self.sent.elapsed().as_millis()
+        )
+    }
+}
 
 use crate::client::stratum::statum_codec::{ErrorCode, MiningNotify, MiningSubmit, NewLineJsonCodecError, StratumLine};
 use crate::client::stratum::statum_codec::{
@@ -326,9 +350,9 @@ pub struct StratumHandler {
     inference_cache: InferenceCache,
     /// True while a capability challenge inference is in flight — prevents duplicate spawns.
     challenge_in_flight: Arc<AtomicBool>,
-    /// Stratum id of the in-flight `mining.ai_response` and when it went out, until the bridge
-    /// acknowledges it or [`AI_ACK_TIMEOUT`] passes.
-    ai_response_pending: Arc<Mutex<Option<(u32, std::time::Instant)>>>,
+    /// The in-flight `mining.ai_response`, until the bridge acknowledges it or [`AI_ACK_TIMEOUT`]
+    /// passes.
+    ai_response_pending: Arc<Mutex<Option<PendingAiResponse>>>,
     /// Ids of our requests whose answers are no share results: `mining.hello`, `mining.telemetry`
     /// and `mining.ai_opening_result`.
     aux_ids: Arc<std::sync::Mutex<HashSet<u32>>>,
@@ -737,8 +761,8 @@ impl StratumHandler {
                                 if removed.is_some() {
                                     self.shares_stats.accepted.fetch_add(1, Ordering::SeqCst);
                                     info!("Share accepted");
-                                } else if self.take_ai_response_ack(id).await {
-                                    info!("AI response accepted by the pool");
+                                } else if let Some(p) = self.take_ai_response_ack(id).await {
+                                    info!("AI response {:.16} accepted by the pool ({})", p.task_id, p.timing());
                                     crate::notify::ai_answered();
                                 } else {
                                     info!("{:?} (Last: {})", msg.clone(), self.last_stratum_id.load(Ordering::SeqCst));
@@ -766,8 +790,8 @@ impl StratumHandler {
                                     debug!("Pool answered request {rid} with {:?}", other);
                                     return Ok(());
                                 }
-                                if self.take_ai_response_ack(id).await {
-                                    warn!("AI response not accepted by the pool: result {:?}", other);
+                                if let Some(p) = self.take_ai_response_ack(id).await {
+                                    warn!("AI response {:.16} not accepted by the pool ({}): result {:?}", p.task_id, p.timing(), other);
                                     crate::notify::ai_missed();
                                     return Ok(());
                                 }
@@ -954,7 +978,7 @@ impl StratumHandler {
             StratumLine {
                 id: Some(id),
                 payload: StratumLinePayload::StratumResult { .. },
-                error: Some(StratumError(code, error, _)),
+                error: Some(StratumError(code, error, data)),
                 ..
             } => {
                 if self.take_aux(id) {
@@ -968,9 +992,23 @@ impl StratumHandler {
                     }
                     return Ok(());
                 }
-                if self.take_ai_response_ack(Some(id)).await {
-                    warn!("AI response rejected by the pool: {}", error);
+                if let Some(p) = self.take_ai_response_ack(Some(id)).await {
+                    warn!(
+                        "AI response {:.16} rejected by the pool ({}): {}: {}{}",
+                        p.task_id,
+                        p.timing(),
+                        code,
+                        error,
+                        data.as_ref().map(|d| format!(" (data {d})")).unwrap_or_default()
+                    );
                     crate::notify::ai_missed();
+                    // A refused answer is never submitted, so the node never audits it (upstream
+                    // drops its trace too).
+                    if let Some(key) = p.trace_key.as_deref() {
+                        if traces::forget(key) {
+                            info!("Trace: dropped the kept trace of the refused answer {:.16}", p.task_id);
+                        }
+                    }
                     return Ok(());
                 }
                 // Option, not unwrap(): a pool error for an id we never tracked (or already
@@ -1043,9 +1081,9 @@ impl StratumHandler {
     /// True while a `mining.ai_response` awaits the pool's ack, for at most [`AI_ACK_TIMEOUT`].
     async fn ai_ack_outstanding(&self) -> bool {
         let mut pending = self.ai_response_pending.lock().await;
-        match *pending {
-            Some((id, at)) if at.elapsed() >= AI_ACK_TIMEOUT => {
-                warn!("AI response (stratum id {id}) never acknowledged by the pool — taking requests again");
+        match pending.as_ref() {
+            Some(p) if p.sent.elapsed() >= AI_ACK_TIMEOUT => {
+                warn!("AI response {:.16} (stratum id {}) never acknowledged by the pool — taking requests again", p.task_id, p.id);
                 *pending = None;
                 false
             }
@@ -1062,14 +1100,13 @@ impl StratumHandler {
         }
     }
 
-    /// True (and cleared) when `id` acknowledges the in-flight `mining.ai_response`.
-    async fn take_ai_response_ack(&self, id: Option<u32>) -> bool {
+    /// The in-flight `mining.ai_response` (cleared) when `id` acknowledges it.
+    async fn take_ai_response_ack(&self, id: Option<u32>) -> Option<PendingAiResponse> {
         let mut pending = self.ai_response_pending.lock().await;
-        if id.is_some() && pending.map(|(p, _)| p) == id {
-            *pending = None;
-            true
+        if id.is_some() && pending.as_ref().map(|p| p.id) == id {
+            pending.take()
         } else {
-            false
+            None
         }
     }
 
@@ -1084,6 +1121,8 @@ impl StratumHandler {
         ext: Option<serde_json::Value>,
         miner: &mut MinerManager,
     ) {
+        let received = Instant::now();
+        let reward = fields.6.clone();
         let request = match ai::AiRequest::parse_ext(fields, ext.as_ref()) {
             Ok(request) => request,
             Err(error) => {
@@ -1091,6 +1130,14 @@ impl StratumHandler {
                 return;
             }
         };
+        // What the pool sent besides the prompt, to tell later why it refused an answer.
+        info!(
+            "AI request {:.16}: from the pool (stratum id {}, reward {} sompi, extension {})",
+            request.task_id,
+            pool_id.map_or("none".to_string(), |id| id.to_string()),
+            reward,
+            ext.as_ref().map_or("none".to_string(), |e| ai::clip(&e.to_string(), 400))
+        );
         crate::notify::ai_request();
         if keryx_miner::pow_only() || !keryx_miner::slm::is_model_ready(&request.model_id) {
             warn!("AI request {:.16}: model is not ready", request.task_id);
@@ -1209,10 +1256,12 @@ impl StratumHandler {
                 ),
             };
             let id = last_id.fetch_add(1, Ordering::SeqCst);
+            let trace_key = traced.is_some().then(|| request.request_hash.to_ascii_lowercase());
             let traced = traced.as_ref().map(|(c, b)| (c.as_slice(), b.as_slice()));
             match request.response(id, worker, &result, traced) {
                 Ok(line) => {
-                    *pending.blocking_lock() = Some((id, std::time::Instant::now()));
+                    *pending.blocking_lock() =
+                        Some(PendingAiResponse { id, received, sent: Instant::now(), task_id: request.task_id.clone(), trace_key });
                     // The GPU is done: resume mining before the send, which blocks while the pool
                     // connection is backed up. `pending` keeps further requests out until the ack.
                     drop(guard);
