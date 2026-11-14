@@ -1437,6 +1437,117 @@ mod tests {
             .try_init();
     }
 
+    /// Where a traced answer's time goes on this GPU: the same prompt and number of generated
+    /// positions fed (a) untraced in the normal batches, (b) untraced in TRACE_UBATCH batches and
+    /// (c) traced under the tier's attention manifest, twice. Each traced run prints a digest of
+    /// its leaves and sequence leaves: a change to the trace path must keep them bit for bit (a
+    /// fixed padding token is fed, so the run is deterministic). Run with:
+    ///   [KERYX_TEST_TIER=<0..4>] KERYX_TEST_GGUF=<that tier's model.gguf> [KERYX_TEST_GEN=128] [KERYX_TEST_REPEAT=60] \
+    ///     cargo test --release --lib -- --ignored --nocapture traced_speed_breakdown
+    /// On the RX 7900 XT, GLM-4-9B (tier 1), 721-token prompt: (a) 0.34 s + 14.4 ms/token, (b) 3.4 s +
+    /// 13.3 ms/token, (c) 2.4 s + 18.5 ms/token with deferred trace hashing (4.5 s + 38 ms/token
+    /// before it); digests leaves 866e1e3606a5484b, sequence c9e00c2e0b509112.
+    #[test]
+    #[ignore = "loads a tier model onto the GPU; set KERYX_TEST_GGUF (and KERYX_TEST_TIER) to run"]
+    fn traced_speed_breakdown() {
+        let gguf = std::env::var("KERYX_TEST_GGUF").expect("KERYX_TEST_GGUF");
+        let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let tier = env("KERYX_TEST_TIER", 1) as u8;
+        let n_gen = env("KERYX_TEST_GEN", 128);
+        let repeat = env("KERYX_TEST_REPEAT", 60);
+        let engine = LlamaEngine::launch(&gguf).expect("launch");
+        let toks = engine.tokenize(&"List three facts about the Moon, one short sentence each. ".repeat(repeat), true);
+        let n_prompt = toks.len();
+        let n_ctx = ((n_prompt + n_gen + 256) as u32).div_ceil(256) * 256;
+        let pad = engine.pad_token();
+        let backend = backend().unwrap();
+        eprintln!("prompt {n_prompt} tokens, {n_gen} generated positions, n_ctx {n_ctx}");
+
+        let untraced = |label: &str, n_batch: u32, n_ubatch: u32| {
+            let mut ctx = engine.new_context_batched(backend, n_ctx, n_batch, n_ubatch).unwrap();
+            let chunk = n_batch.min(n_ctx) as usize;
+            let mut batch = LlamaBatch::new(chunk, 1);
+            let t0 = std::time::Instant::now();
+            for (c, ch) in toks.chunks(chunk).enumerate() {
+                batch.clear();
+                for (j, &t) in ch.iter().enumerate() {
+                    let p = c * chunk + j;
+                    batch.add(t, p as i32, &[0], p == n_prompt - 1).unwrap();
+                }
+                ctx.decode(&mut batch).unwrap();
+            }
+            let tp = t0.elapsed().as_secs_f64();
+            let t1 = std::time::Instant::now();
+            for i in 0..n_gen {
+                batch.clear();
+                batch.add(pad, (n_prompt + i) as i32, &[0], true).unwrap();
+                ctx.decode(&mut batch).unwrap();
+            }
+            let tg = t1.elapsed().as_secs_f64();
+            eprintln!(
+                "{label:<34} prompt {tp:6.2} s ({:6.0} tok/s) | generate {tg:6.2} s ({:5.1} tok/s, {:5.1} ms/tok)",
+                n_prompt as f64 / tp,
+                n_gen as f64 / tg,
+                1e3 * tg / n_gen as f64
+            );
+        };
+        // Warm-up (shader compile, first allocations).
+        untraced("warm-up", N_BATCH, N_UBATCH);
+        untraced("(a) untraced, ubatch 512", N_BATCH, N_UBATCH);
+        untraced("(b) untraced, ubatch 8", TRACE_UBATCH, TRACE_UBATCH);
+
+        let m = crate::trace::TierManifest::for_attn(tier).expect("manifest");
+        let raw = crate::trace::TierManifest::raw_attn(tier).expect("raw manifest");
+        let seq = m.seq_spec().expect("seq spec");
+        let nl = engine.trace_configure(raw, n_ctx, Some(&seq)).expect("trace configure");
+        for run in 0..2 {
+            let mut ctx = engine.new_trace_context(backend, n_ctx, true).unwrap();
+            let mut batch = LlamaBatch::new(TRACE_UBATCH as usize, 1);
+            assert_eq!(unsafe { llama_cpp_sys_2::ggml_backend_vk_keryx_trace_begin(TRACE_DEVICE) }, 0);
+            let mut rec = RecurSink::new(&seq, &[]);
+            let t0 = std::time::Instant::now();
+            feed_traced(&mut ctx, &mut batch, &toks, 0, Some(n_prompt - 1), n_prompt, rec.as_mut()).unwrap();
+            let tp = t0.elapsed().as_secs_f64();
+            let mut fed = toks.clone();
+            let t1 = std::time::Instant::now();
+            for _ in 0..n_gen {
+                fed.push(pad);
+                feed_traced(&mut ctx, &mut batch, &[pad], fed.len() - 1, Some(fed.len() - 1), n_prompt, rec.as_mut()).unwrap();
+            }
+            let tg = t1.elapsed().as_secs_f64();
+            let t2 = std::time::Instant::now();
+            let (_ub, leaves) = read_trace(nl, fed.len()).unwrap();
+            let tr = t2.elapsed().as_secs_f64();
+            let t3 = std::time::Instant::now();
+            let rows = read_seq(&ctx, &seq, fed.len()).unwrap();
+            let mut hashes: Vec<[u8; 32]> = rows.iter().map(|b| *blake3::hash(b).as_bytes()).collect();
+            if let Some(r) = &rec {
+                r.check_end(fed.len()).unwrap();
+                r.hashes_into(&mut hashes);
+            }
+            let ts = t3.elapsed().as_secs_f64();
+            let mut d = blake3::Hasher::new();
+            for l in &leaves {
+                d.update(l);
+            }
+            let leaf_digest = d.finalize();
+            let mut d = blake3::Hasher::new();
+            for h in &hashes {
+                d.update(h);
+            }
+            eprintln!("(c) run {run} digests: leaves {} | sequence {}", &leaf_digest.to_hex()[..16], &d.finalize().to_hex()[..16]);
+            eprintln!(
+                "(c) traced, run {run}                  prompt {tp:6.2} s ({:6.0} tok/s) | generate {tg:6.2} s ({:5.1} tok/s, {:5.1} ms/tok) | read leaves {tr:.2} s ({} leaves) | read+hash KV rows {ts:.2} s ({} rows, {:.0} MB)",
+                n_prompt as f64 / tp,
+                n_gen as f64 / tg,
+                1e3 * tg / n_gen as f64,
+                leaves.len(),
+                hashes.len(),
+                rows.iter().map(|r| r.len()).sum::<usize>() as f64 / 1e6
+            );
+        }
+    }
+
     /// End-to-end in-process inference on a real GGUF + GPU. Ignored by default (loads a
     /// multi-GB model); run with:
     ///   KERYX_TEST_GGUF=<path to model.gguf> cargo test --release -- --ignored inproc_chat
